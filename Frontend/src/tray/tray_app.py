@@ -155,95 +155,55 @@ class SentryEyeWidget(QWidget):
         # 如果迴圈結束都沒找到，就回傳（return）空值（None）。
         return None
 
-    def __init__(self, switch_callback):
+    def __init__(self, switch_callback, shutdown_callback=None):
+        # 我們 呼叫（call）父類別的初始化。
         super().__init__()
-        # [新增] 告訴視窗：我願意接收拖曳進來的東西
+        
+        # [關鍵修正] 我們 開啟（enable）滑鼠追蹤，這樣沒按按鍵時也能偵測懸停！
+        self.setMouseTracking(True) 
+        # 告訴視窗：我願意 接收（accept）拖曳進來的東西
         self.setAcceptDrops(True)
         # 設定背景透明
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        # 用於視窗拖曳的變數
         self.old_pos = None
+        self.switch_callback = switch_callback
+        self.shutdown_callback = shutdown_callback
+        
+        # [新增] 瞳孔懸停狀態 (用於變色)
+        # 我們預設它為 False (沒有懸停)。
+        self.is_pupil_hovered = False
 
-        # [新增] 狀態記憶體：用來暫存「還沒餵飽」的專案資料夾
         self.pending_folder = None
 
-        # --- 動畫核心 ---
-        # 我們建立（create）一個計時器，讓眼睛動起來。
+        # --- 動畫與計時器 (維持原樣) ---
         self.timer = QTimer(self)
-        # 每 50 毫秒（ms）觸發一次更新，讓畫面重畫。
         self.timer.timeout.connect(self.update)
-        # 啟動（start）計時器。
         self.timer.start(50)
-        # 這是一個變數，用來記錄動畫目前的「呼吸進度」。
         self.phase = 0
-        # [新增] 吞噬動畫計數器 (0 = 無動畫, >0 = 播放中)
         self.eating_frame = 0
 
-        # [新增] 初始化引導氣泡
-        # 我們把 self (眼睛) 傳進去當作 parent，這樣氣泡就會成為眼睛的子視窗
+        # 初始化氣泡
         self.bubble = StatusBubble(self)
-        # 設定氣泡初始位置 (相對於眼睛左上角)
-        # 這裡先暫定 (10, 140)，也就是眼睛下方一點點
         self.bubble.move(10, 140)
 
-        # [新增] 瞳孔運動神經
-        self.pupil_offset = QPoint(0, 0)       # 目前位置
-        self.target_offset = QPoint(0, 0)      # 目標位置
-
-        # [新增] 掃視計時器 (Saccade Timer)
+        # 瞳孔運動與眨眼 (維持原樣)
+        self.pupil_offset = QPoint(0, 0)
+        self.target_offset = QPoint(0, 0)
+        
         self.saccade_timer = QTimer(self)
         self.saccade_timer.timeout.connect(self._trigger_saccade)
-        self.saccade_timer.start(3000) # 初始每 3 秒動一次
+        self.saccade_timer.start(3000)
 
-        # [新增] 眨眼計時器 (Blink Timer)
-        # 我們建立（create）一個計時器，專門控制眨眼。
         self.blink_timer = QTimer(self)
-        # 時間到時，連結（connect）到觸發眨眼的方法。
         self.blink_timer.timeout.connect(self._trigger_blink)
-        # 啟動（start）計時器，初始設定 4000 毫秒（4秒）。
         self.blink_timer.start(4000)
-
-        # [新增] 眨眼狀態變數
-        # 這是一個旗標，標記目前是否正在（is）眨眼。
         self.is_blinking = False
-        # 這是一個浮點數，記錄眼皮閉合的進度（0.0 全開 ~ 1.0 全閉）。
         self.blink_progress = 0.0
-        self.blink_repeats = 0  # [新增] 剩餘眨眼次數
+        self.blink_repeats = 0
 
-        # --- 佈局設計 (維持不變) ---
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.addStretch(1)
-        
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addStretch(1) 
-        
-        self.btn_dashboard = QPushButton("哨兵管理")
-        self.btn_dashboard.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_dashboard.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(0, 0, 0, 150);
-                color: white;
-                border: 1px solid rgba(255, 255, 255, 100);
-                border-radius: 5px;
-                padding: 5px 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(40, 40, 40, 200);
-                border-color: white;
-            }
-        """)
-        self.btn_dashboard.clicked.connect(switch_callback)
-        
-        bottom_layout.addWidget(self.btn_dashboard)
-        layout.addLayout(bottom_layout)
-
-        # 初始化偏好開關，預設為開啟（True）。
         self.enable_guidance = True
         self.enable_smart_match = True
-        # 預設開啟提示
         self.setToolTip("👁️ 哨兵之眼：請將「專案資料夾」拖曳至此以開始監控")
 
     def _trigger_saccade(self): 
@@ -342,6 +302,10 @@ class SentryEyeWidget(QWidget):
             # 吞噬中：綠色
             main_color = QColor(50, 255, 50)
             glow_color = QColor(0, 200, 0)
+        # [關鍵修正] 新增這段：如果（elif）懸停在瞳孔上，就變紅色警戒
+        elif self.is_pupil_hovered: 
+            main_color = QColor(255, 60, 60) # 亮紅
+            glow_color = QColor(255, 0, 0)   # 純紅
         elif is_hungry:
             # 飢渴中：橘紅色
             main_color = QColor(255, 140, 0) 
@@ -468,21 +432,89 @@ class SentryEyeWidget(QWidget):
             
             painter.restore()
 
-    # --- 實作無邊框視窗的拖曳功能 ---
     def mousePressEvent(self, event):
+        """記錄點擊起點 (改用全域座標)"""
+        from PySide6.QtCore import QPoint
         if event.button() == Qt.MouseButton.LeftButton:
             self.old_pos = event.globalPosition().toPoint()
-
-    def mouseMoveEvent(self, event):
-        if self.old_pos:
-            delta = event.globalPosition().toPoint() - self.old_pos
-            # 注意：這裡是移動父容器 (SentryTrayAppV2.container)
-            # 因為 SentryEyeWidget 只是 container 裡的一頁
-            self.window().move(self.window().pos() + delta)
-            self.old_pos = event.globalPosition().toPoint()
+            # [核心修正] 改用 globalPosition (螢幕座標) 來記錄起點
+            # 這樣就算視窗跟著跑，我們也能算出滑鼠實際在桌面上跑了多遠
+            self.global_press_pos = event.globalPosition().toPoint()
 
     def mouseReleaseEvent(self, event):
+        """[核心修正 4.0] 全域防手抖判定"""
+        from PySide6.QtCore import QPoint
         self.old_pos = None
+
+        # [核心修正] 計算螢幕上的移動距離
+        diff = event.globalPosition().toPoint() - self.global_press_pos
+        
+        # 如果螢幕上移動超過 10 像素，絕對是拖曳，直接結束，不準觸發點擊！
+        if diff.manhattanLength() > 10: 
+            return 
+            
+        if event.button() == Qt.MouseButton.LeftButton:
+            center = self.rect().center()
+            pupil_center = center + self.pupil_offset
+            
+            # 瞳孔判定邏輯 (維持上一步的精準版)
+            base_radius = (self.height() * 0.5) * 0.45 
+            black_pupil_radius = base_radius * 0.6 
+
+            # Hit Test 依然使用局部座標 (因為是判斷點在視窗的哪裡)
+            distance = ((event.position().x() - pupil_center.x()) ** 2 + 
+                        (event.position().y() - pupil_center.y()) ** 2) ** 0.5
+
+            if distance < black_pupil_radius:
+                # 點擊黑色瞳孔 -> 關機
+                if self.shutdown_callback:
+                    self.bubble.show_message("💤 正在關閉 Sentry...", 1500)
+                    QTimer.singleShot(100, self.window().close)
+                    QTimer.singleShot(500, self.shutdown_callback)
+                else:
+                    self.window().close()
+            else:
+                # 點擊黑色瞳孔以外 -> 切換管理
+                self.bubble.hide()
+                self.switch_callback()
+
+    def mouseMoveEvent(self, event):
+        """[核心修正 3.0] 同步縮小懸停(Hover)的紅色警戒範圍"""
+        # 1. 拖曳邏輯
+        if self.old_pos:
+            delta = event.globalPosition().toPoint() - self.old_pos
+            self.window().move(self.window().pos() + delta)
+            self.old_pos = event.globalPosition().toPoint()
+            
+        # 2. 懸停偵測
+        center = self.rect().center()
+        pupil_center = center + self.pupil_offset
+        
+        # [關鍵修正] 這裡也要同步改用黑色瞳孔的半徑，讓紅色變色也只在黑色區域觸發
+        base_radius = (self.height() * 0.5) * 0.45 
+        black_pupil_radius = base_radius * 0.6 
+        
+        distance = ((event.position().x() - pupil_center.x()) ** 2 + 
+                    (event.position().y() - pupil_center.y()) ** 2) ** 0.5
+
+        if distance < black_pupil_radius:
+            # --- 進入黑色瞳孔 ---
+            if not self.is_pupil_hovered:
+                self.is_pupil_hovered = True
+                self.update() 
+            
+            if self.enable_guidance and self.bubble.isHidden():
+                self.bubble.show_message("🔴 單擊此處可關閉系統", 0)
+        else:
+            # --- 離開黑色瞳孔 ---
+            if self.is_pupil_hovered:
+                self.is_pupil_hovered = False
+                self.update()
+            
+            if not self.bubble.fade_timer.isActive():
+                self.bubble.hide_bubble()
+                
+        super().mouseMoveEvent(event)
 
         # --- 拖曳事件處理 ---
     def dragEnterEvent(self, event):
@@ -639,7 +671,7 @@ class SentryEyeWidget(QWidget):
                 )
                 
                 # 執行切換到 View B (控制台) 的動作
-                self.btn_dashboard.click()
+                self.switch_callback() # 呼叫 go_to_dashboard
                 
                 # 這裡未來可以新增邏輯：自動填入 View B 的輸入框
                 # 但目前 View B 的輸入框邏輯還沒完全移植，先只做到切換。
@@ -1215,6 +1247,8 @@ class DashboardWidget(QWidget):
     def __init__(self, on_stats_change=None, switch_callback=None) -> None:
         # 我們 呼叫（call）父類別的初始化。
         super().__init__()
+        # [核心修正] 強制啟用樣式背景繪製 (這行是關鍵！)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         # 設定視窗的標題（Window Title）。
         self.setWindowTitle("Sentry 控制台 v1 (UX 測試樣板)")
         # 設定視窗的初始大小（resize），寬 900 像素，高 600 像素。
@@ -1226,6 +1260,15 @@ class DashboardWidget(QWidget):
         # 我們將回調函式 儲存（store）起來，供稍後使用。
         self.on_stats_change = on_stats_change
 
+        # [核心修正] 強制設定背景為不透明白色，並加上邊框陰影效果
+        # border-radius: 10px 讓四個角稍微圓潤一點，比較現代
+        self.setStyleSheet("""
+            DashboardWidget {
+                background-color: #FFFFFF; 
+                border: 1px solid #CCCCCC;
+                border-radius: 10px;
+            }
+        """)
 
         # # TODO: 這裡的註解將使用通俗比喻來解釋資料結構。
         # 準備一個叫「current_projects」的空籃子（[]），
@@ -2278,8 +2321,11 @@ class SentryTrayAppV2:
         self.container.setWindowTitle("Sentry v2.0 Sandbox")
         self.container.resize(900, 600)
 
-        # 建立兩個視圖，並傳入「切換頁面」的函式作為參數。
-        self.view_a = SentryEyeWidget(switch_callback=self.go_to_dashboard)        
+        # 建立 View A，並傳入切換與關機的函式
+        self.view_a = SentryEyeWidget(
+            switch_callback=self.go_to_dashboard,
+            shutdown_callback=self.app.quit # [NEW] 將 app.quit 函式傳入給 View A
+)       
         # 替換為我們剛剛貼入並改名的 DashboardWidget
         # 這裡我們傳入了 self.go_to_eye 函式作為返回按鈕的回調
         # type: ignore # 【技術鎮壓】忽略 Pylance 對 update_tooltip 的循環依賴警告
@@ -2296,13 +2342,16 @@ class SentryTrayAppV2:
         # 這會同時設定頁面並將視窗縮小為 130x130
         self.go_to_eye()
 
-        # 啟動時直接顯示視窗
-        self.container.show()
-
         # 設定容器視窗屬性以支援透明背景
         self.container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         # [修改] 移除 WindowStaysOnTopHint，不再強制置頂
         self.container.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+
+        # FIX: 系統啟動時 View A 不再躲起來，而是立即顯示。
+        # 使用 singleShot 確保在事件循環啟動後再執行 show()。
+        QTimer.singleShot(100, lambda: self.container.show()) 
+        QTimer.singleShot(100, lambda: self.container.activateWindow())
+        QTimer.singleShot(100, lambda: self.container.raise_())
 
     def go_to_dashboard(self):
         """切換到 View B (展開)"""
@@ -2359,4 +2408,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    #  啟動系統 python -m src.tray.v2_sandbox
+    #  啟動系統 python -m src.tray.tray_app
