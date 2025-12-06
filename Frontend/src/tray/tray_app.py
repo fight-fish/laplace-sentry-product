@@ -315,6 +315,20 @@ class SentryEyeWidget(QWidget):
             main_color = QColor(0, 255, 255)
             glow_color = QColor(0, 150, 255)
 
+        # --- [NEW] 0.5 底層陰影 (Shadow Layer) ---
+        # 這是一層墊在下面的黑色光暈，確保在淺色桌面上也能看見眼睛
+        shadow_radius = (eye_width / 2) * breath_factor * 1.3 # 比光暈大一點點
+        shadow = QRadialGradient(center, shadow_radius)
+        
+        # 設定黑色漸層 (中心半透明黑 -> 邊緣全透明)
+        shadow.setColorAt(0.0, QColor(0, 0, 0, 180)) # 中心較黑
+        shadow.setColorAt(0.7, QColor(0, 0, 0, 50))  # 邊緣淡黑
+        shadow.setColorAt(1.0, QColor(0, 0, 0, 0))   # 全透明
+        
+        painter.setBrush(QBrush(shadow))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(center, shadow_radius, shadow_radius)
+
         # --- 1. 背景光暈 ---
         halo_radius = (eye_width / 2) * breath_factor * 1.2
         halo = QRadialGradient(center, halo_radius)
