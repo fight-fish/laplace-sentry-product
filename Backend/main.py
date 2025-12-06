@@ -1,0 +1,538 @@
+# main.py - 【v5.2 UX 終極優化版】
+
+import sys
+import os
+import json
+# 【承諾 1: 完整導入】一次性導入所有需要的類型，杜絕 "未定義" 錯誤。
+from typing import Optional, Tuple, List, Dict, Any
+
+# HACK: 解決模組導入問題的經典技巧
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+sys.path.insert(0, project_root)
+
+# 從後端導入我們唯一的依賴：daemon
+from src.core import daemon
+
+# --- 前端專用輔助函式 ---
+
+def _call_daemon_and_get_output(command_and_args: List[str]) -> Tuple[int, str]:
+    """
+    【v-ADHOC-005 智能重試版】
+    一個特殊的、只用於獲取後端輸出的內部函式。
+    """
+    from io import StringIO
+    import contextlib
+
+    temp_stdout = StringIO()
+    temp_stderr = StringIO() # 我們也捕獲 stderr，以便在重試時保持安靜
+    exit_code = -1
+
+    # 我們將 daemon 的調用包裹在 try...except 中，以捕獲所有可能的異常
+    try:
+        with contextlib.redirect_stdout(temp_stdout), contextlib.redirect_stderr(temp_stderr):
+            exit_code = daemon.main_dispatcher(command_and_args)
+    except Exception as e:
+        # 如果在調用過程中發生任何未知崩潰，我們打印錯誤並返回一個失敗碼。
+        print(f"\n[前端致命錯誤]：在獲取輸出時，後端發生意外崩潰！\n  -> 原因: {e}", file=sys.stderr)
+        return (99, "")
+
+    # --- 【v-ADHOC-005 核心改造】 ---
+    # 我們在這裡也加入對退出碼 10 的判斷
+    if exit_code == 10:
+        # 如果收到重試信號，我們就再次調用自己，獲取恢復後的、健康的數據。
+        print("[前端日誌]：在獲取輸出時收到恢復信號(10)，正在自動重試...", file=sys.stderr)
+        return _call_daemon_and_get_output(command_and_args)
+
+    # 對於所有其他情況（包括成功 0 和其他失敗碼），我們都直接返回結果。
+    output = temp_stdout.getvalue()
+    return (exit_code, output)
+
+
+
+def _call_daemon_and_show_feedback(command_and_args: List[str]) -> bool:
+    """一個通用的、負責與後端交互並向用戶顯示回饋的函式。"""
+    print("\n[前端]：正在向後端發送指令...")
+    
+    # TAG: ADHOC-001 - 優雅失敗
+    # 我們將 daemon 的調用也包裹在 try...except 中，以捕獲它可能拋出的異常
+    try:
+        from io import StringIO
+        import contextlib
+
+        temp_stdout = StringIO()
+        temp_stderr = StringIO() # 我們也捕獲 stderr
+        exit_code = -1
+
+        # 使用 contextlib.redirect_stdout/stderr 來捕獲所有輸出
+        with contextlib.redirect_stdout(temp_stdout), contextlib.redirect_stderr(temp_stderr):
+            exit_code = daemon.main_dispatcher(command_and_args)
+        
+        output = temp_stdout.getvalue()
+        error_output = temp_stderr.getvalue()
+
+        # --- 【v-ADHOC-005 核心改造】 ---
+        # 我們現在要區分不同的退出碼
+        if exit_code == 0:
+            print("\033[92m[✓] 操作成功\033[0m") 
+            if output.strip() and output.strip() != "OK":
+                if command_and_args[0] != 'list_projects':
+                    print("--- 後端返回信息 ---\n" + output)
+            # 【修正】顯示系統通知 (stderr)，例如熱重啟提示
+            if error_output.strip():
+                print("--- 系統通知 ---\n" + error_output.strip())
+                
+            return True
+        # 我們專門為退出碼 10 開闢一條新的處理路徑
+        elif exit_code == 10:
+            # 當收到這個信號時，我們知道後端已經完成了恢復，但需要前端重試。
+            print("[前端日誌]：收到後端數據恢復信號(10)，正在自動重試...")
+            # 我們在這裡，直接、無縫地再次調用自己，把同樣的指令再發送一次。
+            # 這就是「原地重試」的核心。
+            return _call_daemon_and_show_feedback(command_and_args)
+        else:
+            # 對於所有其他的非零退出碼，我們才認為是真正的失敗。
+            print(f"\033[91m[✗] 操作失敗 (退出碼: {exit_code})\033[0m")
+            if error_output.strip():
+                print("--- 後端錯誤報告 ---\n" + error_output.strip())
+            else:
+                print("--- 後端未提供額外錯誤信息 ---")
+            return False
+
+
+    except daemon.DataRestoredFromBackupWarning as e:
+        # 當捕獲到這個特殊的、非致命的警告時...
+        print("\n" + "="*50)
+        print("\033[93m[提示] 系統偵測到您的專案設定檔曾發生輕微損壞，並已自動從最近的備份中成功恢復。\033[0m")
+        print("請您檢查一下當前的專案列表，確認最近的操作是否都已正確保存。")
+        print(f"  (恢復自: {e})")
+        print("="*50)
+        # 我們返回 True，因為從用戶的角度看，操作最終是「成功」的，系統恢復了正常。
+        return True
+
+    except (json.JSONDecodeError, IOError) as e:
+        # 針對 I/O 和 JSON 損壞的特定錯誤，給出更清晰的引導
+        print(f"\033[91m[✗] 操作失敗：發生嚴重的 I/O 或數據文件錯誤。\033[0m")
+        print("--- 錯誤詳情 ---")
+        print(str(e))
+        print("\n建議：請檢查 'data/projects.json' 文件是否存在或內容是否損壞。")
+        return False
+    except Exception as e:
+        # 通用安全氣囊保持不變
+        print(f"\n[前端致命錯誤]：調用後端時發生意外崩潰！\n  -> 原因: {e}", file=sys.stderr)
+        return False
+
+
+def _select_project(operation_name: str) -> Optional[Dict[str, Any]]:
+    """【UX 核心】列出表格化的專案，讓用戶通過數字選擇。"""
+    print(f"\n--- {operation_name} ---")
+    exit_code, projects_json_str = _call_daemon_and_get_output(['list_projects'])
+    
+
+    if exit_code != 0:
+        print("[前端]：獲取專案列表失敗！")
+        return None
+
+    try:
+        projects = json.loads(projects_json_str)
+        if not projects:
+            print("目前沒有任何已註冊的專案。")
+            return None
+    except json.JSONDecodeError:
+        print("[前端]：解析後端返回的專案列表時出錯！")
+        return None
+
+    # --- 【v5.5 狀態可視化】表格化顯示邏輯 ---
+    # 我們在表頭中，新增一個「狀態」欄位。
+    headers = {"status": "狀態", "no": "編號", "name": "專案別名"}
+
+    # 我們為不同的狀態，定義好對應的圖標。
+    status_icons = {
+        "running": "[✅ 運行中]",
+        "stopped": "[⛔️ 已停止]",
+        "invalid_path": "[❌ 路徑失效]",
+        "muting": "[🤫 靜默中]",
+    }
+
+    # 【手術 1 核心】我們在計算寬度時，也要考慮狀態圖標的寬度。
+    widths = {key: len(title) for key, title in headers.items()}
+    for i, p in enumerate(projects):
+        status_text = status_icons.get(p.get('status'), "[❔ 未知]")
+        widths['status'] = max(widths['status'], len(status_text))
+        widths['no'] = max(widths['no'], len(str(i + 1)))
+        widths['name'] = max(widths['name'], len(p.get('name', '')))
+
+    # 【手術 1 核心】我們在打印表頭時，也加入「狀態」這一列。
+    header_line = (f"  {headers['status']:<{widths['status']}}  "
+                f"| {headers['no']:<{widths['no']}}  "
+                f"| {headers['name']:<{widths['name']}}")
+    print(header_line)
+    print("-" * len(header_line))
+
+    # 【注意】這裡我們暫時還打印舊的、沒有狀態的行，這是正常的。
+    for i, p in enumerate(projects):
+        # 我們根據專案的 status，從圖標字典中獲取對應的圖標。
+        status_text = status_icons.get(p.get('status'), "[❔ 未知]")
+        # 【手術 2 核心】我們在打印每一行時，將狀態圖標放在最前面。
+        row_line = (f"  {status_text:<{widths['status']}}  "
+                    f"| {str(i + 1):<{widths['no']}}  "
+                    f"| {p.get('name', ''):<{widths['name']}}")
+        print(row_line)
+    # --- 表格化顯示結束 ---
+
+    
+    while True:
+        try:
+            choice_str = input("\n請輸入要操作的專案編號 (或按 Enter 取消) > ").strip()
+            if not choice_str: return None
+            choice_idx = int(choice_str) - 1
+            if 0 <= choice_idx < len(projects):
+                return projects[choice_idx]
+            else:
+                print("無效的編號，請重新輸入。")
+        except (ValueError, IndexError):
+            print("輸入無效，請輸入列表中的數字編號。")
+
+def _select_field_to_edit() -> Optional[str]:
+    """【UX 核心】讓用戶通過數字選擇要修改的欄位。"""
+    print("\n--- 請選擇要修改的欄位 ---")
+    fields = ['name', 'path', 'output_file']
+    for i, field in enumerate(fields):
+        print(f"  [{i + 1}] {field}")
+    
+    while True:
+        try:
+            choice_str = input("\n請輸入欄位編號 (或按 Enter 取消) > ").strip()
+            if not choice_str: return None
+            choice_idx = int(choice_str) - 1
+            if 0 <= choice_idx < len(fields):
+                return fields[choice_idx]
+            else:
+                print("無效的編號，請重新輸入。")
+        except (ValueError, IndexError):
+            print("輸入無效，請輸入列表中的數字編號。")
+
+def _audit_and_apply_suggestions():
+    """
+    審計哨兵建議（簡易 MVP 版）
+    1. 找到所有 status = 'muting' 的專案
+    2. 顯示它們的靜默路徑
+    3. 詢問是否要固化
+    4. 呼叫 daemon.add_ignore_patterns
+    """
+
+    print("\n=== 🛠 審查系統建議 (MVP 版) ===")
+
+    # 取得所有專案
+    projects = daemon.handle_list_projects()
+
+    # 找出靜默專案
+    muted_projects = [
+        p for p in projects
+        if p.get("status") == "muting"
+    ]
+
+    if not muted_projects:
+        print("✔ 目前沒有靜默中的專案，無需審查。\n")
+        return
+
+    print("\n以下專案偵測到靜默狀態：")
+    for idx, proj in enumerate(muted_projects, 1):
+        print(f"[{idx}] {proj['name']} ({proj['uuid']})")
+
+    choice = input("\n請選擇專案（輸入編號，或按 Enter 取消）: ").strip()
+    if not choice.isdigit():
+        print("已取消審查。\n")
+        return
+
+    index = int(choice) - 1
+    if index < 0 or index >= len(muted_projects):
+        print("無效的選擇。\n")
+        return
+
+    project = muted_projects[index]
+    uuid = project["uuid"]
+
+    # 讀取靜默路徑
+    muted_paths = daemon.handle_get_muted_paths([uuid])
+
+    print("程式發現以下被靜默的路徑：")
+    for i, p in enumerate(muted_paths, start=1):
+        print(f"  [{i}] {p}")
+
+    ok = input("\n是否要將這些路徑固化到 ignore_patterns？(y/N): ").strip().lower()
+    if ok != "y":
+        print("已取消固化。\n")
+        return
+
+    patterns = daemon.handle_add_ignore_patterns([uuid])
+
+    print("\n✔ 固化成功，新增的忽略規則為：")
+    for p in patterns:
+        print(f"  - {p}")
+
+    print("\n✔ 審查完成。\n")
+
+
+def _display_menu():
+    """顯示主菜單 (v5.2 簡潔版)。"""
+    print("\n" + "="*50)
+    print("      通用目錄哨兵控制中心 v5.2 (UX 畢業版)")
+    print("="*50)
+    print("  1. 新增專案")
+    print("  2. 修改專案")
+    print("  3. 刪除專案")
+    print(" --- ")
+    print("  4. 手動更新 (依名單)")
+    print("  5. (調試)自由更新")
+    print(" --- 哨兵管理 ---")
+    print("  6. 啟動哨兵 (測試)")
+    print("  7. 停止哨兵 (測試)")
+    print(" --- ")
+    print("  8. 審查系統建議")
+    print("  9. 測試後端連接 (Ping)")
+    print(" 10. 管理目錄樹忽略規則")
+    print("  0. 退出程序")
+    print("="*50)
+
+def _manage_ignore_patterns():
+    """管理單一專案的目錄樹忽略規則（全部用編號操作）。"""
+    selected_project = _select_project("管理目錄樹忽略規則")
+    if not selected_project:
+        return
+
+    uuid = selected_project.get("uuid")
+    name = selected_project.get("name", "")
+    if not uuid:
+        print("錯誤：選中的專案缺少 UUID，無法操作。")
+        return
+
+    while True:
+        try:
+            candidates = daemon.list_ignore_candidates_for_project(uuid)
+            current = set(daemon.list_ignore_patterns_for_project(uuid))
+        except Exception as e:
+            print(f"讀取忽略規則時發生錯誤：{e}")
+            return
+
+        print(f"\n=== 管理專案「{name}」的目錄忽略規則 ===\n")
+
+        if not candidates:
+            print("目前沒有可管理的名稱。")
+            return
+
+        for i, n in enumerate(candidates, start=1):
+            mark = "[✓]" if n in current else "[ ]"
+            print(f"  [{i}] {mark} {n}")
+
+        print("\n操作方式：")
+        print("  - 輸入編號或多個編號切換狀態，例如：1 或 1,3,5")
+        print("  - 輸入 a：新增一個新名稱並標記為忽略")
+        print("  - 輸入 q：保存並返回主選單")
+
+        choice = input("\n請輸入操作 > ").strip().lower()
+        if choice == "q":
+            return
+        elif choice == "a":
+            new_name = input("請輸入要新增的名稱（例：build, coverage, .cache）> ").strip()
+            if not new_name:
+                continue
+            current.add(new_name)
+        else:
+            if not choice:
+                continue
+            parts = [p.strip() for p in choice.split(",") if p.strip()]
+            for p in parts:
+                if not p.isdigit():
+                    print(f"無效的編號：{p}")
+                    continue
+                idx = int(p) - 1
+                if 0 <= idx < len(candidates):
+                    n = candidates[idx]
+                    if n in current:
+                        current.remove(n)
+                    else:
+                        current.add(n)
+                else:
+                    print(f"編號超出範圍：{p}")
+
+        try:
+            daemon.update_ignore_patterns_for_project(uuid, sorted(current))
+            print("已更新忽略規則。")
+        except Exception as e:
+            print(f"寫入忽略規則時發生錯誤：{e}")
+            return
+
+
+# --- 主執行區 ---
+
+def main():
+    """主循環，包含【原地重試】和【終極安全氣囊】。"""
+    while True:
+        try:
+            _display_menu()
+            choice = input("請選擇操作 > ").lower().strip()
+
+            if choice == '0': break
+            elif choice == '9': _call_daemon_and_show_feedback(['ping'])
+            
+            elif choice == '1':
+                while True:
+                    print("\n--- 新增模式選擇 ---")
+                    print("  [1] 建立全新專案 (Create New Project)")
+                    print("  [2] 為現有專案追加目標 (Add Target to Existing)")
+                    print("  [q] 返回主選單")
+                    
+                    sub_choice = input("請輸入選項 > ").strip().lower()
+                    
+                    if sub_choice == 'q':
+                        break
+                    
+                    # --- 分支 A：建立全新專案 (原本的邏輯) ---
+                    elif sub_choice == '1':
+                        print("\n--- 新增專案 ---")
+                        name = input("  請輸入專案別名 > ").strip()
+                        if name.lower() == 'q': continue # 小優化：允許在這裡放棄
+                        path = input("  請輸入專案目錄絕對路徑 > ").strip()
+                        output_file = input("  請輸入目標 Markdown 文件絕對路徑 > ").strip()
+                        
+                        if name and path and output_file:
+                            if _call_daemon_and_show_feedback(['add_project', name, path, output_file]):
+                                break # 成功後退出新增模式
+                        else:
+                            print("錯誤：所有欄位都必須填寫。")
+                    # --- 分支 B：追加寫入檔 (你的新需求) ---
+                    elif sub_choice == '2':
+                        # 1. 先選專案 (複用現有的表格選擇器)
+                        selected_project = _select_project("選擇要追加目標的專案")
+                        
+                        if selected_project:
+                            uuid = selected_project.get('uuid')
+                            name = selected_project.get('name')
+                            print(f"\n您正在為專案 '{name}' 新增寫入目標...")
+                            
+                            # 2. 輸入新路徑
+                            new_target = input("  請輸入新的目標 Markdown 絕對路徑 > ").strip()
+                            
+                            # 3. 呼叫後端 API
+                            if new_target:
+                                # 如果成功，就退出新增模式
+                                if _call_daemon_and_show_feedback(['add_target', str(uuid), new_target]):
+                                    break
+                            else:
+                                print("錯誤：路徑不能為空。")
+                    else:
+                        print("無效的輸入。")
+            
+            elif choice == '2':
+                selected_project = _select_project("修改專案")
+                if selected_project:
+                    uuid = selected_project.get('uuid')
+                    name = selected_project.get('name')
+                    if uuid:
+                        print(f"\n您已選擇專案：'{name}'")
+                        field = _select_field_to_edit()
+                        if field:
+                            new_value = input(f"  請輸入 '{field}' 的新值 > ").strip()
+                            if new_value:
+                                _call_daemon_and_show_feedback(['edit_project', str(uuid), str(field), new_value])
+                            else:
+                                print("錯誤：新值不能為空。")
+                    else:
+                        print("錯誤：選中的專案缺少 UUID，無法操作。")
+
+            elif choice == '3':
+                selected_project = _select_project("刪除專案")
+                if selected_project:
+                    uuid = selected_project.get('uuid')
+                    name = selected_project.get('name')
+                    if uuid:
+                        confirm = input(f"\n\033[91m[警告] 您確定要刪除專案 '{name}' 嗎？(輸入 y 確認)\033[0m > ").lower().strip()
+                        if confirm == 'y':
+                            _call_daemon_and_show_feedback(['delete_project', uuid])
+                        else:
+                            print("刪除操作已取消。")
+                    else:
+                        print("錯誤：選中的專案缺少 UUID，無法操作。")
+
+            elif choice == '4':
+                selected_project = _select_project("手動更新")
+                if selected_project:
+                    uuid = selected_project.get('uuid')
+                    if uuid:
+                        _call_daemon_and_show_feedback(['manual_update', uuid])
+                    else:
+                        print("錯誤：選中的專案缺少 UUID，無法操作。")
+
+            elif choice == '5':
+                print("\n--- (調試)自由更新 ---")
+                project_path = input("  請輸入專案目錄絕對路徑 > ").strip()
+                target_doc = input("  請輸入目標 Markdown 文件絕對路徑 > ").strip()
+                if project_path and target_doc:
+                    _call_daemon_and_show_feedback(['manual_direct', project_path, target_doc])
+                else:
+                    print("錯誤：兩個路徑都必須提供。")
+
+            # 【v5.6 正式版交互】
+            # 理由：將「啟動哨兵」，接入標準的、優雅的表格選擇流程。
+            elif choice == '6':
+                selected_project = _select_project("啟動哨兵")
+                if selected_project:
+                    uuid = selected_project.get('uuid')
+                    if uuid:
+                        _call_daemon_and_show_feedback(['start_sentry', uuid])
+                    else:
+                        print("錯誤：選中的專案缺少 UUID，無法操作。")
+
+            # 【v5.6 正式版交互】
+            # 理由：將「停止哨兵」，也接入標準的表格選擇流程。
+            elif choice == '7':
+                selected_project = _select_project("停止哨兵")
+                if selected_project:
+                    uuid = selected_project.get('uuid')
+                    if uuid:
+                        _call_daemon_and_show_feedback(['stop_sentry', uuid])
+                    else:
+                        print("錯誤：選中的專案缺少 UUID，無法操作。")
+            
+            elif choice == '8':
+                _audit_and_apply_suggestions()
+
+            elif choice == '10':
+                _manage_ignore_patterns()
+
+            else:
+                print(f"無效的選擇 '{choice}'。")
+
+            if choice not in ['0']:
+                input("\n--- 按 Enter 鍵返回主菜單 ---")
+
+        except KeyboardInterrupt:
+            # 修正：強制返回主菜單，忽略意外的信號干擾
+            print("\n\n【警告】偵測到信號干擾，程式將返回主菜單。")
+            continue
+        except Exception as e:
+            # 【承諾 3: 終極安全氣囊】
+            print("\n" + "="*50)
+            print("\033[91m【主程序發生致命錯誤！】\033[0m")
+            print("一個未被預料的錯誤導致當前操作失敗，但主程序依然穩定。")
+            print("請將以下錯誤信息截圖，以便我們進行分析：")
+            print(f"  錯誤類型: {type(e).__name__}")
+            print(f"  錯誤詳情: {e}")
+            print("="*50)
+            input("\n--- 按 Enter 鍵返回主菜單 ---")
+
+if __name__ == "__main__":
+    # 【G-2 核心修正】自動判斷模式
+    # 如果有傳入參數（代表是哨兵或腳本呼叫的），走「快速通道」
+    if len(sys.argv) > 1:
+        # 取出指令參數（去掉第一個 main.py 本身）
+        args = sys.argv[1:]
+        
+        # 使用封裝好的函式，享受自動重試和錯誤處理的好處
+        success = _call_daemon_and_show_feedback(args)
+        
+        # 告訴呼叫者結果：成功回傳 0，失敗回傳 1
+        sys.exit(0 if success else 1)
+    else:
+        # 沒有參數（代表是人點開的），才進入「互動餐廳」
+        main()
