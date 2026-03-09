@@ -1363,9 +1363,9 @@ class DashboardWidget(QWidget):
         # --- 頂部導航區 (返回按鈕) ---
         nav_layout = QHBoxLayout()
         # 依照 UI_Strings_Reference_v2.md 定義的返回按鈕
-        btn_back = QPushButton("↩ 返回哨兵之眼") 
+        btn_back = QPushButton("↩ 返回哨兵之眼")
         # 將按鈕連接到我們在 __init__ 中儲存的回調
-        btn_back.clicked.connect(self.switch_callback) 
+        btn_back.clicked.connect(self.switch_callback)
 
         # 標題
         title_label = QLabel("Sentry 控制台")
@@ -1409,15 +1409,22 @@ class DashboardWidget(QWidget):
         # 設定標籤的文字在超過寬度時可以自動換行（setWordWrap）。
         self.status_label.setWordWrap(True)
 
-        # --- 5. 組合所有佈局 ---
-        # 把分割器（splitter）加入到主佈局（main_layout）的上半部分。
-        main_layout.addWidget(splitter)
-        # 把底部面板（bottom_panel）加入到主佈局的中間部分。
-        main_layout.addWidget(bottom_panel)
+        # --- 5. 建立上下可拖曳分隔 ---
+        # 這一層只負責讓「上半整塊」與「下半整塊」之間可以拖曳移動，
+        # 不改動上下兩塊內部原本的格局。
+        main_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        main_splitter.addWidget(splitter)
+        main_splitter.addWidget(bottom_panel)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+
+        # --- 6. 組合所有佈局 ---
+        # 把上下分割器加入到主佈局。
+        main_layout.addWidget(main_splitter)
         # 把狀態標籤（status_label）加入到主佈局的最下方。
         main_layout.addWidget(self.status_label)
 
-        # --- 6. 事件連結 (Signal/Slot) ---
+        # --- 7. 事件連結 (Signal/Slot) ---
         # 當表格的選擇改變時（itemSelectionChanged），連結（connect）到處理函式。
         self.project_table.itemSelectionChanged.connect(
             self._on_project_selection_changed
@@ -1491,11 +1498,16 @@ class DashboardWidget(QWidget):
         layout = QVBoxLayout(frame)
 
         # --- 上半部：專案詳情 ---
-        self.detail_label = QLabel(
+        self.detail_label = QTextEdit()
+        self.detail_label.setReadOnly(True)
+        self.detail_label.setFrameShape(QFrame.Shape.NoFrame)
+        self.detail_label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.detail_label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.detail_label.setMinimumHeight(120)
+        self.detail_label.setPlainText(
             "專案詳情區：\n"
             "選取左側某個專案後，會在這裡顯示其狀態與模式。"
         )
-        self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
 
         # 加入分隔線
@@ -1521,80 +1533,84 @@ class DashboardWidget(QWidget):
         # 設定框架的外觀形狀（setFrameShape）為帶有樣式（StyledPanel）的面板。
         frame.setFrameShape(QFrame.Shape.StyledPanel)
 
-        # 建立主佈局，採用水平佈局（QHBoxLayout），把左右兩塊內容並排。
+        # 建立主佈局，採用水平佈局（QHBoxLayout），把左側控制區與右側工作區並排。
         layout = QHBoxLayout(frame)
 
-        # 左側：忽略設定 + 狀態訊息（採用垂直佈局）
+        # 左側：忽略設定 + 狀態訊息 + 偏好設定（採用垂直佈局）
         left_panel = QVBoxLayout()
 
         # [1] 忽略設定說明
-        # 建立一個標籤（QLabel）用於顯示忽略設定資訊。
         self.ignore_info_label = QLabel("忽略設定區（暫時版）：尚未載入設定。")
-        # 設定文字自動換行（setWordWrap）。
         self.ignore_info_label.setWordWrap(True)
-        # 把標籤加入（addWidget）到左側垂直佈局。
         left_panel.addWidget(self.ignore_info_label)
 
         # [2] 狀態訊息列
-        # 建立另一個標籤（QLabel）用於顯示詳細的狀態訊息。
         self.status_message_label = QLabel("狀態訊息：目前沒有任何訊息。")
         self.status_message_label.setWordWrap(True)
-        # 用比較淡的顏色（#666666）當預設，讓狀態訊息不要太突兀。
         self.status_message_label.setStyleSheet("color: #666666;")
         left_panel.addWidget(self.status_message_label)
 
         # [Task 9.4] 偏好設定區塊
         pref_layout = QHBoxLayout()
-        pref_layout.setContentsMargins(0, 10, 0, 10) # 上下留白
-        
+        pref_layout.setContentsMargins(0, 10, 0, 10)
+
         self.check_guidance = QCheckBox("啟用氣泡引導")
         self.check_guidance.setChecked(True)
         self.check_guidance.setToolTip("開啟後，哨兵會在桌面顯示操作提示氣泡")
-        
+
         self.check_smart = QCheckBox("啟用智慧配對")
         self.check_smart.setChecked(True)
         self.check_smart.setToolTip("開啟後，拖曳資料夾時會自動尋找 README.md")
-        
-        # 綁定事件：當勾選改變時，呼叫 _on_pref_changed
+
         self.check_guidance.toggled.connect(self._on_pref_changed)
         self.check_smart.toggled.connect(self._on_pref_changed)
-        
+
         pref_layout.addWidget(self.check_guidance)
         pref_layout.addWidget(self.check_smart)
         pref_layout.addStretch(1)
-        
-        # 把這個設定區加入左側面板
-        left_panel.addLayout(pref_layout)
 
-        # 讓這兩行資訊貼上去，底下留空（addStretch(1)）。
+        left_panel.addLayout(pref_layout)
         left_panel.addStretch(1)
 
-        # 右側：按鈕群（採用垂直佈局）
-        button_panel = QVBoxLayout()
-        # 建立第一個按鈕：審查靜默項目 (對應 CLI Option 8)
-        # 改成 self.btn_audit_muted，方便後續控制
-        self.btn_audit_muted = QPushButton("審查靜默/過熱項目…")
-        self.btn_audit_muted.clicked.connect(self._open_audit_dialog) # 稍後實作此函式
+        # 右側：主操作區（按鈕 + 目錄樹工作區）
+        right_panel = QVBoxLayout()
 
-        # 建立第二個按鈕：編輯目錄樹忽略規則 (對應 CLI Option 10)
+        action_layout = QHBoxLayout()
+
+        self.btn_audit_muted = QPushButton("審查靜默/過熱項目…")
+        self.btn_audit_muted.clicked.connect(self._open_audit_dialog)
+
         self.btn_tree_ignore = QPushButton("編輯目錄樹忽略規則…")
         self.btn_tree_ignore.clicked.connect(self._open_ignore_settings_dialog)
 
-        # 預設禁用這兩個按鈕
         self.btn_audit_muted.setEnabled(False)
         self.btn_tree_ignore.setEnabled(False)
 
-        # 把按鈕依序加入（addWidget）到右側垂直佈局。
-        button_panel.addWidget(self.btn_audit_muted) 
-        button_panel.addWidget(self.btn_tree_ignore)       
-        # 加入拉伸因子（addStretch(1)），把按鈕推到頂部。
-        button_panel.addStretch(1)
+        action_layout.addWidget(self.btn_audit_muted)
+        action_layout.addWidget(self.btn_tree_ignore)
+        action_layout.addStretch(1)
+
+        right_panel.addLayout(action_layout)
+
+        self.tree_workspace = QFrame()
+        self.tree_workspace.setFrameShape(QFrame.Shape.Box)
+        self.tree_workspace.setMinimumHeight(120)
+
+        tree_layout = QVBoxLayout(self.tree_workspace)
+        tree_layout.setContentsMargins(12, 12, 12, 12)
+
+        tree_placeholder = QLabel("目錄樹工作區")
+        tree_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tree_placeholder.setStyleSheet("font-size: 32px; color: #222222;")
+        tree_layout.addStretch(1)
+        tree_layout.addWidget(tree_placeholder)
+        tree_layout.addStretch(1)
+
+        right_panel.addWidget(self.tree_workspace, stretch=1)
 
         # --- 組合佈局 ---
-        # 把左側面板加入（addLayout）到主水平佈局，佔 3 的比例。
-        layout.addLayout(left_panel, stretch=3)
-        # 把右側按鈕群加入，佔 2 的比例。
-        layout.addLayout(button_panel, stretch=2)
+        layout.addLayout(left_panel, stretch=2)
+        layout.addLayout(right_panel, stretch=3)
 
         # 回傳（return）設定好的框架元件。
         return frame
@@ -2245,21 +2261,19 @@ class DashboardWidget(QWidget):
         # 用「return ... if ... else ...」來判斷並回傳（return）中文標籤。
         return "靜默" if mode == "silent" else "互動"
     
-    # --- 實作無邊框視窗的拖曳功能 ---
+    # --- Dashboard 模式下不接管整頁拖曳 ---
+    # 目前 Dashboard 是一般可縮放視窗，應交由系統標題列負責移動。
+    # 這樣才不會搶走 QSplitter 的拖曳事件。
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.old_pos = event.globalPosition().toPoint()
+        self.old_pos = None
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.old_pos:
-            delta = event.globalPosition().toPoint() - self.old_pos
-            # 注意：這裡是移動父容器 (SentryTrayAppV2.container)
-            # 因為 DashboardWidget 只是 container 裡的一頁
-            self.window().move(self.window().pos() + delta)
-            self.old_pos = event.globalPosition().toPoint()
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         self.old_pos = None
+        super().mouseReleaseEvent(event)
 
 
 # ==========================================
@@ -2334,16 +2348,21 @@ class SentryTrayAppV2:
         self.container = QStackedWidget()
         self.container.setWindowTitle("Sentry v2.0 Sandbox")
         self.container.resize(900, 600)
+        # [UI-Only Phase] 記錄 Dashboard 最近一次尺寸，避免切回後丟失使用者調整結果
+        self.dashboard_size = QSize(900, 600)
 
         # 建立 View A，並傳入切換與關機的函式
         self.view_a = SentryEyeWidget(
             switch_callback=self.go_to_dashboard,
             shutdown_callback=self.app.quit # [NEW] 將 app.quit 函式傳入給 View A
-)       
+        )
         # 替換為我們剛剛貼入並改名的 DashboardWidget
         # 這裡我們傳入了 self.go_to_eye 函式作為返回按鈕的回調
         # type: ignore # 【技術鎮壓】忽略 Pylance 對 update_tooltip 的循環依賴警告
-        self.view_b = DashboardWidget(on_stats_change=lambda r, m: self.update_tooltip(r, m), switch_callback=self.go_to_eye)
+        self.view_b = DashboardWidget(
+            on_stats_change=lambda r, m: self.update_tooltip(r, m),
+            switch_callback=self.go_to_eye,
+        )
         # 把視圖加入（addWidget）容器中。
         # 索引 0 = View A
         self.container.addWidget(self.view_a)
@@ -2352,36 +2371,58 @@ class SentryTrayAppV2:
         # [Task 9.4] 連接 Dashboard 的偏好設定訊號到 Eye
         self.view_b.preferences_changed.connect(self.view_a.set_preferences)
 
-        # --- 改成呼叫 go_to_eye() 來初始化 ---
-        # 這會同時設定頁面並將視窗縮小為 130x130
-        self.go_to_eye()
-
-        # 設定容器視窗屬性以支援透明背景
+        # [初始化順序修正] 先套用 Eye 視窗所需的透明與無邊框屬性，
+        # 再呼叫 go_to_eye()，避免第一次 show() 時透明背景尚未生效。
         self.container.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         # [修改] 移除 WindowStaysOnTopHint，不再強制置頂
         self.container.setWindowFlags(Qt.WindowType.FramelessWindowHint)
 
+        # --- 改成呼叫 go_to_eye() 來初始化 ---
+        # 這會同時設定頁面並將視窗縮小為 130x130
+        self.go_to_eye()
+
         # FIX: 系統啟動時 View A 不再躲起來，而是立即顯示。
         # 使用 singleShot 確保在事件循環啟動後再執行 show()。
-        QTimer.singleShot(100, lambda: self.container.show()) 
+        QTimer.singleShot(100, lambda: self.container.show())
         QTimer.singleShot(100, lambda: self.container.activateWindow())
         QTimer.singleShot(100, lambda: self.container.raise_())
 
     def go_to_dashboard(self):
-        """切換到 View B (展開)"""
-        # 1. 命令 View B 重新去後端拉取最新資料
+        """切換到 View B (展開 + 可拉伸)"""
+        # 1. 若目前在 Dashboard，先記住使用者最後一次調整的尺寸
+        if self.container.currentIndex() == 1:
+            self.dashboard_size = self.container.size()
+
+        # 2. 命令 View B 重新去後端拉取最新資料
         self.view_b._reload_projects_from_backend()
-        # 2. 切換頁面
+
+        # 3. 切換為一般可縮放視窗
+        self.container.hide()
+        self.container.setWindowFlags(Qt.WindowType.Window)
+        self.container.show()
+
+        # 4. 切換頁面並恢復 Dashboard 尺寸
         self.container.setCurrentIndex(1)
-        # 3. [新增] 展開視窗為後台尺寸
-        self.container.resize(900, 600)
-    
+        self.container.resize(self.dashboard_size)
+        self.container.activateWindow()
+        self.container.raise_()
+
     def go_to_eye(self):
-        """切換到 View A (縮微)"""
-        # 1. 切換頁面
+        """切換到 View A (縮微 + 固定眼球視窗)"""
+        # 1. 離開 Dashboard 前，記住最近一次尺寸
+        if self.container.currentIndex() == 1:
+            self.dashboard_size = self.container.size()
+
+        # 2. 切換為無邊框眼球視窗
+        self.container.hide()
+        self.container.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.container.show()
+
+        # 3. 切換頁面並縮回眼球尺寸
         self.container.setCurrentIndex(0)
-        # 2. [新增] 縮小視窗為眼球尺寸
         self.container.resize(130, 130)
+        self.container.activateWindow()
+        self.container.raise_()
 
     def toggle_window(self):
         """切換視窗顯示狀態"""
