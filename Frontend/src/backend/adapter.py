@@ -566,6 +566,18 @@ class BackendAdapter:
         if isinstance(result, list):
             return [str(x) for x in result]
         return []
+
+    def get_project_tree(self, uuid: str) -> Dict[str, Any]:
+        """呼叫 WSL 獲取指定專案的結構化目錄樹資料。"""
+        if not uuid:
+            raise BackendError("讀取目錄樹失敗：UUID 為空。")
+
+        result = self._run_wsl_command("get_project_tree", uuid)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("讀取目錄樹失敗：後端未回傳合法 JSON 物件。")
     
     # [Task 9.4] 審計功能：獲取靜默路徑
     def get_muted_paths(self, uuid: str) -> List[str]:
@@ -778,6 +790,10 @@ def match_project_by_path(local_path: str) -> Optional[ProjectInfo]:
 def get_log_content(uuid: str) -> List[str]:
     adapter = _ensure_adapter()
     return adapter.get_log_content(uuid)
+
+def get_project_tree(uuid: str) -> Dict[str, Any]:
+    adapter = _ensure_adapter()
+    return adapter.get_project_tree(uuid)
 
 # [Task 9.4] 對外公開接口
 def get_muted_paths(uuid: str) -> List[str]:
