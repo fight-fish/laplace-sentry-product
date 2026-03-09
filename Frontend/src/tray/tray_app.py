@@ -4,6 +4,7 @@
 
 # --- 1. 系統與基礎工具 ---
 import sys
+import json
 from typing import List, Dict, Any
 import math
 from pathlib import Path
@@ -60,6 +61,9 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDialog,
     QCheckBox,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QHeaderView,
 )
 
 # --- 3. 專案內部模組 ---
@@ -1429,6 +1433,7 @@ class DashboardWidget(QWidget):
         self.project_table.itemSelectionChanged.connect(
             self._on_project_selection_changed
         )
+        self.tree_viewer.currentItemChanged.connect(self._on_tree_item_changed)
         # 當表格的項目被雙擊時（itemDoubleClicked），連結（connect）到處理函式。
         self.project_table.itemDoubleClicked.connect(
             self._on_project_double_clicked
@@ -1583,34 +1588,73 @@ class DashboardWidget(QWidget):
         self.btn_tree_ignore = QPushButton("編輯目錄樹忽略規則…")
         self.btn_tree_ignore.clicked.connect(self._open_ignore_settings_dialog)
 
+        self.btn_copy_tree = QPushButton("複製目錄樹")
+        self.btn_copy_tree.clicked.connect(self._copy_current_tree)
+        self.btn_copy_tree.setEnabled(False)
+
         self.btn_audit_muted.setEnabled(False)
         self.btn_tree_ignore.setEnabled(False)
 
         action_layout.addWidget(self.btn_audit_muted)
         action_layout.addWidget(self.btn_tree_ignore)
+        action_layout.addWidget(self.btn_copy_tree)
         action_layout.addStretch(1)
 
         right_panel.addLayout(action_layout)
 
         self.tree_workspace = QFrame()
         self.tree_workspace.setFrameShape(QFrame.Shape.Box)
-        self.tree_workspace.setMinimumHeight(120)
+        self.tree_workspace.setMinimumHeight(0)
 
         tree_layout = QVBoxLayout(self.tree_workspace)
         tree_layout.setContentsMargins(12, 12, 12, 12)
 
-        tree_placeholder = QLabel("目錄樹工作區")
-        tree_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tree_placeholder.setStyleSheet("font-size: 32px; color: #222222;")
-        tree_layout.addStretch(1)
-        tree_layout.addWidget(tree_placeholder)
-        tree_layout.addStretch(1)
+        tree_splitter = QSplitter(Qt.Orientation.Horizontal, self.tree_workspace)
+
+        self.tree_viewer = QTreeWidget()
+        self.tree_viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.tree_viewer.setHeaderLabels(["名稱"])
+        self.tree_viewer.setColumnCount(1)
+        self.tree_viewer.setAlternatingRowColors(True)
+        self.tree_viewer.setRootIsDecorated(True)
+        self.tree_viewer.setUniformRowHeights(True)
+        self.tree_viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_viewer.setTextElideMode(Qt.TextElideMode.ElideNone)
+
+        tree_header = self.tree_viewer.header()
+        tree_header.setStretchLastSection(True)
+        tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        self.tree_comment_viewer = QTextEdit()
+        self.tree_comment_viewer.setReadOnly(True)
+        self.tree_comment_viewer.setFrameShape(QFrame.Shape.StyledPanel)
+        self.tree_comment_viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_comment_viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_comment_viewer.setPlaceholderText("選取目錄樹節點後，會在這裡顯示完整註解。")
+        self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+
+        placeholder_item = QTreeWidgetItem(["目錄樹工作區"])
+        placeholder_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "comment": "選取左側某個專案後，會在這裡顯示目錄樹。",
+            "path_key": "",
+            "is_dir": True,
+        })
+        self.tree_viewer.addTopLevelItem(placeholder_item)
+        self.tree_viewer.expandAll()
+
+        tree_splitter.addWidget(self.tree_viewer)
+        tree_splitter.addWidget(self.tree_comment_viewer)
+        tree_splitter.setStretchFactor(0, 3)
+        tree_splitter.setStretchFactor(1, 2)
+
+        tree_layout.addWidget(tree_splitter)
 
         right_panel.addWidget(self.tree_workspace, stretch=1)
 
         # --- 組合佈局 ---
-        layout.addLayout(left_panel, stretch=2)
-        layout.addLayout(right_panel, stretch=3)
+        layout.addLayout(left_panel, stretch=1)
+        layout.addLayout(right_panel, stretch=4)
 
         # 回傳（return）設定好的框架元件。
         return frame
@@ -1882,6 +1926,144 @@ class DashboardWidget(QWidget):
     # ---------------------------
 
 # 這裡，我們用「def」來定義（define）當專案列表的選取項目改變時（selection_changed）執行的函式。
+    def _tree_to_plaintext_lines(
+        self,
+        node: Dict[str, Any],
+        prefix: str = "",
+        is_last: bool = True,
+        is_root: bool = True,
+    ) -> List[str]:
+        """把樹資料轉成可複製的純文字樹（含樹枝符號）。"""
+        if not isinstance(node, dict):
+            return []
+
+        name = str(node.get("name", ""))
+        comment = str(node.get("comment", "") or "")
+
+        if is_root:
+            line = name
+            child_prefix = ""
+        else:
+            branch = "└── " if is_last else "├── "
+            line = f"{prefix}{branch}{name}"
+            child_prefix = prefix + ("    " if is_last else "│   ")
+
+        if comment:
+            line = f"{line}    # {comment}"
+
+        lines = [line]
+
+        children = node.get("children", [])
+        if isinstance(children, list):
+            valid_children = [child for child in children if isinstance(child, dict)]
+            for index, child in enumerate(valid_children):
+                child_is_last = (index == len(valid_children) - 1)
+                lines.extend(
+                    self._tree_to_plaintext_lines(
+                        child,
+                        prefix=child_prefix,
+                        is_last=child_is_last,
+                        is_root=False,
+                    )
+                )
+
+        return lines
+
+    def _copy_current_tree(self) -> None:
+        """複製目前已載入的整棵目錄樹。"""
+        tree_payload = getattr(self, "_current_tree_payload", None)
+        if not isinstance(tree_payload, dict) or not tree_payload:
+            self._set_status_message("目前沒有可複製的目錄樹。", level="error")
+            return
+
+        lines = self._tree_to_plaintext_lines(tree_payload)
+        text = "\n".join(lines).strip()
+
+        if not text:
+            self._set_status_message("目前沒有可複製的目錄樹內容。", level="error")
+            return
+
+        QApplication.clipboard().setText(text)
+        self._set_status_message("✓ 已複製目前目錄樹到剪貼簿。", level="success")
+
+    def _populate_tree_widget(self, node: Dict[str, Any], parent_item: QTreeWidgetItem | None = None) -> None:
+        """把後端回傳的巢狀 tree JSON 轉成 QTreeWidgetItem。"""
+        if not isinstance(node, dict):
+            return
+
+        name = str(node.get("name", ""))
+        comment = node.get("comment")
+        comment_text = "" if comment is None else str(comment)
+        path_key = str(node.get("path_key", ""))
+        is_dir = bool(node.get("is_dir", False))
+
+        item = QTreeWidgetItem([name])
+        item.setData(0, Qt.ItemDataRole.UserRole, {
+            "comment": comment_text,
+            "path_key": path_key,
+            "is_dir": is_dir,
+        })
+
+        if parent_item is None:
+            self.tree_viewer.addTopLevelItem(item)
+        else:
+            parent_item.addChild(item)
+
+        children = node.get("children", [])
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    self._populate_tree_widget(child, item)
+
+    def _show_tree_placeholder(self) -> None:
+        """恢復目錄樹工作區的預設提示。"""
+        self.tree_viewer.clear()
+        self._current_tree_payload = None
+
+        placeholder_item = QTreeWidgetItem(["目錄樹工作區"])
+        placeholder_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "comment": "選取左側某個專案後，會在這裡顯示目錄樹。",
+            "path_key": "",
+            "is_dir": True,
+        })
+        self.tree_viewer.addTopLevelItem(placeholder_item)
+        self.tree_viewer.expandAll()
+
+        if hasattr(self, 'tree_comment_viewer'):
+            self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+
+        if hasattr(self, 'btn_copy_tree'):
+            self.btn_copy_tree.setEnabled(False)
+
+    def _on_tree_item_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None = None) -> None:
+        """當使用者點選樹節點時，更新右側註解詳情區。"""
+        if not hasattr(self, 'tree_comment_viewer'):
+            return
+
+        if current is None:
+            self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+            return
+
+        payload = current.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            self.tree_comment_viewer.setPlainText("此節點沒有可顯示的註解。")
+            return
+
+        name = current.text(0)
+        comment_text = str(payload.get("comment", "") or "(無註解)")
+        path_key = str(payload.get("path_key", "") or "(root)")
+        node_type = "資料夾" if bool(payload.get("is_dir", False)) else "檔案"
+
+        detail_lines = [
+            f"名稱：{name}",
+            f"類型：{node_type}",
+            f"路徑鍵：{path_key}",
+            "",
+            "註解：",
+            comment_text,
+        ]
+        self.tree_comment_viewer.setPlainText("\n".join(detail_lines))
+
     def _on_project_selection_changed(self) -> None:
         # 獲取（get）目前選取的行號（currentRow）。
         row = self.project_table.currentRow()
@@ -1890,9 +2072,14 @@ class DashboardWidget(QWidget):
         if row < 0 or row >= len(self.current_projects):
             self._update_detail_panel(None)
             self.btn_tree_ignore.setEnabled(False)
+            self.btn_audit_muted.setEnabled(False)
+            if hasattr(self, 'btn_copy_tree'):
+                self.btn_copy_tree.setEnabled(False)
             # [New] 清空日誌
             if hasattr(self, 'log_viewer'):
                 self.log_viewer.set_logs([])
+            if hasattr(self, 'tree_viewer'):
+                self._show_tree_placeholder()
             return
 
         # 從「專案籃子」（self.current_projects）中，根據行號（row）取出選取的專案（proj）。
@@ -1901,15 +2088,32 @@ class DashboardWidget(QWidget):
         self._update_detail_panel(proj)
 
         # 有選到專案，啟用按鈕
-        self.btn_tree_ignore.setEnabled(True) 
-        # [Task 9.4-Audit] 解除封印：只要選中專案，就允許審查
+        self.btn_tree_ignore.setEnabled(True)
         self.btn_audit_muted.setEnabled(True)
 
         # [New] 讀取並顯示日誌
-        # 呼叫 Adapter 獲取該專案的日誌內容
         logs = adapter.get_log_content(proj.uuid)
-        # 餵給顯示器
         self.log_viewer.set_logs(logs)
+
+        # [R-02-02] 讀取並顯示結構化目錄樹
+        tree_payload = adapter.get_project_tree(proj.uuid)
+        tree_only = tree_payload.get("tree", {})
+
+        self.tree_viewer.clear()
+        if isinstance(tree_only, dict) and tree_only:
+            self._current_tree_payload = tree_only
+            if hasattr(self, 'btn_copy_tree'):
+                self.btn_copy_tree.setEnabled(True)
+
+            self._populate_tree_widget(tree_only)
+            self.tree_viewer.expandToDepth(1)
+
+            first_item = self.tree_viewer.topLevelItem(0)
+            if first_item is not None:
+                self.tree_viewer.setCurrentItem(first_item)
+                self._on_tree_item_changed(first_item)
+        else:
+            self._show_tree_placeholder()
     
     # 這裡，我們用「def」來定義（define）當專案列表被雙擊時（double_clicked）執行的函式。
     def _on_project_double_clicked(self) -> None:

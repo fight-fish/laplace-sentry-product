@@ -11,20 +11,13 @@ from typing import Optional, Tuple, List, Dict, Any
 
 # 導入（import）專案內部的專家模組
 # 1. 路徑專家：負責路徑計算與驗證
-from .path import (
-    normalize_path, 
-    validate_paths_exist,
-    get_project_root,
-    get_temp_dir,
-    get_lists_dir,
-    get_sentry_dir,
-    get_projects_temp_dir
-)
+from .path import (normalize_path, validate_paths_exist, get_project_root, get_temp_dir, get_lists_dir, get_sentry_dir, get_projects_temp_dir)
 # 2. 工人專家：負責執行更新
 from .worker import execute_update_workflow
-# 3. I/O 網關：負責安全讀寫與備份
+# 3 目錄樹專家：負責提供 UI 用的結構化樹資料
+from .engine import generate_structured_tree
+# 4. I/O 網關：負責安全讀寫與備份
 from .io_gateway import safe_read_modify_write, DataRestoredFromBackupWarning
-
 
 
 # --- 內部清理函式 ---
@@ -136,10 +129,37 @@ def read_projects_data(file_path: str) -> List[Dict[str, Any]]:
         return new_data
 
     except DataRestoredFromBackupWarning:
-        raise # 讓信號繼續向上傳遞給 main_dispatcher
+        raise  # 讓信號繼續向上傳遞給 main_dispatcher
     except IOError as e:
         print(f"【守護進程警告】：讀取專案文件時出錯: {e}", file=sys.stderr)
         return []
+
+
+def read_projects_data_readonly(file_path: str) -> List[Dict[str, Any]]:
+    """
+    純唯讀地讀取 projects.json。
+    用途：提供給不允許產生任何寫入副作用的查詢型 API（例如 get_project_tree）。
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        if not content.strip():
+            return []
+
+        data = json.loads(content)
+        if isinstance(data, list):
+            return data
+
+        print("【守護進程警告】：projects.json 內容不是 list，已回傳空列表。", file=sys.stderr)
+        return []
+
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError as e:
+        raise IOError(f"唯讀解析專案文件失敗（JSON 損壞）: {e}")
+    except OSError as e:
+        raise IOError(f"唯讀讀取專案文件失敗: {e}")
 
 
 def write_projects_data(data: List[Dict[str, Any]], file_path: str):
@@ -972,6 +992,55 @@ def handle_stop_sentry(args: List[str], projects_file_path: Optional[str] = None
             except Exception: pass
             del sentry_log_files[uuid_to_stop]
 
+def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    【API】依專案 UUID 取得結構化目錄樹資料。
+    只回傳 JSON 樹資料，不寫入 Markdown、不產生副作用。
+    """
+    PROJECTS_FILE = get_projects_file_path(projects_file_path)
+
+    if len(args) != 1:
+        raise ValueError("【讀取目錄樹失敗】：需要 1 個參數 (uuid)。")
+
+    uuid_target = args[0]
+    projects_data = read_projects_data_readonly(PROJECTS_FILE)
+    selected_project = next((p for p in projects_data if p.get('uuid') == uuid_target), None)
+
+    if not selected_project:
+        raise ValueError(f"未找到具有該 UUID 的專案 '{uuid_target}'。")
+
+    project_path = selected_project.get('path')
+    targets = _get_targets_from_project(selected_project)
+    ignore_list = selected_project.get("ignore_patterns")
+    ignore_patterns = set(ignore_list) if isinstance(ignore_list, list) else None
+
+    if not project_path or not os.path.isdir(project_path):
+        raise ValueError(f"專案 '{selected_project.get('name')}' 的路徑不存在或無效。")
+
+    old_content = ""
+    if targets:
+        first_target = targets[0]
+        if isinstance(first_target, str) and first_target.strip() and os.path.isfile(first_target):
+            try:
+                with open(first_target, 'r', encoding='utf-8') as f:
+                    old_content = f.read()
+            except Exception:
+                old_content = ""
+
+    tree_data = generate_structured_tree(
+        project_path,
+        old_content_string=old_content,
+        ignore_patterns=ignore_patterns,
+    )
+
+    return {
+        "uuid": uuid_target,
+        "project_name": selected_project.get("name", "Unnamed_Project"),
+        "project_path": project_path,
+        "tree": tree_data,
+    }
+
+
 def handle_get_log(args: List[str], projects_file_path: Optional[str] = None) -> List[str]:
     """【API】讀取日誌 (Tail)。"""
     PROJECTS_FILE = get_projects_file_path(projects_file_path)
@@ -1144,6 +1213,13 @@ def main_dispatcher(argv: List[str], **kwargs):
                 print("錯誤：缺少 UUID 參數。", file=sys.stderr)
                 return 1
             result = handle_get_log(args, projects_file_path=projects_file_path)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+
+        elif command == 'get_project_tree':
+            if not args:
+                print("錯誤：缺少 UUID 參數。", file=sys.stderr)
+                return 1
+            result = handle_get_project_tree(args, projects_file_path=projects_file_path)
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         else:

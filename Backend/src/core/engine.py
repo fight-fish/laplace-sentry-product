@@ -387,6 +387,161 @@ def _merge_and_align_comments_by_path(
 # 【v4.0 核心演算法】 - 總裝配線 (Public API)
 # ==============================================================================
 
+def _select_comment_for_path(
+    path_key: str,
+    path_comments: Dict[str, str],
+    basename_comments: Dict[str, str],
+    used_basenames: Set[str],
+) -> Optional[str]:
+    """
+    依照既有註解合併規則，為單一路徑選出最終註解。
+    """
+    if path_key in path_comments:
+        return path_comments[path_key]
+
+    base = os.path.basename(path_key.rstrip("/"))
+    if base and base in basename_comments and base not in used_basenames:
+        used_basenames.add(base)
+        return basename_comments[base]
+
+    return None
+
+
+def _get_parent_path_key(path_key: str) -> Optional[str]:
+    """
+    依目前節點 path_key 反推出父節點 path_key。
+    """
+    if path_key == "":
+        return None
+
+    normalized = path_key.rstrip("/")
+    parent_normalized = os.path.dirname(normalized)
+
+    if not parent_normalized:
+        return ""
+
+    return parent_normalized + "/"
+
+
+def _build_structured_tree(
+    tree_nodes: List[TreeNode],
+    path_comments: Dict[str, str],
+    basename_comments: Dict[str, str],
+) -> Dict[str, object]:
+    """
+    將扁平的 tree_nodes 轉為巢狀 TreeNode JSON 結構。
+
+    TreeNode 結構：
+    {
+        "name": str,
+        "path_key": str,
+        "is_dir": bool,
+        "comment": Optional[str],
+        "children": list[TreeNode],
+    }
+    """
+    if not tree_nodes:
+        return {
+            "name": "",
+            "path_key": "",
+            "is_dir": True,
+            "comment": None,
+            "children": [],
+        }
+
+    node_map: Dict[str, Dict[str, object]] = {}
+    used_basenames: Set[str] = set()
+
+    # 第一輪：建立所有節點
+    for line, path_key in tree_nodes:
+        if path_key is None:
+            continue
+
+        is_root = (path_key == "")
+        is_dir = is_root or path_key.endswith("/")
+
+        if is_root:
+            name = line.rstrip("/")
+        else:
+            name = os.path.basename(path_key.rstrip("/"))
+
+        comment = _select_comment_for_path(
+            path_key,
+            path_comments,
+            basename_comments,
+            used_basenames,
+        )
+
+        node_map[path_key] = {
+            "name": name,
+            "path_key": path_key,
+            "is_dir": is_dir,
+            "comment": comment,
+            "children": [],
+        }
+
+    # 第二輪：掛回父節點
+    for path_key, node in node_map.items():
+        if path_key == "":
+            continue
+
+        parent_key = _get_parent_path_key(path_key)
+        if parent_key is None:
+            continue
+
+        parent_node = node_map.get(parent_key)
+        if parent_node is None:
+            continue
+
+        parent_children = parent_node["children"]
+        if isinstance(parent_children, list):
+            parent_children.append(node)
+
+    root_node = node_map.get("")
+    if root_node is None:
+        return {
+            "name": "",
+            "path_key": "",
+            "is_dir": True,
+            "comment": None,
+            "children": [],
+        }
+
+    return root_node
+
+
+def generate_structured_tree(
+    root_path,
+    old_content_string: str | None = "None",
+    folder_spacing=0,
+    max_depth=None,
+    ignore_patterns=None,
+):
+    """
+    提供給 UI 顯示鏈使用的結構化樹資料 API。
+    不影響既有 generate_annotated_tree() 的文字輸出行為。
+    """
+    root_name = os.path.basename(os.path.normpath(root_path)) + "/"
+
+    path_comments, basename_comments = _parse_comments_by_path(
+        old_content_string or "",
+        root_name,
+    )
+
+    _tree_lines, tree_nodes = _generate_tree(
+        root_path,
+        folder_spacing=folder_spacing,
+        max_depth=max_depth,
+        ignore_patterns=ignore_patterns,
+    )
+
+    return _build_structured_tree(
+        tree_nodes,
+        path_comments,
+        basename_comments,
+    )
+
+
 # 這裡，我們用「def」來 定義（define）一個公開的、可以從外部調用的主函式。
 # 它的任務是：按順序調用所有內部函式，完成一次完整的生成流程。
 # 我們同樣為這個公開的函式，增加一個可選的 ignore_patterns 參數
