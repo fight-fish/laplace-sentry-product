@@ -2003,13 +2003,33 @@ class DashboardWidget(QWidget):
         return lines
 
     def _copy_current_tree(self) -> None:
-        """複製目前已載入的整棵目錄樹。"""
+        """複製目前選取節點的子樹；若未選到有效節點則複製整個專案樹。"""
         tree_payload = getattr(self, "_current_tree_payload", None)
         if not isinstance(tree_payload, dict) or not tree_payload:
             self._set_status_message("目前沒有可複製的目錄樹。", level="error")
             return
 
-        lines = self._tree_to_plaintext_lines(tree_payload)
+        current_item = self.tree_viewer.currentItem() if hasattr(self, "tree_viewer") else None
+        selected_node: Dict[str, Any] | None = None
+        copy_scope_label = "整個專案樹"
+
+        if current_item is not None:
+            payload = current_item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(payload, dict):
+                tree_node = payload.get("tree_node")
+                if isinstance(tree_node, dict) and tree_node:
+                    selected_node = tree_node
+
+                    selected_path_key = str(payload.get("path_key", "") or "").strip()
+                    if selected_path_key in ("", "(root)"):
+                        copy_scope_label = "整個專案樹"
+                    else:
+                        copy_scope_label = f"目前選取節點子樹：{selected_path_key}"
+
+        if selected_node is None:
+            selected_node = tree_payload
+
+        lines = self._tree_to_plaintext_lines(selected_node)
         text = "\n".join(lines).strip()
 
         if not text:
@@ -2017,7 +2037,7 @@ class DashboardWidget(QWidget):
             return
 
         QApplication.clipboard().setText(text)
-        self._set_status_message("✓ 已複製目前目錄樹到剪貼簿。", level="success")
+        self._set_status_message(f"✓ 已複製：{copy_scope_label}", level="success")
 
     def _populate_tree_widget(self, node: Dict[str, Any], parent_item: QTreeWidgetItem | None = None) -> None:
         """把後端回傳的巢狀 tree JSON 轉成 QTreeWidgetItem。"""
@@ -2035,6 +2055,7 @@ class DashboardWidget(QWidget):
             "comment": comment_text,
             "path_key": path_key,
             "is_dir": is_dir,
+            "tree_node": node,
         })
 
         if parent_item is None:
@@ -2058,6 +2079,7 @@ class DashboardWidget(QWidget):
             "comment": "選取左側某個專案後，會在這裡顯示目錄樹。",
             "path_key": "",
             "is_dir": True,
+            "tree_node": None,
         })
         self.tree_viewer.addTopLevelItem(placeholder_item)
         self.tree_viewer.expandAll()
@@ -2084,13 +2106,27 @@ class DashboardWidget(QWidget):
 
         name = current.text(0)
         comment_text = str(payload.get("comment", "") or "(無註解)")
-        path_key = str(payload.get("path_key", "") or "(root)")
-        node_type = "資料夾" if bool(payload.get("is_dir", False)) else "檔案"
+        raw_path_key = str(payload.get("path_key", "") or "").strip()
+        is_dir = bool(payload.get("is_dir", False))
+
+        is_root_node = raw_path_key in ("", "(root)")
+        if is_root_node:
+            path_key = "(root)"
+            node_type = "專案根資料夾"
+            copy_scope = "整個專案樹"
+            source_label = "目前複製來源：整個專案根目錄"
+        else:
+            path_key = raw_path_key
+            node_type = "資料夾" if is_dir else "檔案"
+            copy_scope = f"此節點子樹：{path_key}"
+            source_label = f"目前複製來源：{path_key}"
 
         detail_lines = [
             f"名稱：{name}",
             f"類型：{node_type}",
             f"路徑鍵：{path_key}",
+            source_label,
+            f"按下「複製目錄樹」時：會複製 {copy_scope}",
             "",
             "註解：",
             comment_text,
