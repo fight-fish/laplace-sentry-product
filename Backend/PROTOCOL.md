@@ -1,427 +1,267 @@
-# -----------------------------------------
 
-# **PROTOCOL.md v2.0 — Laplace Sentry Backend Contract**
+# Laplace Sentry Backend — Protocol & Invariants
 
-# -----------------------------------------
+## 1. 文件定位
 
-## 0. 範圍（Scope）
+本文件為 Laplace Sentry Backend 的最高規範文件。
 
-本協定僅適用於 **WSL 後端系統（Laplace Sentry Control Backend）**，負責：
+用於定義：
 
-* 專案管理
-* 哨兵進程（sentry_worker）啟停
-* 更新流程觸發
-* 檔案樹生成與格式化（worker/engine/formatter）
-* 安全 I/O（io_gateway）
-* CLI 指令協定（main.py）
+- 後端責任範圍
+- 指令控制契約
+- 核心資料流規範
+- 模組職責邊界
+- 系統不變量
+- 前後端交互邊界
+- 安全寫入與哨兵行為規則
 
-**UI（tray_app.py / The Eye / Dashboard）不屬於本協定範圍。**
-UI 僅能透過 Adapter → WSL → `main.py` 與後端通訊。
-
----
-
-# 1. 系統架構（Architecture）
-
-後端模組由七個明確層級組成：
-
-```
-UI (Windows)
-  ↓ Adapter（WSL 指令橋）
-main.py（CLI 指令層）
-  ↓
-daemon 行為（由 main.py 與 sentry_worker.py 分拆實現）
-  ↓
-sentry_worker.py（檔案監控 + 快照 + 節流器）
-  ↓
-worker.py（更新流水線：engine + formatter）
-  ↓
-engine.py（樹生成）
-formatter.py（格式化）
-  ↓
-io_gateway.py（atomic_write）
-```
-
-每層的邊界在後續章節中精確定義。
+當其他文件與本文件衝突時，以本文件為準。
 
 ---
 
-# 2. 模組職責（Module Responsibilities）
+## 2. 後端責任範圍（Scope）
 
-以下條列基於實際代碼逐行比對後的真實行為。
+Backend 為系統正式執行核心，負責：
 
----
+- 專案設定管理
+- 目錄結構解析
+- 目錄樹生成
+- Markdown 輸出格式處理
+- 目標檔案安全寫入
+- 背景哨兵監控
+- 忽略與靜默規則管理
+- CLI 指令處理
+- Dispatcher 任務分派
 
-## 2.1 `main.py`（指令入口 / 後端 API 層）
+Backend 不負責：
 
-### **允許（Allowed）**
-
-* 接受 CLI 指令，包含：
-
-  * `list_projects`
-  * `add_project`
-  * `delete_project`
-  * `edit_project`
-  * `add_target`
-  * `remove_target`
-  * `start_sentry`
-  * `stop_sentry`
-  * `manual_update`
-  * `get_log`
-* 調用：
-
-  * `io_gateway` 寫入 `projects.json`
-  * `worker.execute_update_workflow()` 執行更新流水線
-* 啟動與終止哨兵進程（spawn / kill sentry_worker.py）
-* 回傳 JSON 或純文字輸出
-
-### **禁止（Forbidden）**
-
-* ❌ 不做任何檔案監控行為
-* ❌ 不解析節流邏輯（交由 sentry_worker）
-* ❌ 不執行 engine / formatter（改由 worker）
-* ❌ 不直接讀寫 output files（寫入由 io_gateway）
-* ❌ 不讀取 `.sentry_status`（由 sentry_worker 寫入）
+- 圖形介面
+- 視覺呈現
+- 使用者互動流程
+- UI 字串管理
 
 ---
 
-## 2.2 `sentry_worker.py`（真正哨兵進程）
+## 3. 系統不變量（Invariants）
 
-### **允許（Allowed）**
+### 3.1 正式入口不變量
+所有正式操作必須透過：
 
-* 建立初始快照（FileSnapshot）
-* 使用 os.walk 快速掃描
-* 監控檔案修改（modified / created / deleted）
-* 執行 SmartThrottler（R1 / R3 / R4）
-* 動態維護靜默清單
-* 寫入 `.sentry_status` 於 `/tmp/<uuid>.sentry_status`
-* 在事件通過節流器後，觸發：
+main.py → daemon.py → 指定工作流程
 
-```
-trigger_update_cli(uuid)
-→ main.py manual_update
-→ worker → engine → formatter → io_gateway
-```
-
-### **禁止（Forbidden）**
-
-* ❌ 不直接寫入 output files
-* ❌ 不寫入 projects.json
-* ❌ 不維持任何專案資訊（由 main.py 管理）
-* ❌ 不管理 lifecycle（由 main.py 啟停）
-* ❌ 不解析 ignore patterns（僅限 engine/worker 使用）
+不得繞過正式入口直接呼叫底層模組。
 
 ---
 
-## 2.3 `worker.py`（更新流水線：engine + formatter）
+### 3.2 專案設定唯一來源
+專案設定唯一真相來源為：
 
-### **允許（Allowed）**
+Backend/data/projects.json
 
-* 執行完整的更新工作流程：
-
-```
-1. engine.generate_annotated_tree(project_path, old_content, ignore_patterns)
-2. fake stdin/out 執行 formatter.main()
-3. 將 formatter 的結果回傳 main.py
-```
-
-### 回傳格式：
-
-```
-(exit_code, output_str)
-
-exit_code = 0 → 成功
-exit_code = 3 → 內部運行錯誤
-```
-
-### **禁止（Forbidden）**
-
-* ❌ 不做任何 I/O
-* ❌ 不觸碰 output files
-* ❌ 不操作 projects.json
-* ❌ 不讀取 / 寫入 .sentry_status
-* ❌ 不做檔案監控
-* ❌ 不涉及節流器判斷
-
-worker 是純運算層。
+禁止建立平行設定來源。
 
 ---
 
-## 2.4 `engine.py`（樹生成）
-
-### **允許（Allowed）**
-
-* 遍歷專案目錄（受 ignore_patterns 約束）
-* 產生 Annotated Tree（含節點屬性、深度控制）
-* 用於 formatter 的中間層輸入
-
-### **禁止（Forbidden）**
-
-* ❌ 不做任何檔案寫入
-* ❌ 不直接讀取 output_file
-* ❌ 不處理 SmartThrottler
-* ❌ 不啟動哨兵
-
-engine 是純資料轉換層（stateless）。
+### 3.3 查詢與寫入分離
+查詢行為僅生成目錄結構資料，不得修改目標檔案。  
+正式寫入行為必須透過完整更新流程執行。
 
 ---
 
-## 2.5 `formatter.py`（格式化）
-
-### **允許（Allowed）**
-
-* 接受來自 engine 的輸入
-* 根據策略（預設 obsidian）輸出格式化文字
-* 對 worker 提供 CLI 友好的 main() 入口
-
-### **禁止（Forbidden）**
-
-* ❌ 不做任何 I/O
-* ❌ 不解析專案設定
-* ❌ 不與 daemon 互動
-
-formatter 為 stateless 純函數層。
+### 3.4 哨兵寫入限制
+背景哨兵不得直接寫入最終輸出檔。  
+正式寫入必須透過標準更新流程完成。
 
 ---
 
-## 2.6 `io_gateway.py`（原子寫入 I/O）
-
-### **允許（Allowed）**
-
-* atomic_write with portalocker + tempfile
-* safe_read_modify_write
-* 唯一合法寫入：
-
-  * `projects.json`
-  * output files（由 main.py 指派）
-
-### **禁止（Forbidden）**
-
-* ❌ 不做邏輯判斷
-* ❌ 不做節流器行為
-* ❌ 不與 worker / engine 互動
+### 3.5 安全寫入不可繞過
+所有檔案寫入必須經由安全寫入機制處理。  
+不得直接覆蓋原始檔案。
 
 ---
 
-## 2.7 `path.py`（跨平台路徑）
+## 4. CLI 控制契約（Command Protocol）
 
-### **允許（Allowed）**
+### 4.1 指令入口
+所有 CLI 操作透過：
 
-* Windows → WSL `/mnt/<drive>/<path>` 轉換
-* WSL UNC 清理
-* validate_path
-* 提供 read/write CLI
-
-### **禁止（Forbidden）**
-
-* ❌ 不做任何業務邏輯
-* ❌ 不觸碰 projects.json
-* ❌ 不參與更新流程
+python main.py <command> [arguments]
 
 ---
 
-# 3. 資料格式（Data Contracts）
+### 4.2 指令處理流程
+指令處理流程必須為：
+
+main.py  
+→ daemon.py  
+→ dispatcher  
+→ 對應處理模組
+
+main.py 不承載業務邏輯。
 
 ---
 
-## 3.1 `projects.json`（唯一後端真實來源）
+### 4.3 操作模式
 
-格式：
+Backend 支援：
 
-```json
-[
-  {
-    "uuid": "str",
-    "name": "str",
-    "path": "/abs/path",
-    "output_file": ["/abs/path/file.md"],
-    "target_files": ["/abs/path/file.md"],
-    "status": "running" | "stopped" | "invalid_path" | "muting"
-  }
-]
-```
+1. 互動式模式（不帶參數啟動）
+2. 指令模式（帶參數單次執行）
 
-### 管理規則
-
-* 唯一可寫入者：`main.py` → `io_gateway`
-* 必須使用 atomic_write
-* UI 禁止直接讀取
-* worker 禁止寫入
-* sentry_worker 禁止寫入
+指令模式供 UI 與腳本調用。
 
 ---
 
-## 3.2 `.sentry_status`（哨兵靜默狀態）
+### 4.4 CLI 行為原則
+CLI 操作必須：
 
-位置：
-
-```
-/tmp/<uuid>.sentry_status
-```
-
-格式：
-
-```json
-["/muted/path/a", "/muted/path/b"]
-```
-
-### 來源 / 權限
-
-* 由 sentry_worker 寫入
-* main.py 可讀取
-* UI 禁止直接讀取
+- 回傳明確成功或失敗狀態
+- 輸出格式穩定
+- 避免依賴互動式輸入
+- 可被自動化工具呼叫
 
 ---
 
-## 3.3 更新流程資料流（Data Flow）
+## 5. 核心模組職責（Module Responsibilities）
 
-完整資料鏈：
-
-```
-sentry_worker → trigger_update_cli → main.py manual_update
-→ worker.execute_update_workflow
-→ engine.generate_annotated_tree
-→ formatter.main()
-→ io_gateway.atomic_write(target_file)
-```
-
-worker 永不觸碰檔案；寫入一律經 io_gateway。
+### main.py
+後端正式入口，負責模式判斷與指令轉發。
 
 ---
 
-# 4. 指令協定（Command Contract）
+### daemon.py
+後端主調度器，負責：
 
-以下為 Adapter → main.py → WSL 應遵守之 API。
-
----
-
-## 4.1 list_projects
-
-```
-main.py list_projects
-```
-
-輸出：JSON array（內容對應 projects.json）
+- 專案管理
+- 哨兵管理
+- 任務分派
+- 更新流程觸發
+- 查詢請求處理
 
 ---
 
-## 4.2 add_project
-
-```
-main.py add_project <name> <path> <output_file>
-```
-
-限制：
-
-* path 為專案根
-* output_file 可自動建立
-* 衝突與無效路徑需立即回報錯誤
+### worker.py
+單次更新流程協調器，串接資料生成與輸出流程。
 
 ---
 
-## 4.3 delete_project
-
-```
-main.py delete_project <uuid>
-```
-
-刪除後：
-
-* 停止哨兵（若存在）
-* 自 projects.json 移除
+### engine.py
+目錄樹生成核心與資料結構處理。
 
 ---
 
-## 4.4 edit_project
-
-```
-main.py edit_project <uuid> <field> <new_value>
-```
-
-允許欄位：
-
-* name
-* path
-* output_file（單一）
-* target_files（單一）
+### formatter.py
+輸出格式處理，不負責資料生成。
 
 ---
 
-## 4.5 add_target / remove_target
+### io_gateway.py
+安全寫入處理，負責：
 
-```
-add_target <uuid> <path>
-remove_target <uuid> <path>
-```
-
-target_files 影響 formatter 寫入行為。
-
----
-
-## 4.6 start_sentry / stop_sentry
-
-```
-start_sentry <uuid>
-stop_sentry <uuid>
-```
-
-start：
-
-* 啟動 sentry_worker
-* 傳入：uuid, project_path, target_files
-
-stop：
-
-* 終止該 PID
+- 檔案鎖定
+- 備份管理
+- 原子寫入
+- JSON 安全存取
 
 ---
 
-## 4.7 get_log
-
-```
-get_log <uuid> <lines=100>
-```
-
-由 UI 戰情室使用。
-不得混合語意翻譯。
+### path.py
+統一路徑處理模組，負責跨平台路徑正規化。
 
 ---
 
-## 4.8 manual_update
+### sentry_worker.py
+背景監控進程，負責目錄變化監控與更新請求觸發。
 
+---
+
+## 6. 資料契約（Data Contract）
+
+### 6.1 projects.json
+此檔為專案設定唯一來源，必須確保：
+
+- 結構完整
+- UUID 唯一
+- 修改經由正式流程進行
+
+---
+
+### 6.2 合法修改方式
+專案設定必須透過：
+
+- CLI 指令
+- Dispatcher 管理流程
+- 安全寫入機制
+
+禁止直接手動覆寫破壞結構。
+
+---
+
+## 7. 哨兵行為邊界（Sentry Boundaries）
+
+背景哨兵允許：
+
+- 監控目錄變化
+- 節流高頻事件
+- 更新靜默資訊
+- 發送更新請求
+
+背景哨兵禁止：
+
+- 直接寫入 Markdown
+- 修改專案設定
+- 干涉 UI 狀態
+
+---
+
+## 8. 前後端邊界（Frontend–Backend Boundary）
+
+Frontend 不得：
+
+- 直接讀寫後端狀態檔
+- 修改 projects.json
+- 呼叫未公開的內部模組
+
+Frontend 必須透過 CLI 或受控橋接層與 Backend 通訊。
+
+---
+
+## 9. 正式資料流（Formal Workflow）
+
+正式更新流程：
+
+main.py  
+→ daemon.py  
+→ worker.py  
+→ engine.py  
+→ formatter.py  
+→ io_gateway.py
+
+此流程為唯一正式資料流。
+
+---
+
+## 10. 重構安全原則（Refactor Safety）
+
+未來重構時必須保持：
+
+- CLI 契約穩定
+- 專案設定來源不變
+- 正式資料流不變
+- 安全寫入機制存在
+- 哨兵行為邊界不變
+
+允許變動：
+
+- 演算法優化
+- 模組內部實作細節
+- 效能優化
+- 日誌細節調整
+
+---
+
+## 11. 文件權威性
+
+本文件為 Backend 規範最高權威來源。
 ```
-manual_update <uuid>
-```
-
-執行 pipeline（engine → formatter → io_gateway）。
-
----
-
-# 5. 不變性條款（Invariants）
-
-後端永遠遵守：
-
-1. **所有寫入必須使用 atomic_write**
-2. **projects.json 是唯一真實來源（SSOT）**
-3. **worker / sentry_worker 禁止寫 output files**
-4. **engine / formatter 不得進行任何 I/O**
-5. **UI 禁止直接讀取任何後端檔案**
-6. **sentry_worker 只能寫 `.sentry_status`**
-7. **新增 API 不得破壞資料格式相容性**
-
----
-
-# 6. 版本策略（Version Policy）
-
-* 任何破壞格式者 → 必須升 major version
-* 增加欄位 → minor version
-* 修改預設值 → patch version
-
----
-
-# 7. 版權與作者
-
-* 作者：帕爾（Par）
-* 系統協作：Laplace Raven Model
-* 授權：MIT License
-
 
