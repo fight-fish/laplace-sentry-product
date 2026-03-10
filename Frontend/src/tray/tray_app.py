@@ -159,7 +159,7 @@ class SentryEyeWidget(QWidget):
         # 如果迴圈結束都沒找到，就回傳（return）空值（None）。
         return None
 
-    def __init__(self, switch_callback, shutdown_callback=None):
+    def __init__(self, switch_callback, shutdown_callback=None, eye_size: int = 480, eye_size_callback=None):
         # 我們 呼叫（call）父類別的初始化。
         super().__init__()
         
@@ -173,6 +173,8 @@ class SentryEyeWidget(QWidget):
         self.old_pos = None
         self.switch_callback = switch_callback
         self.shutdown_callback = shutdown_callback
+        self.eye_size = int(eye_size)
+        self.eye_size_callback = eye_size_callback
         
         # [新增] 瞳孔懸停狀態 (用於變色)
         # 我們預設它為 False (沒有懸停)。
@@ -209,6 +211,18 @@ class SentryEyeWidget(QWidget):
         self.enable_guidance = True
         self.enable_smart_match = True
         self.setToolTip("👁️ 哨兵之眼：請將「專案資料夾」拖曳至此以開始監控")
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.eye_size, self.eye_size)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.eye_size, self.eye_size)
+
+    def set_eye_size(self, size: int) -> None:
+        self.eye_size = int(size)
+        self.updateGeometry()
+        self.resize(self.eye_size, self.eye_size)
+        self.update()
 
     def _trigger_saccade(self): 
         """隨機產生眼球移動目標""" 
@@ -699,40 +713,59 @@ class SentryEyeWidget(QWidget):
                 QMessageBox.critical(self, "新增失敗", error_msg)
 
     def contextMenuEvent(self, event):
-        """[Task 9.4-UX] 右鍵選單：提供飢餓狀態的逃生門"""
-        # 只有在「飢餓模式 (有暫存資料夾)」時，才顯示這個選單
+        """右鍵選單：提供 Eye 尺寸切換，並保留飢餓狀態的取消入口"""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { 
+                background-color: rgba(20, 20, 30, 240); 
+                color: white; 
+                border: 1px solid #00D8FF; 
+                border-radius: 5px;
+                padding: 5px;
+            }
+            QMenu::item:selected {
+                background-color: #155A6C;
+            }
+        """)
+
+        # --- 1. Eye 大小子選單 ---
+        size_menu = menu.addMenu("👁️ Eye 大小")
+
+        size_options = [
+            ("小（320）", 320),
+            ("中（480）", 480),
+            ("大（560）", 560),
+        ]
+
+        for label, size in size_options:
+            action = QAction(label, size_menu)
+            action.setCheckable(True)
+            action.setChecked(self.eye_size == size)
+
+            callback = self.eye_size_callback
+            if callback is not None:
+                action.triggered.connect(lambda checked=False, s=size, cb=callback: cb(s))
+
+            size_menu.addAction(action)
+
+        # --- 2. 飢餓模式時，保留取消暫存入口 ---
         if self.pending_folder:
-            menu = QMenu(self)
-            # 設定樣式：深色背景 + 紅色邊框 (強調取消)
-            menu.setStyleSheet("""
-                QMenu { 
-                    background-color: rgba(20, 20, 30, 240); 
-                    color: white; 
-                    border: 1px solid #FF5555; 
-                    border-radius: 5px;
-                    padding: 5px;
-                }
-                QMenu::item:selected {
-                    background-color: #FF5555;
-                }
-            """)
-            
-            # 顯示當前暫存的資料夾名稱，讓使用者確認
+            menu.addSeparator()
+
             folder_name = Path(self.pending_folder).name
             action_cancel = QAction(f"❌ 取消暫存：{folder_name}", menu)
-            
-            # 定義取消動作
+
             def do_cancel():
-                self.pending_folder = None # 清空暫存
-                self.eating_frame = 0      # 確保動畫重置
-                self.update()              # 重畫 (橘眼 -> 青眼)
+                self.pending_folder = None
+                self.eating_frame = 0
+                self.update()
                 self.bubble.show_message("已取消操作，回到待機狀態。", 2000)
-                
+
             action_cancel.triggered.connect(do_cancel)
             menu.addAction(action_cancel)
-            
-            # 在滑鼠位置彈出
-            menu.exec(event.globalPos())
+
+        # 在滑鼠位置彈出
+        menu.exec(event.globalPos())
 
     def mouseDoubleClickEvent(self, event):
         """雙擊隱藏視窗"""
@@ -2506,6 +2539,36 @@ class MockViewB(QWidget):
 # ==========================================
 #   主控制器：v2.0 托盤應用程式
 # ==========================================
+class CurrentPageStackedWidget(QStackedWidget):
+    """
+    只回報「目前頁面」幾何提示的 QStackedWidget。
+    目的：
+    - 避免 Dashboard 頁的 minimumSizeHint 汙染 Eye 模式
+    - 讓 top-level container 的幾何契約跟著 currentWidget 走
+    """
+    def sizeHint(self) -> QSize:
+        current = self.currentWidget()
+        if current is not None:
+            hint = current.sizeHint()
+            if hint.isValid():
+                return hint
+
+            current_size = current.size()
+            if current_size.isValid() and current_size.width() > 0 and current_size.height() > 0:
+                return current_size
+
+        return QSize(0, 0)
+
+    def minimumSizeHint(self) -> QSize:
+        current = self.currentWidget()
+        if current is not None:
+            hint = current.minimumSizeHint()
+            if hint.isValid():
+                return hint
+
+        return QSize(0, 0)
+
+
 class SentryTrayAppV2:
     def update_tooltip(self, running: int, muting: int) -> None:
         """更新托盤圖示的 Tooltip 顯示狀態，並檢查循環依賴。"""
@@ -2549,16 +2612,28 @@ class SentryTrayAppV2:
 
         # --- 2. 建立雙視圖容器 ---
         # 我們建立（create）一個堆疊容器，它可以像紙牌一樣切換頁面。
-        self.container = QStackedWidget()
+        self.container = CurrentPageStackedWidget()
         self.container.setWindowTitle("Sentry v2.0 Sandbox")
         self.container.resize(900, 600)
         # [UI-Only Phase] 記錄 Dashboard 最近一次尺寸，避免切回後丟失使用者調整結果
         self.dashboard_size = QSize(900, 600)
 
+        self.settings = QSettings("sentry_config.ini", QSettings.Format.IniFormat)
+        raw_eye_size = self.settings.value("eye_size", 480)
+
+        if isinstance(raw_eye_size, (int, float)):
+            self.eye_size = int(raw_eye_size)
+        elif isinstance(raw_eye_size, str) and raw_eye_size.strip().isdigit():
+            self.eye_size = int(raw_eye_size.strip())
+        else:
+            self.eye_size = 480
+
         # 建立 View A，並傳入切換與關機的函式
         self.view_a = SentryEyeWidget(
             switch_callback=self.go_to_dashboard,
-            shutdown_callback=self.app.quit # [NEW] 將 app.quit 函式傳入給 View A
+            shutdown_callback=self.app.quit, # [NEW] 將 app.quit 函式傳入給 View A
+            eye_size=self.eye_size,
+            eye_size_callback=self.set_eye_size,
         )
         # 替換為我們剛剛貼入並改名的 DashboardWidget
         # 這裡我們傳入了 self.go_to_eye 函式作為返回按鈕的回調
@@ -2583,13 +2658,43 @@ class SentryTrayAppV2:
 
         # --- 改成呼叫 go_to_eye() 來初始化 ---
         # 這會同時設定頁面並將視窗縮小為 130x130
+        self._debug_geometry("before-initial-go-to-eye")
         self.go_to_eye()
 
         # FIX: 系統啟動時 View A 不再躲起來，而是立即顯示。
         # 使用 singleShot 確保在事件循環啟動後再執行 show()。
+        QTimer.singleShot(100, lambda: self._debug_geometry("before-singleShot-show"))
         QTimer.singleShot(100, lambda: self.container.show())
+        QTimer.singleShot(100, lambda: self._debug_geometry("after-singleShot-show"))
         QTimer.singleShot(100, lambda: self.container.activateWindow())
         QTimer.singleShot(100, lambda: self.container.raise_())
+        QTimer.singleShot(200, lambda: self._debug_geometry("after-raise-200ms"))
+
+    def _debug_geometry(self, tag: str):
+        """統一輸出 Eye / Dashboard 幾何觀測資料。"""
+        current = self.container.currentWidget()
+        current_name = type(current).__name__ if current is not None else "(none)"
+        print(
+            f"[GEOM {tag}]",
+            "current_index=", self.container.currentIndex(),
+            "current_widget=", current_name,
+            "container_size=", self.container.size(),
+            "container_min=", self.container.minimumSize(),
+            "container_min_hint=", self.container.minimumSizeHint(),
+            "container_max=", self.container.maximumSize(),
+            "container_hint=", self.container.sizeHint(),
+            "view_a_size=", self.view_a.size(),
+            "view_a_min=", self.view_a.minimumSize(),
+            "view_a_min_hint=", self.view_a.minimumSizeHint(),
+            "view_a_max=", self.view_a.maximumSize(),
+            "view_a_hint=", self.view_a.sizeHint(),
+            "view_b_size=", self.view_b.size(),
+            "view_b_min=", self.view_b.minimumSize(),
+            "view_b_min_hint=", self.view_b.minimumSizeHint(),
+            "view_b_max=", self.view_b.maximumSize(),
+            "view_b_hint=", self.view_b.sizeHint(),
+            "flags=", int(self.container.windowFlags()),
+        )
 
     def go_to_dashboard(self):
         """切換到 View B (展開 + 可拉伸)"""
@@ -2600,33 +2705,67 @@ class SentryTrayAppV2:
         # 2. 命令 View B 重新去後端拉取最新資料
         self.view_b._reload_projects_from_backend()
 
-        # 3. 切換為一般可縮放視窗
+        # 3. 先隱藏，恢復 Dashboard 所需幾何契約，再切頁與設尺寸，最後才顯示
         self.container.hide()
         self.container.setWindowFlags(Qt.WindowType.Window)
-        self.container.show()
-
-        # 4. 切換頁面並恢復 Dashboard 尺寸
+        self.container.setMinimumSize(self.view_b.minimumSizeHint())
+        self.container.setMaximumSize(QSize(16777215, 16777215))
         self.container.setCurrentIndex(1)
         self.container.resize(self.dashboard_size)
+        self.container.show()
+
         self.container.activateWindow()
         self.container.raise_()
 
     def go_to_eye(self):
         """切換到 View A (縮微 + 固定眼球視窗)"""
+        self._debug_geometry("go-to-eye-start")
+
         # 1. 離開 Dashboard 前，記住最近一次尺寸
         if self.container.currentIndex() == 1:
             self.dashboard_size = self.container.size()
+        self._debug_geometry("go-to-eye-after-save-dashboard-size")
 
-        # 2. 切換為無邊框眼球視窗
+        # 2. 先解除 Dashboard 模式的幾何限制，切到 Eye
         self.container.hide()
-        self.container.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        self.container.show()
+        self._debug_geometry("go-to-eye-after-hide")
 
-        # 3. 切換頁面並縮回眼球尺寸
+        self.container.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self._debug_geometry("go-to-eye-after-set-flags")
+
+        self.container.setMinimumSize(0, 0)
+        self._debug_geometry("go-to-eye-after-set-min-0")
+
+        self.container.setMaximumSize(QSize(16777215, 16777215))
+        self._debug_geometry("go-to-eye-after-set-max")
+
         self.container.setCurrentIndex(0)
-        self.container.resize(130, 130)
+        self._debug_geometry("go-to-eye-after-set-index-0")
+
+        self.container.setFixedSize(self.eye_size, self.eye_size)
+        self._debug_geometry("go-to-eye-after-resize-130")
+
+        self.container.show()
+        self._debug_geometry("go-to-eye-after-show")
+
+        # 3. 關鍵：show() 後 Qt 會把視窗重新撐大，所以在 show() 後再鎖一次最終尺寸
+        self.container.setFixedSize(self.eye_size, self.eye_size)
+        self._debug_geometry("go-to-eye-after-fixed-130")
+
         self.container.activateWindow()
+        self._debug_geometry("go-to-eye-after-activate")
+
         self.container.raise_()
+        self._debug_geometry("go-to-eye-end")
+
+    def set_eye_size(self, size: int) -> None:
+        self.eye_size = int(size)
+        self.settings.setValue("eye_size", self.eye_size)
+        self.view_a.set_eye_size(self.eye_size)
+
+        if self.container.currentIndex() == 0:
+            self.container.setFixedSize(self.eye_size, self.eye_size)
+            self.container.resize(self.eye_size, self.eye_size)
 
     def toggle_window(self):
         """切換視窗顯示狀態"""
