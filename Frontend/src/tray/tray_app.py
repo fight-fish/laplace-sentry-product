@@ -1621,6 +1621,10 @@ class DashboardWidget(QWidget):
         self.btn_tree_ignore = QPushButton("編輯目錄樹忽略規則…")
         self.btn_tree_ignore.clicked.connect(self._open_ignore_settings_dialog)
 
+        self.btn_sync_write = QPushButton("🔄 同步寫入")
+        self.btn_sync_write.setEnabled(False)
+        self.btn_sync_write.clicked.connect(self._perform_sync_write_for_current_selection)
+
         self.btn_copy_tree = QPushButton("複製目錄樹")
         self.btn_copy_tree.clicked.connect(self._copy_current_tree)
         self.btn_copy_tree.setEnabled(False)
@@ -1630,6 +1634,7 @@ class DashboardWidget(QWidget):
 
         action_layout.addWidget(self.btn_audit_muted)
         action_layout.addWidget(self.btn_tree_ignore)
+        action_layout.addWidget(self.btn_sync_write)
         action_layout.addWidget(self.btn_copy_tree)
         action_layout.addStretch(1)
 
@@ -1659,13 +1664,31 @@ class DashboardWidget(QWidget):
         tree_header.setStretchLastSection(True)
         tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
-        self.tree_comment_viewer = QTextEdit()
-        self.tree_comment_viewer.setReadOnly(True)
-        self.tree_comment_viewer.setFrameShape(QFrame.Shape.StyledPanel)
-        self.tree_comment_viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.tree_comment_viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.tree_comment_viewer.setPlaceholderText("選取目錄樹節點後，會在這裡顯示完整註解。")
-        self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+        self.tree_detail_panel = QWidget()
+        detail_layout = QVBoxLayout(self.tree_detail_panel)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
+
+        self.tree_meta_viewer = QTextEdit()
+        self.tree_meta_viewer.setReadOnly(True)
+        self.tree_meta_viewer.setFrameShape(QFrame.Shape.StyledPanel)
+        self.tree_meta_viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_meta_viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_meta_viewer.setPlaceholderText("選取目錄樹節點後，會在這裡顯示系統資訊。")
+        self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
+
+        self.tree_comment_editor = QTextEdit()
+        self.tree_comment_editor.setReadOnly(False)
+        self.tree_comment_editor.setFrameShape(QFrame.Shape.StyledPanel)
+        self.tree_comment_editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_comment_editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.tree_comment_editor.setPlaceholderText("可在這裡編輯目前節點的註解。")
+        self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
+
+        detail_layout.addWidget(QLabel("<b>節點資訊</b>"))
+        detail_layout.addWidget(self.tree_meta_viewer, stretch=3)
+        detail_layout.addWidget(QLabel("<b>註解編輯</b>"))
+        detail_layout.addWidget(self.tree_comment_editor, stretch=2)
 
         placeholder_item = QTreeWidgetItem(["目錄樹工作區"])
         placeholder_item.setData(0, Qt.ItemDataRole.UserRole, {
@@ -1677,7 +1700,7 @@ class DashboardWidget(QWidget):
         self.tree_viewer.expandAll()
 
         tree_splitter.addWidget(self.tree_viewer)
-        tree_splitter.addWidget(self.tree_comment_viewer)
+        tree_splitter.addWidget(self.tree_detail_panel)
         tree_splitter.setStretchFactor(0, 3)
         tree_splitter.setStretchFactor(1, 2)
 
@@ -1778,8 +1801,14 @@ class DashboardWidget(QWidget):
                 
                 # 手動更新詳情面板 (因為訊號被切斷了，必須手動呼叫)
                 self._update_detail_panel(self.current_projects[0])
+
+                if hasattr(self, 'btn_sync_write'):
+                    self.btn_sync_write.setEnabled(True)
             else:
                 self._update_detail_panel(None)
+
+                if hasattr(self, 'btn_sync_write'):
+                    self.btn_sync_write.setEnabled(False)
                 
         finally:
             # [關鍵修正] 無論如何，最後一定要把訊號接回去，不然使用者就不能點擊了
@@ -2084,24 +2113,29 @@ class DashboardWidget(QWidget):
         self.tree_viewer.addTopLevelItem(placeholder_item)
         self.tree_viewer.expandAll()
 
-        if hasattr(self, 'tree_comment_viewer'):
-            self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+        if hasattr(self, 'tree_meta_viewer'):
+            self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
+
+        if hasattr(self, 'tree_comment_editor'):
+            self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
 
         if hasattr(self, 'btn_copy_tree'):
             self.btn_copy_tree.setEnabled(False)
 
     def _on_tree_item_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None = None) -> None:
-        """當使用者點選樹節點時，更新右側註解詳情區。"""
-        if not hasattr(self, 'tree_comment_viewer'):
+        """當使用者點選樹節點時，更新右側節點資訊與註解編輯區。"""
+        if not hasattr(self, 'tree_meta_viewer') or not hasattr(self, 'tree_comment_editor'):
             return
 
         if current is None:
-            self.tree_comment_viewer.setPlainText("註解詳情區：\n請先選取左側專案，並點選目錄樹節點。")
+            self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
+            self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
             return
 
         payload = current.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(payload, dict):
-            self.tree_comment_viewer.setPlainText("此節點沒有可顯示的註解。")
+            self.tree_meta_viewer.setPlainText("此節點沒有可顯示的系統資訊。")
+            self.tree_comment_editor.setPlainText("")
             return
 
         name = current.text(0)
@@ -2127,11 +2161,9 @@ class DashboardWidget(QWidget):
             f"路徑鍵：{path_key}",
             source_label,
             f"按下「複製目錄樹」時：會複製 {copy_scope}",
-            "",
-            "註解：",
-            comment_text,
         ]
-        self.tree_comment_viewer.setPlainText("\n".join(detail_lines))
+        self.tree_meta_viewer.setPlainText("\n".join(detail_lines))
+        self.tree_comment_editor.setPlainText(comment_text)
 
     def _on_project_selection_changed(self) -> None:
         # 獲取（get）目前選取的行號（currentRow）。
@@ -2142,6 +2174,8 @@ class DashboardWidget(QWidget):
             self._update_detail_panel(None)
             self.btn_tree_ignore.setEnabled(False)
             self.btn_audit_muted.setEnabled(False)
+            if hasattr(self, 'btn_sync_write'):
+                self.btn_sync_write.setEnabled(False)
             if hasattr(self, 'btn_copy_tree'):
                 self.btn_copy_tree.setEnabled(False)
             # [New] 清空日誌
@@ -2159,6 +2193,8 @@ class DashboardWidget(QWidget):
         # 有選到專案，啟用按鈕
         self.btn_tree_ignore.setEnabled(True)
         self.btn_audit_muted.setEnabled(True)
+        if hasattr(self, 'btn_sync_write'):
+            self.btn_sync_write.setEnabled(True)
 
         # [New] 讀取並顯示日誌
         logs = adapter.get_log_content(proj.uuid)
@@ -2342,6 +2378,28 @@ class DashboardWidget(QWidget):
         menu.exec(self.project_table.viewport().mapToGlobal(position))
 
     # 這裡，我們用「def」來定義（define）執行手動更新的動作函式。
+    def _perform_sync_write_for_current_selection(self) -> None:
+        """從工作台同步入口觸發：對目前選取專案執行 manual_update。"""
+        row = self.project_table.currentRow()
+        if row < 0 or row >= len(self.current_projects):
+            self._set_status_message("目前沒有選取任何專案，無法同步寫入。", level="error")
+            return
+
+        proj = self.current_projects[row]
+
+        if hasattr(self, 'btn_sync_write'):
+            self.btn_sync_write.setEnabled(False)
+            self.btn_sync_write.setText("⏳ 同步中…")
+
+        QApplication.processEvents()
+
+        try:
+            self._perform_manual_update(proj.uuid, proj.name)
+        finally:
+            if hasattr(self, 'btn_sync_write'):
+                self.btn_sync_write.setText("🔄 同步寫入")
+                self.btn_sync_write.setEnabled(True)
+
     def _perform_manual_update(self, uuid: str, name: str) -> None:
         # 先顯示一個「請稍候」的狀態訊息。
         self._set_status_message(f"正在更新專案 '{name}'，請稍候...", level="info")
