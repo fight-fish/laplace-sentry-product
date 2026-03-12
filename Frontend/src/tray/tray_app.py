@@ -1327,6 +1327,14 @@ class DashboardWidget(QWidget):
         self.current_projects: list[adapter.ProjectInfo] = []
         self.new_input_fields: list[QLineEdit] = [] 
         self.new_browse_buttons: list[QPushButton] = []
+
+        # [S-02-02b] 目錄樹註解編輯上下文
+        self._current_tree_project_uuid: str = ""
+        self._current_tree_path_key: str = ""
+        self._current_tree_original_comment: str = ""
+        self._current_tree_dirty: bool = False
+        self._is_loading_tree_comment: bool = False
+
         # 呼叫各類函式來 建立介面 和 載入初始資料。        
         self._build_ui()
                 
@@ -1467,6 +1475,7 @@ class DashboardWidget(QWidget):
             self._on_project_selection_changed
         )
         self.tree_viewer.currentItemChanged.connect(self._on_tree_item_changed)
+        self.tree_comment_editor.textChanged.connect(self._on_tree_comment_text_changed)
         # 當表格的項目被雙擊時（itemDoubleClicked），連結（connect）到處理函式。
         self.project_table.itemDoubleClicked.connect(
             self._on_project_double_clicked
@@ -1709,8 +1718,8 @@ class DashboardWidget(QWidget):
         right_panel.addWidget(self.tree_workspace, stretch=1)
 
         # --- 組合佈局 ---
-        layout.addLayout(left_panel, stretch=1)
         layout.addLayout(right_panel, stretch=4)
+        layout.addLayout(left_panel, stretch=1)
 
         # 回傳（return）設定好的框架元件。
         return frame
@@ -1982,6 +1991,46 @@ class DashboardWidget(QWidget):
         # 設定（setStyleSheet）標籤的樣式，把前面判斷好的顏色放進去。
         self.status_message_label.setStyleSheet(f"color: {color};")
 
+    def _reset_tree_edit_context(self) -> None:
+        """清空目前樹節點的註解編輯上下文。"""
+        self._current_tree_project_uuid = ""
+        self._current_tree_path_key = ""
+        self._current_tree_original_comment = ""
+        self._current_tree_dirty = False
+        self._refresh_tree_sync_button_state()
+
+    def _load_tree_comment_into_editor(self, comment_text: str) -> None:
+        """以受控方式把註解載入 editor，避免誤觸 dirty。"""
+        self._is_loading_tree_comment = True
+        try:
+            self.tree_comment_editor.setPlainText(comment_text)
+        finally:
+            self._is_loading_tree_comment = False
+
+    def _refresh_tree_sync_button_state(self) -> None:
+        """依目前節點上下文與 dirty 狀態更新同步按鈕可用性。"""
+        if not hasattr(self, "btn_sync_write"):
+            return
+
+        has_project = bool(self._current_tree_project_uuid)
+        has_path_key = self._current_tree_path_key is not None
+        can_sync = has_project and has_path_key and self._current_tree_dirty
+
+        self.btn_sync_write.setEnabled(can_sync)
+
+        if can_sync:
+            self.btn_sync_write.setText("🔄 同步寫入 *")
+        else:
+            self.btn_sync_write.setText("🔄 同步寫入")
+
+    def _on_tree_comment_text_changed(self) -> None:
+        """當註解正文被編輯時，更新 dirty 狀態。"""
+        if self._is_loading_tree_comment:
+            return
+
+        current_text = self.tree_comment_editor.toPlainText()
+        self._current_tree_dirty = (current_text != self._current_tree_original_comment)
+        self._refresh_tree_sync_button_state()
 
     # ---------------------------
     # 事件處理：選取、雙擊
@@ -2068,6 +2117,43 @@ class DashboardWidget(QWidget):
         QApplication.clipboard().setText(text)
         self._set_status_message(f"✓ 已複製：{copy_scope_label}", level="success")
 
+    def _find_tree_item_by_path_key(self, path_key: str) -> QTreeWidgetItem | None:
+        """在目前樹上依 path_key 找回對應節點。"""
+        if not hasattr(self, "tree_viewer"):
+            return None
+
+        normalized_target = "" if path_key in ("", "(root)") else str(path_key or "").strip()
+
+        def _walk(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            payload = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(payload, dict):
+                raw_path_key = str(payload.get("path_key", "") or "").strip()
+                normalized_item_key = "" if raw_path_key in ("", "(root)") else raw_path_key
+                if normalized_item_key == normalized_target:
+                    return item
+
+            for i in range(item.childCount()):
+                child_item = item.child(i)
+                if child_item is None:
+                    continue
+
+                found = _walk(child_item)
+                if found is not None:
+                    return found
+
+            return None
+
+        for i in range(self.tree_viewer.topLevelItemCount()):
+            top_item = self.tree_viewer.topLevelItem(i)
+            if top_item is None:
+                continue
+
+            found = _walk(top_item)
+            if found is not None:
+                return found
+
+        return None
+
     def _populate_tree_widget(self, node: Dict[str, Any], parent_item: QTreeWidgetItem | None = None) -> None:
         """把後端回傳的巢狀 tree JSON 轉成 QTreeWidgetItem。"""
         if not isinstance(node, dict):
@@ -2102,6 +2188,7 @@ class DashboardWidget(QWidget):
         """恢復目錄樹工作區的預設提示。"""
         self.tree_viewer.clear()
         self._current_tree_payload = None
+        self._reset_tree_edit_context()
 
         placeholder_item = QTreeWidgetItem(["目錄樹工作區"])
         placeholder_item.setData(0, Qt.ItemDataRole.UserRole, {
@@ -2117,7 +2204,7 @@ class DashboardWidget(QWidget):
             self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
 
         if hasattr(self, 'tree_comment_editor'):
-            self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
+            self._load_tree_comment_into_editor("請先選取左側專案，並點選目錄樹節點。")
 
         if hasattr(self, 'btn_copy_tree'):
             self.btn_copy_tree.setEnabled(False)
@@ -2128,18 +2215,21 @@ class DashboardWidget(QWidget):
             return
 
         if current is None:
+            self._reset_tree_edit_context()
             self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
-            self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
+            self._load_tree_comment_into_editor("請先選取左側專案，並點選目錄樹節點。")
             return
 
         payload = current.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(payload, dict):
+            self._reset_tree_edit_context()
             self.tree_meta_viewer.setPlainText("此節點沒有可顯示的系統資訊。")
-            self.tree_comment_editor.setPlainText("")
+            self._load_tree_comment_into_editor("")
             return
 
         name = current.text(0)
-        comment_text = str(payload.get("comment", "") or "(無註解)")
+        raw_comment = payload.get("comment", "")
+        comment_text = "" if raw_comment is None else str(raw_comment)
         raw_path_key = str(payload.get("path_key", "") or "").strip()
         is_dir = bool(payload.get("is_dir", False))
 
@@ -2155,6 +2245,16 @@ class DashboardWidget(QWidget):
             copy_scope = f"此節點子樹：{path_key}"
             source_label = f"目前複製來源：{path_key}"
 
+        row = self.project_table.currentRow() if hasattr(self, "project_table") else -1
+        current_project_uuid = ""
+        if 0 <= row < len(self.current_projects):
+            current_project_uuid = self.current_projects[row].uuid
+
+        self._current_tree_project_uuid = current_project_uuid
+        self._current_tree_path_key = path_key
+        self._current_tree_original_comment = comment_text
+        self._current_tree_dirty = False
+
         detail_lines = [
             f"名稱：{name}",
             f"類型：{node_type}",
@@ -2163,7 +2263,8 @@ class DashboardWidget(QWidget):
             f"按下「複製目錄樹」時：會複製 {copy_scope}",
         ]
         self.tree_meta_viewer.setPlainText("\n".join(detail_lines))
-        self.tree_comment_editor.setPlainText(comment_text)
+        self._load_tree_comment_into_editor(comment_text)
+        self._refresh_tree_sync_button_state()
 
     def _on_project_selection_changed(self) -> None:
         # 獲取（get）目前選取的行號（currentRow）。
@@ -2379,13 +2480,22 @@ class DashboardWidget(QWidget):
 
     # 這裡，我們用「def」來定義（define）執行手動更新的動作函式。
     def _perform_sync_write_for_current_selection(self) -> None:
-        """從工作台同步入口觸發：對目前選取專案執行 manual_update。"""
-        row = self.project_table.currentRow()
-        if row < 0 or row >= len(self.current_projects):
+        """從工作台同步入口觸發：只提交目前節點的註解正文。"""
+        project_uuid = self._current_tree_project_uuid.strip()
+        path_key = self._current_tree_path_key
+        current_comment = self.tree_comment_editor.toPlainText() if hasattr(self, "tree_comment_editor") else ""
+
+        if not project_uuid:
             self._set_status_message("目前沒有選取任何專案，無法同步寫入。", level="error")
             return
 
-        proj = self.current_projects[row]
+        if path_key is None:
+            self._set_status_message("目前沒有選取任何節點，無法同步寫入。", level="error")
+            return
+
+        if not self._current_tree_dirty:
+            self._set_status_message("目前沒有未同步的註解變更。", level="info")
+            return
 
         if hasattr(self, 'btn_sync_write'):
             self.btn_sync_write.setEnabled(False)
@@ -2394,11 +2504,34 @@ class DashboardWidget(QWidget):
         QApplication.processEvents()
 
         try:
-            self._perform_manual_update(proj.uuid, proj.name)
+            adapter.save_tree_comment(project_uuid, path_key, current_comment)
+
+            tree_payload = adapter.get_project_tree(project_uuid)
+            tree_only = tree_payload.get("tree", {})
+
+            self.tree_viewer.clear()
+            if isinstance(tree_only, dict) and tree_only:
+                self._current_tree_payload = tree_only
+                self._populate_tree_widget(tree_only)
+                self.tree_viewer.expandToDepth(1)
+
+                target_item = self._find_tree_item_by_path_key(path_key)
+                if target_item is None and self.tree_viewer.topLevelItemCount() > 0:
+                    target_item = self.tree_viewer.topLevelItem(0)
+
+                if target_item is not None:
+                    self.tree_viewer.setCurrentItem(target_item)
+                    self._on_tree_item_changed(target_item)
+
+            self._set_status_message("✓ 目前節點註解已同步寫入。", level="success")
+
+        except Exception as e:
+            self._current_tree_dirty = True
+            self._refresh_tree_sync_button_state()
+            self._set_status_message(f"註解同步失敗：{e}", level="error")
         finally:
             if hasattr(self, 'btn_sync_write'):
-                self.btn_sync_write.setText("🔄 同步寫入")
-                self.btn_sync_write.setEnabled(True)
+                self._refresh_tree_sync_button_state()
 
     def _perform_manual_update(self, uuid: str, name: str) -> None:
         # 先顯示一個「請稍候」的狀態訊息。

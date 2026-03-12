@@ -1041,6 +1041,165 @@ def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] =
     }
 
 
+def _get_primary_target_markdown(project_config: Dict[str, Any]) -> str:
+    """
+    取得單點註解回寫的固定 target markdown。
+    S-02-02b v1 階段：固定採用專案的第一個 target。
+    """
+    targets = _get_targets_from_project(project_config)
+    if not targets:
+        raise RuntimeError("找不到可用的 target markdown。")
+
+    target_doc = targets[0]
+    if not isinstance(target_doc, str) or not target_doc.strip():
+        raise RuntimeError("target markdown 設定無效。")
+
+    target_doc = normalize_path(target_doc)
+    if not os.path.isfile(target_doc):
+        raise IOError(f"target markdown 不存在或不可讀取 -> {target_doc}")
+
+    return target_doc
+
+
+def _split_tree_line_comment(line: str) -> Tuple[str, Optional[str]]:
+    """
+    將樹節點行拆成：
+    - base_part：不含 comment 的前半段
+    - comment：註解內容（若無則為 None）
+    """
+    marker = " # "
+    if marker in line:
+        base_part, comment = line.split(marker, 1)
+        return base_part, comment
+    return line, None
+
+
+def _resolve_path_key_from_tree_lines(lines: List[str], target_path_key: str) -> Optional[int]:
+    """
+    解析 AUTO_TREE 文字區塊中的每一行，找出指定 path_key 對應的行索引。
+    規則：
+    - 根節點 path_key = ""
+    - 子節點 path_key = 相對專案根目錄的唯一路徑
+    """
+    import re
+
+    stack: List[str] = []
+
+    for index, raw_line in enumerate(lines):
+        stripped = raw_line.strip()
+
+        if not stripped:
+            continue
+        if stripped == "```":
+            continue
+
+        base_part, _ = _split_tree_line_comment(raw_line)
+        base_rstrip = base_part.rstrip()
+
+        match = re.match(
+            r"^(?P<indent>(?:│   |    )*)(?P<branch>[├└]── )?(?P<name>.+?)\s*$",
+            base_rstrip,
+        )
+        if not match:
+            continue
+
+        indent = match.group("indent") or ""
+        branch = match.group("branch")
+        name = (match.group("name") or "").rstrip()
+        if not name:
+            continue
+
+        depth = len(indent) // 4
+        if branch:
+            depth += 1
+
+        normalized_name = name[:-1] if name.endswith("/") else name
+
+        stack = stack[:depth]
+        stack.append(normalized_name)
+
+        current_path_key = ""
+        if depth > 0:
+            current_path_key = "/".join(stack[1:])
+
+        normalized_target = "" if target_path_key in ("", "(root)") else target_path_key
+        if current_path_key == normalized_target:
+            return index
+
+    return None
+
+
+def handle_save_tree_comment(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    【API】單點更新指定 TreeNode 的 comment。
+    規則：
+    - 只更新 target markdown 既有 AUTO_TREE 區塊中的單一節點註解
+    - 不觸發 manual_update
+    - 不重建整個專案樹
+    """
+    PROJECTS_FILE = get_projects_file_path(projects_file_path)
+
+    if len(args) != 3:
+        raise ValueError("save_tree_comment 需要 3 個參數：<uuid> <path_key> <comment>")
+
+    uuid_target, path_key, comment = args
+
+    projects_data = read_projects_data(PROJECTS_FILE)
+    selected_project = next((p for p in projects_data if p.get("uuid") == uuid_target), None)
+    if not selected_project:
+        raise ValueError(f"未找到具有該 UUID 的專案 '{uuid_target}'。")
+
+    target_doc = _get_primary_target_markdown(selected_project)
+    updated_comment = str(comment)
+
+    def update_comment_callback(full_old_content: Any) -> str:
+        if not isinstance(full_old_content, str):
+            full_old_content = str(full_old_content or "")
+
+        start_marker = "<!-- AUTO_TREE_START -->"
+        end_marker = "<!-- AUTO_TREE_END -->"
+
+        start_idx = full_old_content.find(start_marker)
+        end_idx = full_old_content.find(end_marker)
+
+        if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+            raise RuntimeError("target markdown 缺少有效的 AUTO_TREE 區塊。")
+
+        block_start = start_idx + len(start_marker)
+        tree_block = full_old_content[block_start:end_idx]
+
+        lines = tree_block.splitlines()
+        target_line_index = _resolve_path_key_from_tree_lines(lines, path_key)
+        if target_line_index is None:
+            raise ValueError(f"找不到 path_key 對應節點：{path_key}")
+
+        original_line = lines[target_line_index]
+        base_part, _ = _split_tree_line_comment(original_line)
+        new_line = base_part.rstrip()
+
+        if updated_comment.strip():
+            new_line = f"{new_line}  # {updated_comment}"
+
+        lines[target_line_index] = new_line
+        new_tree_block = "\n".join(lines)
+
+        return f"{full_old_content[:block_start]}{new_tree_block}{full_old_content[end_idx:]}"
+
+    safe_read_modify_write(
+        target_doc,
+        update_comment_callback,
+        serializer="text",
+        project_uuid=uuid_target,
+    )
+
+    return {
+        "ok": True,
+        "uuid": uuid_target,
+        "path_key": path_key,
+        "comment": updated_comment,
+    }
+
+
 def handle_get_log(args: List[str], projects_file_path: Optional[str] = None) -> List[str]:
     """【API】讀取日誌 (Tail)。"""
     PROJECTS_FILE = get_projects_file_path(projects_file_path)
@@ -1222,6 +1381,30 @@ def main_dispatcher(argv: List[str], **kwargs):
             result = handle_get_project_tree(args, projects_file_path=projects_file_path)
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
+        elif command == "save_tree_comment":
+            if len(args) != 3:
+                print("錯誤：save_tree_comment 需要 3 個參數：<uuid> <path_key> <comment>", file=sys.stderr)
+                return 1
+
+            try:
+                result = handle_save_tree_comment(args, projects_file_path=projects_file_path)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            except ValueError as e:
+                message = str(e)
+                print(message, file=sys.stderr)
+
+                if "未找到具有該 UUID" in message:
+                    return 2
+                if "找不到 path_key 對應節點" in message:
+                    return 3
+                return 1
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                return 4
+            except IOError as e:
+                print(str(e), file=sys.stderr)
+                return 5
+
         else:
             print(f"錯誤：未知命令 '{command}'。", file=sys.stderr)
             return 1
@@ -1249,6 +1432,19 @@ def main_dispatcher(argv: List[str], **kwargs):
 
 
 # --- 主執行入口 ---
+# --- 主執行入口 ---
 if __name__ == "__main__":
     exit_code = main_dispatcher(sys.argv[1:])
-    sys.exit(exit_code)
+
+    if exit_code is None:
+        sys.exit(0)
+
+    if isinstance(exit_code, bool):
+        print("main_dispatcher must return int, not bool", file=sys.stderr)
+        sys.exit(99)
+
+    try:
+        sys.exit(int(exit_code))
+    except Exception:
+        print(f"invalid exit code: {exit_code!r}", file=sys.stderr)
+        sys.exit(99)

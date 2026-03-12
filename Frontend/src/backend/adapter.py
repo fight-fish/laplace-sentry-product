@@ -518,6 +518,22 @@ class BackendAdapter:
             raise BackendError("更新失敗：UUID 為空。")
         self._run_wsl_command("manual_update", uuid)
 
+    def save_tree_comment(self, uuid: str, path_key: str, comment: str) -> Dict[str, Any]:
+        """呼叫 WSL 將單一節點註解同步回寫到 target markdown。"""
+        if not uuid:
+            raise BackendError("註解同步失敗：UUID 為空。")
+        if path_key is None:
+            raise BackendError("註解同步失敗：path_key 不得為空。")
+        if comment is None:
+            raise BackendError("註解同步失敗：comment 不得為空。")
+
+        result = self._run_wsl_command("save_tree_comment", uuid, path_key, comment)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("註解同步失敗：後端未回傳合法 JSON 物件。")
+
 
     # 這裡，我們用「def」來定義（define）獲取忽略候選名單的函式。
     def get_ignore_candidates(self, uuid: str) -> List[str]:
@@ -718,6 +734,11 @@ def trigger_manual_update(uuid: str) -> None:
     # 獲取（get）單例 adapter 並呼叫其 trigger_manual_update 方法。
     adapter = _ensure_adapter()
     return adapter.trigger_manual_update(uuid)
+
+def save_tree_comment(uuid: str, path_key: str, comment: str) -> Dict[str, Any]:
+    # 獲取（get）單例 adapter 並呼叫其 save_tree_comment 方法。
+    adapter = _ensure_adapter()
+    return adapter.save_tree_comment(uuid, path_key, comment)
 
 
 # 這裡，我們用「def」來定義（define）對外提供的獲取忽略候選函式。
