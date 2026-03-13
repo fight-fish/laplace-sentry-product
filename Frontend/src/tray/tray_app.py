@@ -772,6 +772,70 @@ class SentryEyeWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.window().hide()
 
+class PreviewDropFrame(QFrame):
+    """右下角臨時資料夾拖入區（只接收資料夾）。"""
+
+    def __init__(self, on_folder_dropped, parent=None):
+        super().__init__(parent)
+        self.on_folder_dropped = on_folder_dropped
+        self.setAcceptDrops(True)
+
+        self._normal_style = """
+            QFrame#previewDropFrame {
+                border: 2px dashed #cc4444;
+                border-radius: 8px;
+                background-color: #fffdfd;
+            }
+        """
+
+        self._hover_style = """
+            QFrame#previewDropFrame {
+                border: 2px dashed #66aaff;
+                border-radius: 8px;
+                background-color: #f0f7ff;
+            }
+        """
+
+    def _set_hover_style(self, hover: bool):
+        if hover:
+            self.setStyleSheet(self._hover_style)
+            self.setMinimumHeight(196)
+        else:
+            self.setStyleSheet(self._normal_style)
+            self.setMinimumHeight(180)
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasUrls():
+            urls = mime.urls()
+            if urls:
+                local_path = urls[0].toLocalFile()
+                if local_path and Path(local_path).is_dir():
+                    self._set_hover_style(True)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_hover_style(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._set_hover_style(False)
+
+        urls = event.mimeData().urls()
+        if not urls:
+            event.ignore()
+            return
+
+        local_path = urls[0].toLocalFile()
+        if local_path and Path(local_path).is_dir():
+            if callable(self.on_folder_dropped):
+                self.on_folder_dropped(local_path)
+            event.acceptProposedAction()
+            return
+
+        event.ignore()
 class IgnoreSettingsDialog(QDialog):
     """
     忽略清單設定視窗：
@@ -1334,6 +1398,7 @@ class DashboardWidget(QWidget):
         self._current_tree_original_comment: str = ""
         self._current_tree_dirty: bool = False
         self._is_loading_tree_comment: bool = False
+        self._is_preview_tree_mode: bool = False
 
         # 呼叫各類函式來 建立介面 和 載入初始資料。        
         self._build_ui()
@@ -1617,6 +1682,37 @@ class DashboardWidget(QWidget):
         pref_layout.addStretch(1)
 
         left_panel.addLayout(pref_layout)
+
+        # --- 臨時資料夾拖入區（S-02-03 / UI 骨架）---
+        self.preview_drop_frame = PreviewDropFrame(self._on_preview_folder_dropped)
+        self.preview_drop_frame.setObjectName("previewDropFrame")
+        self.preview_drop_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.preview_drop_frame.setMinimumHeight(180)
+        self.preview_drop_frame.setStyleSheet("""
+            QFrame#previewDropFrame {
+                border: 2px dashed #cc4444;
+                border-radius: 8px;
+                background-color: #fffdfd;
+            }
+        """)
+
+        preview_drop_layout = QVBoxLayout(self.preview_drop_frame)
+        preview_drop_layout.setContentsMargins(12, 12, 12, 12)
+        preview_drop_layout.setSpacing(8)
+
+        self.preview_drop_title = QLabel("臨時資料夾拖入區")
+        self.preview_drop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_drop_title.setStyleSheet("font-weight: bold; color: #cc2222;")
+
+        self.preview_drop_hint = QLabel("📂 Drop Folder\n\n拖入資料夾即可預覽並複製目錄樹\n（不註冊 / 不監控 / 用完即棄）")
+        self.preview_drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_drop_hint.setWordWrap(True)
+        self.preview_drop_hint.setStyleSheet("color: #aa3333;")
+
+        preview_drop_layout.addWidget(self.preview_drop_title)
+        preview_drop_layout.addWidget(self.preview_drop_hint, stretch=1)
+
+        left_panel.addWidget(self.preview_drop_frame)
         left_panel.addStretch(1)
 
         # 右側：主操作區（按鈕 + 目錄樹工作區）
@@ -1723,6 +1819,49 @@ class DashboardWidget(QWidget):
 
         # 回傳（return）設定好的框架元件。
         return frame
+
+    def _on_preview_folder_dropped(self, folder_path: str) -> None:
+        """S-02-03：拖入資料夾後，顯示臨時 preview tree。"""
+        self._enter_preview_tree_mode()
+
+        if hasattr(self, "preview_drop_hint"):
+            self.preview_drop_hint.setText(f"已接收資料夾\n\n{folder_path}")
+
+        try:
+            preview_payload = adapter.preview_tree_from_path(folder_path)
+            tree_only = preview_payload.get("tree", {})
+
+            self.tree_viewer.clear()
+
+            if isinstance(tree_only, dict) and tree_only:
+                self._current_tree_payload = tree_only
+                self._populate_tree_widget(tree_only)
+                self.tree_viewer.expandToDepth(1)
+
+                first_item = self.tree_viewer.topLevelItem(0)
+                if first_item is not None:
+                    self.tree_viewer.setCurrentItem(first_item)
+                    self._on_tree_item_changed(first_item)
+
+                if hasattr(self, 'btn_copy_tree'):
+                    self.btn_copy_tree.setEnabled(True)
+
+                if hasattr(self, 'btn_sync_write'):
+                    self.btn_sync_write.setEnabled(False)
+
+                if hasattr(self, 'btn_tree_ignore'):
+                    self.btn_tree_ignore.setEnabled(False)
+
+                if hasattr(self, 'btn_audit_muted'):
+                    self.btn_audit_muted.setEnabled(False)
+
+                self._set_status_message("已載入臨時預覽樹，可直接複製目錄樹。", level="success")
+            else:
+                self._show_tree_placeholder()
+                self._set_status_message("臨時預覽失敗：後端未回傳有效目錄樹。", level="error")
+
+        except Exception as e:
+            self._set_status_message(f"臨時預覽失敗：{e}", level="error")
 
     def _on_pref_changed(self):
         """[Task 9.4] 當 Checkbox 變更時，儲存設定並發送訊號"""
@@ -1991,6 +2130,15 @@ class DashboardWidget(QWidget):
         # 設定（setStyleSheet）標籤的樣式，把前面判斷好的顏色放進去。
         self.status_message_label.setStyleSheet(f"color: {color};")
 
+    def _enter_preview_tree_mode(self) -> None:
+        """切換到臨時 preview tree 模式，並清空正式寫入上下文。"""
+        self._is_preview_tree_mode = True
+        self._reset_tree_edit_context()
+
+    def _enter_project_tree_mode(self) -> None:
+        """切換回正式專案樹模式。"""
+        self._is_preview_tree_mode = False
+
     def _reset_tree_edit_context(self) -> None:
         """清空目前樹節點的註解編輯上下文。"""
         self._current_tree_project_uuid = ""
@@ -2089,7 +2237,7 @@ class DashboardWidget(QWidget):
 
         current_item = self.tree_viewer.currentItem() if hasattr(self, "tree_viewer") else None
         selected_node: Dict[str, Any] | None = None
-        copy_scope_label = "整個專案樹"
+        copy_scope_label = "資料夾目錄樹" if getattr(self, "_is_preview_tree_mode", False) else "整個專案樹"
 
         if current_item is not None:
             payload = current_item.data(0, Qt.ItemDataRole.UserRole)
@@ -2100,7 +2248,7 @@ class DashboardWidget(QWidget):
 
                     selected_path_key = str(payload.get("path_key", "") or "").strip()
                     if selected_path_key in ("", "(root)"):
-                        copy_scope_label = "整個專案樹"
+                        copy_scope_label = "資料夾目錄樹" if getattr(self, "_is_preview_tree_mode", False) else "整個專案樹"
                     else:
                         copy_scope_label = f"目前選取節點子樹：{selected_path_key}"
 
@@ -2236,9 +2384,14 @@ class DashboardWidget(QWidget):
         is_root_node = raw_path_key in ("", "(root)")
         if is_root_node:
             path_key = "(root)"
-            node_type = "專案根資料夾"
-            copy_scope = "整個專案樹"
-            source_label = "目前複製來源：整個專案根目錄"
+            if getattr(self, "_is_preview_tree_mode", False):
+                node_type = "資料夾根目錄"
+                copy_scope = "資料夾目錄樹"
+                source_label = "目前複製來源：整個資料夾目錄"
+            else:
+                node_type = "專案根資料夾"
+                copy_scope = "整個專案樹"
+                source_label = "目前複製來源：整個專案根目錄"
         else:
             path_key = raw_path_key
             node_type = "資料夾" if is_dir else "檔案"
@@ -2285,6 +2438,8 @@ class DashboardWidget(QWidget):
             if hasattr(self, 'tree_viewer'):
                 self._show_tree_placeholder()
             return
+
+        self._enter_project_tree_mode()
 
         # 從「專案籃子」（self.current_projects）中，根據行號（row）取出選取的專案（proj）。
         proj = self.current_projects[row]
@@ -2843,7 +2998,7 @@ class SentryTrayAppV2:
         self.container.setWindowTitle("Sentry v2.0 Sandbox")
         self.container.resize(900, 600)
         # [UI-Only Phase] 記錄 Dashboard 最近一次尺寸，避免切回後丟失使用者調整結果
-        self.dashboard_size = QSize(900, 600)
+        self.dashboard_size = QSize(900, 700)
 
         self.settings = QSettings("sentry_config.ini", QSettings.Format.IniFormat)
         raw_eye_size = self.settings.value("eye_size", 480)

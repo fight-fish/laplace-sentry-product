@@ -1200,6 +1200,35 @@ def handle_save_tree_comment(args: List[str], projects_file_path: Optional[str] 
     }
 
 
+def handle_preview_tree(args: List[str]) -> Dict[str, Any]:
+    """
+    【API】依資料夾 path 取得臨時預覽用的結構化目錄樹資料。
+    只回傳 JSON 樹資料，不寫入任何檔案、不產生副作用。
+    """
+    if len(args) != 1:
+        raise ValueError("【臨時預覽失敗】：需要 1 個參數 (path)。")
+
+    preview_path = normalize_path(args[0])
+
+    if not os.path.isabs(preview_path):
+        raise ValueError(f"【臨時預覽失敗】：路徑必須是絕對路徑 -> {preview_path}")
+
+    if not os.path.isdir(preview_path):
+        raise ValueError(f"【臨時預覽失敗】：資料夾不存在或無效 -> {preview_path}")
+
+    tree_data = generate_structured_tree(
+        preview_path,
+        old_content_string="",
+        ignore_patterns=None,
+    )
+
+    return {
+        "mode": "preview",
+        "preview_path": preview_path,
+        "tree": tree_data,
+    }
+
+
 def handle_get_log(args: List[str], projects_file_path: Optional[str] = None) -> List[str]:
     """【API】讀取日誌 (Tail)。"""
     PROJECTS_FILE = get_projects_file_path(projects_file_path)
@@ -1379,6 +1408,13 @@ def main_dispatcher(argv: List[str], **kwargs):
                 print("錯誤：缺少 UUID 參數。", file=sys.stderr)
                 return 1
             result = handle_get_project_tree(args, projects_file_path=projects_file_path)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+
+        elif command == 'preview_tree':
+            if len(args) != 1:
+                print("錯誤：preview_tree 需要 1 個參數：<path>", file=sys.stderr)
+                return 1
+            result = handle_preview_tree(args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif command == "save_tree_comment":

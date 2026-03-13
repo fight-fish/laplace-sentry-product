@@ -594,6 +594,18 @@ class BackendAdapter:
             return result
 
         raise BackendError("讀取目錄樹失敗：後端未回傳合法 JSON 物件。")
+
+    def preview_tree_from_path(self, path: str) -> Dict[str, Any]:
+        """呼叫 WSL 取得臨時資料夾的結構化預覽樹資料。"""
+        if not path:
+            raise BackendError("臨時預覽失敗：path 不得為空。")
+
+        result = self._run_wsl_command("preview_tree", path)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("臨時預覽失敗：後端未回傳合法 JSON 物件。")
     
     # [Task 9.4] 審計功能：獲取靜默路徑
     def get_muted_paths(self, uuid: str) -> List[str]:
@@ -816,7 +828,11 @@ def get_project_tree(uuid: str) -> Dict[str, Any]:
     adapter = _ensure_adapter()
     return adapter.get_project_tree(uuid)
 
-# [Task 9.4] 對外公開接口
+def preview_tree_from_path(path: str) -> Dict[str, Any]:
+    adapter = _ensure_adapter()
+    return adapter.preview_tree_from_path(path)
+
+# 這裡，我們用「def」來定義（define）對外提供的切換專案狀態函式。
 def get_muted_paths(uuid: str) -> List[str]:
     adapter = _ensure_adapter()
     return adapter.get_muted_paths(uuid)
