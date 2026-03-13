@@ -51,13 +51,22 @@ call .\.venv\Scripts\activate.bat
 pip install -r requirements.txt
 echo [OK] 前端部署完成。
 
-:: 6. 建立桌面捷徑
-echo [5/5] 正在建立桌面捷徑...
+:: 6. 建立正式無黑窗啟動器與桌面捷徑
+echo [5/5] 正在建立正式啟動器與桌面捷徑...
+
+set "UI_LAUNCHER_VBS=%INSTALL_DIR_WIN%\run_ui.vbs"
+if not exist "%UI_LAUNCHER_VBS%" (
+    echo [錯誤] 缺少正式 UI 啟動器：%UI_LAUNCHER_VBS%
+    echo [提示] 請確認 Frontend\run_ui.vbs 已存在於安裝來源中。
+    pause
+    exit /b 1
+)
+
 set "SHORTCUT_SCRIPT=%temp%\CreateShortcut.vbs"
 echo Set oWS = WScript.CreateObject("WScript.Shell") > "%SHORTCUT_SCRIPT%"
 echo sLinkFile = "%USERPROFILE%\Desktop\Laplace Sentry.lnk" >> "%SHORTCUT_SCRIPT%"
 echo Set oLink = oWS.CreateShortcut(sLinkFile) >> "%SHORTCUT_SCRIPT%"
-echo oLink.TargetPath = "%INSTALL_DIR_WIN%\run_ui.bat" >> "%SHORTCUT_SCRIPT%"
+echo oLink.TargetPath = "%INSTALL_DIR_WIN%\run_ui.vbs" >> "%SHORTCUT_SCRIPT%"
 echo oLink.WorkingDirectory = "%INSTALL_DIR_WIN%" >> "%SHORTCUT_SCRIPT%"
 echo oLink.Description = "啟動目錄哨兵" >> "%SHORTCUT_SCRIPT%"
 echo oLink.IconLocation = "%INSTALL_DIR_WIN%\assets\icons\cyber-eye.ico" >> "%SHORTCUT_SCRIPT%"

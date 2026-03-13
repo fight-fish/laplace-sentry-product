@@ -3043,8 +3043,15 @@ class SentryTrayAppV2:
         self._debug_geometry("before-initial-go-to-eye")
         self.go_to_eye()
 
-        # 啟動後幾何觀測保留；首次顯示責任仍由 go_to_eye() 單一路徑處理。
-        QTimer.singleShot(200, lambda: self._debug_geometry("after-startup-200ms"))
+        # FIX: 系統啟動時 View A 不再躲起來，而是立即顯示。
+        # 使用 singleShot 確保在事件循環啟動後再執行 show()。
+        QTimer.singleShot(100, lambda: self._debug_geometry("before-singleShot-show"))
+        QTimer.singleShot(100, lambda: self.container.show())
+        QTimer.singleShot(100, lambda: self._debug_geometry("after-singleShot-show"))
+        QTimer.singleShot(100, lambda: self.container.activateWindow())
+        QTimer.singleShot(100, lambda: self.container.raise_())
+        QTimer.singleShot(200, lambda: self._debug_geometry("after-raise-200ms"))
+
     def _debug_geometry(self, tag: str):
         """統一輸出 Eye / Dashboard 幾何觀測資料。"""
         current = self.container.currentWidget()
