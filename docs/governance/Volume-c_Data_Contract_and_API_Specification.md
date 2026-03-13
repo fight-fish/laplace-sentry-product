@@ -75,6 +75,51 @@
 3. 檔案節點 children 必為空陣列
 4. 結構不得形成循環參照
 
+
+## 2.1.1 TreeNode Comment Persistence Rule 樹節點註解持久化規則
+
+### ■ 用途
+
+定義 TreeNode.comment 欄位在使用者編輯後的資料持久化來源與更新流程。
+
+### ■ 持久化來源
+
+在 S-02-02b v1 階段：
+
+TreeNode.comment 的資料持久化來源為：
+
+> target markdown 檔案中既有對應節點的註解位置
+
+系統不建立獨立 annotation 檔案，不新增資料庫層。
+
+### ■ 單點更新定位依據
+
+節點註解更新必須同時具備：
+
+| 條件 | 說明 |
+|------|------|
+| uuid | 專案唯一識別碼 |
+| path_key | 節點相對專案根目錄之唯一識別路徑 |
+
+兩者缺一不可。
+
+### ■ 更新流程約束
+
+1. UI 僅可提交 comment 新值
+2. 不得由 UI 直接寫入檔案
+3. 必須透過正式 daemon 指令進行寫入
+4. 寫入後必須重新解析目錄樹
+5. UI 顯示結果以重新解析之樹資料為準
+
+### ■ 相容性說明
+
+本規則：
+
+- 不改變既有 TreeNode Schema 結構
+- 不影響 manual_update 既有寫入流程
+- 不新增額外資料儲存層
+
+
 ---
 
 ## 2.2 Project Record Schema 專案紀錄結構
@@ -129,6 +174,69 @@ python main.py <command> <args>
 | -- | ------------------ |
 | 成功 | JSON               |
 | 失敗 | STDERR + Exit Code |
+
+
+## 3.1.1 save_tree_comment CLI Contract
+
+### ■ 用途
+
+提供單一節點註解之正式回寫指令介面。
+
+---
+
+### ■ 指令格式
+
+```bash
+python main.py save_tree_comment <uuid> <path_key> <comment>
+````
+
+---
+
+### ■ 參數定義
+
+| 參數       | 型別     | 說明          |
+| -------- | ------ | ----------- |
+| uuid     | string | 專案唯一識別碼     |
+| path_key | string | 節點唯一識別路徑    |
+| comment  | string | 使用者編輯後之註解內容 |
+
+---
+
+### ■ 成功回傳格式（STDOUT）
+
+```json
+{
+  "ok": true,
+  "uuid": "<uuid>",
+  "path_key": "<path_key>",
+  "comment": "<updated_comment>"
+}
+```
+
+---
+
+### ■ 失敗行為（STDERR + Exit Code）
+
+| Exit Code | 錯誤類型         |
+| --------- | ------------ |
+| 1         | 參數數量錯誤       |
+| 2         | uuid 不存在     |
+| 3         | path_key 不存在 |
+| 4         | 寫入流程失敗       |
+| 5         | 檔案鎖定或 I/O 錯誤 |
+
+STDERR 必須輸出可讀錯誤訊息，不得靜默失敗。
+
+---
+
+### ■ 相容性聲明
+
+本指令：
+
+* 不影響既有 manual_update 指令語意
+* 不改變既有 CLI 指令參數順序
+* 不新增破壞性資料格式
+* 不改變既有 safe_write 流程
 
 ---
 

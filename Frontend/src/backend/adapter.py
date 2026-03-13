@@ -518,6 +518,22 @@ class BackendAdapter:
             raise BackendError("更新失敗：UUID 為空。")
         self._run_wsl_command("manual_update", uuid)
 
+    def save_tree_comment(self, uuid: str, path_key: str, comment: str) -> Dict[str, Any]:
+        """呼叫 WSL 將單一節點註解同步回寫到 target markdown。"""
+        if not uuid:
+            raise BackendError("註解同步失敗：UUID 為空。")
+        if path_key is None:
+            raise BackendError("註解同步失敗：path_key 不得為空。")
+        if comment is None:
+            raise BackendError("註解同步失敗：comment 不得為空。")
+
+        result = self._run_wsl_command("save_tree_comment", uuid, path_key, comment)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("註解同步失敗：後端未回傳合法 JSON 物件。")
+
 
     # 這裡，我們用「def」來定義（define）獲取忽略候選名單的函式。
     def get_ignore_candidates(self, uuid: str) -> List[str]:
@@ -578,6 +594,18 @@ class BackendAdapter:
             return result
 
         raise BackendError("讀取目錄樹失敗：後端未回傳合法 JSON 物件。")
+
+    def preview_tree_from_path(self, path: str) -> Dict[str, Any]:
+        """呼叫 WSL 取得臨時資料夾的結構化預覽樹資料。"""
+        if not path:
+            raise BackendError("臨時預覽失敗：path 不得為空。")
+
+        result = self._run_wsl_command("preview_tree", path)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("臨時預覽失敗：後端未回傳合法 JSON 物件。")
     
     # [Task 9.4] 審計功能：獲取靜默路徑
     def get_muted_paths(self, uuid: str) -> List[str]:
@@ -719,6 +747,11 @@ def trigger_manual_update(uuid: str) -> None:
     adapter = _ensure_adapter()
     return adapter.trigger_manual_update(uuid)
 
+def save_tree_comment(uuid: str, path_key: str, comment: str) -> Dict[str, Any]:
+    # 獲取（get）單例 adapter 並呼叫其 save_tree_comment 方法。
+    adapter = _ensure_adapter()
+    return adapter.save_tree_comment(uuid, path_key, comment)
+
 
 # 這裡，我們用「def」來定義（define）對外提供的獲取忽略候選函式。
 def get_ignore_candidates(uuid: str) -> List[str]:
@@ -795,7 +828,11 @@ def get_project_tree(uuid: str) -> Dict[str, Any]:
     adapter = _ensure_adapter()
     return adapter.get_project_tree(uuid)
 
-# [Task 9.4] 對外公開接口
+def preview_tree_from_path(path: str) -> Dict[str, Any]:
+    adapter = _ensure_adapter()
+    return adapter.preview_tree_from_path(path)
+
+# 這裡，我們用「def」來定義（define）對外提供的切換專案狀態函式。
 def get_muted_paths(uuid: str) -> List[str]:
     adapter = _ensure_adapter()
     return adapter.get_muted_paths(uuid)
