@@ -163,63 +163,66 @@ class BackendAdapter:
 
     def _run_wsl_command(self, cmd: str, *args: str) -> list | dict | str:
         """
-        核心通訊橋樑 (v3.1 安全路徑版)：
-        1. 【新增】強制將所有 args 中的反斜線 (\\) 替換為正斜線 (/)，防止被 WSL Shell 吃掉。
-        2. 組裝 wsl ... 指令
-        3. 強制使用 utf-8 解碼
-        4. 智能解析回傳值
+        核心通訊橋樑 (v3.2 shell-safe 參數版)：
+        1. 將 Windows 反斜線路徑轉為正斜線
+        2. 對每個參數做 shell-safe quoting，避免 ()、空白、# 等字元被 bash 誤解
+        3. 維持既有 JSON / OK 解析策略
         """
-        # --- 安全清洗：防止反斜線災難 ---
-        # WSL/Linux 接收參數時，反斜線 \ 會被視為跳脫字元。
-        # 我們必須在 Windows 這端就先把它轉成 /，這對 Linux 來說是合法的路徑分隔符。
+        import shlex
+
         clean_args = [str(a).replace("\\", "/") for a in args]
+
+        quoted_parts = [
+            WSL_PYTHON,
+            "-m",
+            shlex.quote(WSL_MAIN_SCRIPT),
+            shlex.quote(cmd),
+            *[shlex.quote(a) for a in clean_args],
+        ]
+        command_string = " ".join(quoted_parts)
 
         full_cmd = [
             "wsl",
-            "--cd", WSL_PROJECT_ROOT,
-            WSL_PYTHON,
-            "-m", WSL_MAIN_SCRIPT,
-            cmd,
-            *clean_args
+            "--cd",
+            WSL_PROJECT_ROOT,
+            "bash",
+            "-lc",
+            command_string,
         ]
 
         try:
-            # 執行指令
             result = subprocess.run(
                 full_cmd,
                 capture_output=True,
                 text=True,
-                encoding='utf-8',
+                encoding="utf-8",
                 creationflags=0x08000000,
-                check=True 
+                check=True,
             )
-            
+
             output = result.stdout.strip()
 
             if not output:
                 return []
 
-            # --- 策略 1: 直接解析 JSON ---
             try:
                 return json.loads(output)
             except json.JSONDecodeError:
-                pass 
+                pass
 
-            # --- 策略 2: 嘗試從雜訊中提取 JSON ---
             try:
-                l_idx = output.find('[')
-                r_idx = output.rfind(']')
+                l_idx = output.find("[")
+                r_idx = output.rfind("]")
                 if l_idx != -1 and r_idx != -1 and r_idx > l_idx:
                     return json.loads(output[l_idx : r_idx + 1])
-                
-                l_idx = output.find('{')
-                r_idx = output.rfind('}')
+
+                l_idx = output.find("{")
+                r_idx = output.rfind("}")
                 if l_idx != -1 and r_idx != -1 and r_idx > l_idx:
                     return json.loads(output[l_idx : r_idx + 1])
             except json.JSONDecodeError:
-                pass 
+                pass
 
-            # --- 策略 3: 寬容放行 ---
             if result.returncode == 0:
                 return "OK"
 
@@ -229,7 +232,7 @@ class BackendAdapter:
             error_msg = e.stderr.strip() or "未知錯誤"
             raise BackendError(f"WSL 執行失敗: {error_msg}")
         except Exception as e:
-            raise BackendError(f"系統錯誤: {e}")   
+            raise BackendError(f"系統錯誤: {e}")
     # ---------------------------------------------------------
     # 讀取 projects.json
     # ---------------------------------------------------------
@@ -534,6 +537,18 @@ class BackendAdapter:
 
         raise BackendError("註解同步失敗：後端未回傳合法 JSON 物件。")
 
+    def publish_tree(self, uuid: str) -> Dict[str, Any]:
+        """呼叫 WSL 以第一寫入檔為 SSOT，將 AUTO_TREE 區塊發布到後續寫入檔。"""
+        if not uuid:
+            raise BackendError("註解發佈失敗：UUID 為空。")
+
+        result = self._run_wsl_command("publish_tree", uuid)
+
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("註解發佈失敗：後端未回傳合法 JSON 物件。")
+
 
     # 這裡，我們用「def」來定義（define）獲取忽略候選名單的函式。
     def get_ignore_candidates(self, uuid: str) -> List[str]:
@@ -751,6 +766,11 @@ def save_tree_comment(uuid: str, path_key: str, comment: str) -> Dict[str, Any]:
     # 獲取（get）單例 adapter 並呼叫其 save_tree_comment 方法。
     adapter = _ensure_adapter()
     return adapter.save_tree_comment(uuid, path_key, comment)
+
+def publish_tree(uuid: str) -> Dict[str, Any]:
+    # 獲取（get）單例 adapter 並呼叫其 publish_tree 方法。
+    adapter = _ensure_adapter()
+    return adapter.publish_tree(uuid)
 
 
 # 這裡，我們用「def」來定義（define）對外提供的獲取忽略候選函式。
