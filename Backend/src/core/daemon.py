@@ -1061,6 +1061,48 @@ def _get_primary_target_markdown(project_config: Dict[str, Any]) -> str:
     return target_doc
 
 
+def _extract_auto_tree_block(full_content: Any) -> str:
+    """
+    從 markdown 文字中抽出 AUTO_TREE 區塊內容（不含 marker 本身）。
+    若區塊不存在或結構不合法，直接拋錯。
+    """
+    if not isinstance(full_content, str):
+        full_content = str(full_content or "")
+
+    start_marker = "<!-- AUTO_TREE_START -->"
+    end_marker = "<!-- AUTO_TREE_END -->"
+
+    start_idx = full_content.find(start_marker)
+    end_idx = full_content.find(end_marker)
+
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        raise RuntimeError("target markdown 缺少有效的 AUTO_TREE 區塊。")
+
+    block_start = start_idx + len(start_marker)
+    return full_content[block_start:end_idx]
+
+
+def _replace_auto_tree_block(full_content: Any, new_tree_block: str) -> str:
+    """
+    將 markdown 文字中的 AUTO_TREE 區塊替換為 new_tree_block。
+    保留 marker 與區塊外其他內容不變。
+    """
+    if not isinstance(full_content, str):
+        full_content = str(full_content or "")
+
+    start_marker = "<!-- AUTO_TREE_START -->"
+    end_marker = "<!-- AUTO_TREE_END -->"
+
+    start_idx = full_content.find(start_marker)
+    end_idx = full_content.find(end_marker)
+
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        raise RuntimeError("target markdown 缺少有效的 AUTO_TREE 區塊。")
+
+    block_start = start_idx + len(start_marker)
+    return f"{full_content[:block_start]}{new_tree_block}{full_content[end_idx:]}"
+
+
 def _split_tree_line_comment(line: str) -> Tuple[str, Optional[str]]:
     """
     將樹節點行拆成：
@@ -1197,6 +1239,99 @@ def handle_save_tree_comment(args: List[str], projects_file_path: Optional[str] 
         "uuid": uuid_target,
         "path_key": path_key,
         "comment": updated_comment,
+    }
+
+
+def handle_publish_tree(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    【API】以第一寫入檔為 SSOT，將 AUTO_TREE 區塊發布到後續寫入檔。
+
+    規則：
+    - 第一寫入檔（primary target）視為主稿
+    - 只覆蓋後續寫入檔的 AUTO_TREE 區塊
+    - 不重建整個專案樹
+    - 不修改第一寫入檔內容
+    """
+    PROJECTS_FILE = get_projects_file_path(projects_file_path)
+
+    if len(args) != 1:
+        raise ValueError("publish_tree 需要 1 個參數：<uuid>")
+
+    uuid_target = args[0]
+
+    projects_data = read_projects_data(PROJECTS_FILE)
+    selected_project = next((p for p in projects_data if p.get("uuid") == uuid_target), None)
+    if not selected_project:
+        raise ValueError(f"未找到具有該 UUID 的專案 '{uuid_target}'。")
+
+    targets = _get_targets_from_project(selected_project)
+    if not targets:
+        raise RuntimeError("找不到可用的寫入目標。")
+
+    primary_target = normalize_path(targets[0])
+    secondary_targets = [normalize_path(t) for t in targets[1:] if isinstance(t, str) and t.strip()]
+
+    if not os.path.isfile(primary_target):
+        raise IOError(f"primary target 不存在或不可讀取 -> {primary_target}")
+
+    if not secondary_targets:
+        return {
+            "ok": True,
+            "uuid": uuid_target,
+            "primary_target": primary_target,
+            "published_count": 0,
+            "results": [],
+        }
+
+    with open(primary_target, "r", encoding="utf-8") as f:
+        primary_content = f.read()
+
+    primary_tree_block = _extract_auto_tree_block(primary_content)
+
+    results: List[Dict[str, Any]] = []
+
+    for target_doc in secondary_targets:
+        if not os.path.isfile(target_doc):
+            results.append({
+                "target": target_doc,
+                "ok": False,
+                "error": f"target 不存在或不可讀取 -> {target_doc}",
+            })
+            continue
+
+        try:
+            def publish_callback(full_old_content: Any) -> str:
+                return _replace_auto_tree_block(full_old_content, primary_tree_block)
+
+            safe_read_modify_write(
+                target_doc,
+                publish_callback,
+                serializer="text",
+                project_uuid=uuid_target,
+            )
+
+            results.append({
+                "target": target_doc,
+                "ok": True,
+            })
+
+        except Exception as e:
+            results.append({
+                "target": target_doc,
+                "ok": False,
+                "error": str(e),
+            })
+
+    published_count = sum(1 for item in results if item.get("ok") is True)
+    failed_count = sum(1 for item in results if item.get("ok") is False)
+
+    return {
+        "ok": failed_count == 0,
+        "uuid": uuid_target,
+        "primary_target": primary_target,
+        "published_count": published_count,
+        "failed_count": failed_count,
+        "results": results,
     }
 
 
@@ -1416,6 +1551,24 @@ def main_dispatcher(argv: List[str], **kwargs):
                 return 1
             result = handle_preview_tree(args)
             print(json.dumps(result, ensure_ascii=False, indent=2))
+
+        elif command == "publish_tree":
+            if len(args) != 1:
+                print("錯誤：publish_tree 需要 1 個參數：<uuid>", file=sys.stderr)
+                return 1
+
+            try:
+                result = handle_publish_tree(args, projects_file_path=projects_file_path)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                return 2
+            except RuntimeError as e:
+                print(str(e), file=sys.stderr)
+                return 4
+            except IOError as e:
+                print(str(e), file=sys.stderr)
+                return 5
 
         elif command == "save_tree_comment":
             if len(args) != 3:
