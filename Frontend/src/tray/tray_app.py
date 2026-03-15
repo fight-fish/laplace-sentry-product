@@ -2135,9 +2135,18 @@ class DashboardWidget(QWidget):
         self._is_preview_tree_mode = True
         self._reset_tree_edit_context()
 
+        if hasattr(self, "tree_comment_editor"):
+            self.tree_comment_editor.setReadOnly(True)
+            self.tree_comment_editor.setPlaceholderText("臨時預覽模式不可編輯註解。")
+            self._load_tree_comment_into_editor("【臨時預覽模式】\n此區僅供查看，不可編輯註解，也不可同步寫入正式專案。")
+
     def _enter_project_tree_mode(self) -> None:
         """切換回正式專案樹模式。"""
         self._is_preview_tree_mode = False
+
+        if hasattr(self, "tree_comment_editor"):
+            self.tree_comment_editor.setReadOnly(False)
+            self.tree_comment_editor.setPlaceholderText("可在這裡編輯目前節點的註解。")
 
     def _reset_tree_edit_context(self) -> None:
         """清空目前樹節點的註解編輯上下文。"""
@@ -2160,8 +2169,13 @@ class DashboardWidget(QWidget):
         if not hasattr(self, "btn_sync_write"):
             return
 
+        if self._is_preview_tree_mode:
+            self.btn_sync_write.setEnabled(False)
+            self.btn_sync_write.setText("🔄 同步寫入")
+            return
+
         has_project = bool(self._current_tree_project_uuid)
-        has_path_key = self._current_tree_path_key is not None
+        has_path_key = bool(self._current_tree_path_key)
         can_sync = has_project and has_path_key and self._current_tree_dirty
 
         current_project = next(
@@ -2410,10 +2424,13 @@ class DashboardWidget(QWidget):
             copy_scope = f"此節點子樹：{path_key}"
             source_label = f"目前複製來源：{path_key}"
 
-        row = self.project_table.currentRow() if hasattr(self, "project_table") else -1
         current_project_uuid = ""
-        if 0 <= row < len(self.current_projects):
-            current_project_uuid = self.current_projects[row].uuid
+
+        # 我們先用「if」判斷：如果目前是 preview mode，就禁止回填正式專案 uuid。
+        if not self._is_preview_tree_mode:
+            row = self.project_table.currentRow() if hasattr(self, "project_table") else -1
+            if 0 <= row < len(self.current_projects):
+                current_project_uuid = self.current_projects[row].uuid
 
         self._current_tree_project_uuid = current_project_uuid
         self._current_tree_path_key = path_key
@@ -2648,6 +2665,11 @@ class DashboardWidget(QWidget):
     # 這裡，我們用「def」來定義（define）執行手動更新的動作函式。
     def _perform_sync_write_for_current_selection(self) -> None:
         """從工作台入口觸發：有 dirty 時先同步到第一寫入檔；無 dirty 但有多目標時執行發布。"""
+        if self._is_preview_tree_mode:
+            self._set_status_message("預覽模式不可同步寫入正式專案。", level="info")
+            self._refresh_tree_sync_button_state()
+            return
+
         project_uuid = self._current_tree_project_uuid.strip()
         path_key = self._current_tree_path_key
         current_comment = self.tree_comment_editor.toPlainText() if hasattr(self, "tree_comment_editor") else ""
