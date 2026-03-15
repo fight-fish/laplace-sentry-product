@@ -2345,6 +2345,7 @@ class DashboardWidget(QWidget):
             "path_key": path_key,
             "is_dir": is_dir,
             "tree_node": node,
+            "project_uuid": self._current_tree_project_uuid if not self._is_preview_tree_mode else "",
         })
 
         if parent_item is None:
@@ -2419,18 +2420,13 @@ class DashboardWidget(QWidget):
                 copy_scope = "整個專案樹"
                 source_label = "目前複製來源：整個專案根目錄"
         else:
-            path_key = raw_path_key
+            normalized_path_key = raw_path_key.rstrip("/") if is_dir else raw_path_key
+            path_key = normalized_path_key
             node_type = "資料夾" if is_dir else "檔案"
             copy_scope = f"此節點子樹：{path_key}"
             source_label = f"目前複製來源：{path_key}"
 
-        current_project_uuid = ""
-
-        # 我們先用「if」判斷：如果目前是 preview mode，就禁止回填正式專案 uuid。
-        if not self._is_preview_tree_mode:
-            row = self.project_table.currentRow() if hasattr(self, "project_table") else -1
-            if 0 <= row < len(self.current_projects):
-                current_project_uuid = self.current_projects[row].uuid
+        current_project_uuid = str(payload.get("project_uuid", "") or "").strip()
 
         self._current_tree_project_uuid = current_project_uuid
         self._current_tree_path_key = path_key
@@ -2492,6 +2488,7 @@ class DashboardWidget(QWidget):
         self.tree_viewer.clear()
         if isinstance(tree_only, dict) and tree_only:
             self._current_tree_payload = tree_only
+            self._current_tree_project_uuid = proj.uuid
             if hasattr(self, 'btn_copy_tree'):
                 self.btn_copy_tree.setEnabled(True)
 
