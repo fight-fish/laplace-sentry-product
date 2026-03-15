@@ -472,11 +472,21 @@ def _build_structured_tree(
             used_basenames,
         )
 
+        # 判斷是否存在「正式註解」
+        comment_exists = False
+        if comment:
+            text = str(comment).strip()
+            if text and not text.startswith("TODO:"):
+                comment_exists = True
+
         node_map[path_key] = {
             "name": name,
             "path_key": path_key,
             "is_dir": is_dir,
+
             "comment": comment,
+            "comment_exists": comment_exists,
+
             "children": [],
         }
 
