@@ -1397,6 +1397,18 @@ class DashboardWidget(QWidget):
         self._current_tree_path_key: str = ""
         self._current_tree_original_comment: str = ""
         self._current_tree_dirty: bool = False
+
+        # [T-02-05] 多節點狀態暫存層（NodeStateCache）
+        # key = (project_uuid, path_key)
+        # value = {
+        #     "original_comment": str,
+        #     "draft_comment": str,
+        #     "dirty": bool,
+        #     "sync_state": str,
+        #     "publish_state": str,
+        # }
+        self._node_state_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
         self._is_loading_tree_comment: bool = False
         self._is_preview_tree_mode: bool = False
 
@@ -2156,6 +2168,49 @@ class DashboardWidget(QWidget):
         self._current_tree_dirty = False
         self._refresh_tree_sync_button_state()
 
+    def _make_node_state_cache_key(self, project_uuid: str, path_key: str) -> tuple[str, str] | None:
+        """組出 NodeStateCache 的 key；缺任一欄位時回傳 None。"""
+        normalized_project_uuid = str(project_uuid or "").strip()
+        normalized_path_key = str(path_key or "").strip()
+
+        if not normalized_project_uuid or not normalized_path_key:
+            return None
+
+        return (normalized_project_uuid, normalized_path_key)
+
+    def _upsert_current_node_state_cache(
+        self,
+        *,
+        draft_comment: str | None = None,
+        sync_state: str | None = None,
+        publish_state: str | None = None,
+    ) -> None:
+        """把目前節點的狀態寫入 NodeStateCache。"""
+        cache_key = self._make_node_state_cache_key(
+            self._current_tree_project_uuid,
+            self._current_tree_path_key,
+        )
+        if cache_key is None:
+            return
+
+        current_entry = self._node_state_cache.get(cache_key, {})
+        current_original_comment = self._current_tree_original_comment
+
+        next_draft_comment = (
+            current_entry.get("draft_comment", current_original_comment)
+            if draft_comment is None
+            else draft_comment
+        )
+        next_dirty = (next_draft_comment != current_original_comment)
+
+        self._node_state_cache[cache_key] = {
+            "original_comment": current_original_comment,
+            "draft_comment": next_draft_comment,
+            "dirty": next_dirty,
+            "sync_state": current_entry.get("sync_state", "idle") if sync_state is None else sync_state,
+            "publish_state": current_entry.get("publish_state", "idle") if publish_state is None else publish_state,
+        }
+
     def _load_tree_comment_into_editor(self, comment_text: str) -> None:
         """以受控方式把註解載入 editor，避免誤觸 dirty。"""
         self._is_loading_tree_comment = True
@@ -2165,7 +2220,7 @@ class DashboardWidget(QWidget):
             self._is_loading_tree_comment = False
 
     def _refresh_tree_sync_button_state(self) -> None:
-        """依目前節點上下文與 dirty 狀態更新同步/發布按鈕可用性。"""
+        """依目前專案的 dirty 狀態與發布條件更新同步/發布按鈕。"""
         if not hasattr(self, "btn_sync_write"):
             return
 
@@ -2174,19 +2229,27 @@ class DashboardWidget(QWidget):
             self.btn_sync_write.setText("🔄 同步寫入")
             return
 
-        has_project = bool(self._current_tree_project_uuid)
-        has_path_key = bool(self._current_tree_path_key)
-        can_sync = has_project and has_path_key and self._current_tree_dirty
+        current_project_uuid = self._current_tree_project_uuid.strip()
+        has_project = bool(current_project_uuid)
+
+        project_has_dirty = False
+        if has_project:
+            for (cache_project_uuid, _cache_path_key), entry in self._node_state_cache.items():
+                if cache_project_uuid != current_project_uuid:
+                    continue
+                if bool(entry.get("dirty", False)):
+                    project_has_dirty = True
+                    break
 
         current_project = next(
-            (p for p in self.current_projects if p.uuid == self._current_tree_project_uuid),
+            (p for p in self.current_projects if p.uuid == current_project_uuid),
             None
         )
         has_publish_targets = bool(current_project and len(current_project.output_file) > 1)
 
-        self.btn_sync_write.setEnabled(can_sync or has_publish_targets)
+        self.btn_sync_write.setEnabled(project_has_dirty or has_publish_targets)
 
-        if can_sync:
+        if project_has_dirty:
             self.btn_sync_write.setText("🔄 同步寫入 *")
         elif has_publish_targets:
             self.btn_sync_write.setText("📢 發布")
@@ -2200,6 +2263,22 @@ class DashboardWidget(QWidget):
 
         current_text = self.tree_comment_editor.toPlainText()
         self._current_tree_dirty = (current_text != self._current_tree_original_comment)
+
+        self._upsert_current_node_state_cache(
+            draft_comment=current_text,
+        )
+
+        current_item = self.tree_viewer.currentItem() if hasattr(self, "tree_viewer") else None
+        if current_item is not None:
+            item_text = current_item.text(0)
+
+            if self._current_tree_dirty:
+                if not item_text.endswith(" *"):
+                    current_item.setText(0, f"{item_text} *")
+            else:
+                if item_text.endswith(" *"):
+                    current_item.setText(0, item_text[:-2])
+
         self._refresh_tree_sync_button_state()
 
     # ---------------------------
@@ -2336,7 +2415,15 @@ class DashboardWidget(QWidget):
         path_key = str(node.get("path_key", ""))
         is_dir = bool(node.get("is_dir", False))
 
+        project_uuid = self._current_tree_project_uuid if not self._is_preview_tree_mode else ""
+
         display_name = name if comment_exists else f"⚠ {name}"
+
+        cache_key = self._make_node_state_cache_key(project_uuid, path_key)
+        if cache_key is not None:
+            cached_entry = self._node_state_cache.get(cache_key, {})
+            if bool(cached_entry.get("dirty", False)):
+                display_name = f"{display_name} *"
 
         item = QTreeWidgetItem([display_name])
         item.setData(0, Qt.ItemDataRole.UserRole, {
@@ -2345,7 +2432,7 @@ class DashboardWidget(QWidget):
             "path_key": path_key,
             "is_dir": is_dir,
             "tree_node": node,
-            "project_uuid": self._current_tree_project_uuid if not self._is_preview_tree_mode else "",
+            "project_uuid": project_uuid,
         })
 
         if parent_item is None:
@@ -2433,6 +2520,15 @@ class DashboardWidget(QWidget):
         self._current_tree_original_comment = comment_text
         self._current_tree_dirty = False
 
+        # T-02-05：優先載入 NodeStateCache 的 draft_comment
+        cache_key = (current_project_uuid, path_key)
+        cached = self._node_state_cache.get(cache_key)
+
+        if cached and "draft_comment" in cached:
+            editor_comment = cached["draft_comment"]
+        else:
+            editor_comment = comment_text
+
         detail_lines = [
             f"名稱：{name}",
             f"類型：{node_type}",
@@ -2441,7 +2537,7 @@ class DashboardWidget(QWidget):
             f"按下「複製目錄樹」時：會複製 {copy_scope}",
         ]
         self.tree_meta_viewer.setPlainText("\n".join(detail_lines))
-        self._load_tree_comment_into_editor(comment_text)
+        self._load_tree_comment_into_editor(editor_comment)
         self._refresh_tree_sync_button_state()
 
     def _on_project_selection_changed(self) -> None:
@@ -2661,14 +2757,14 @@ class DashboardWidget(QWidget):
 
     # 這裡，我們用「def」來定義（define）執行手動更新的動作函式。
     def _perform_sync_write_for_current_selection(self) -> None:
-        """從工作台入口觸發：有 dirty 時先同步到第一寫入檔；無 dirty 但有多目標時執行發布。"""
+        """從工作台入口觸發：先同步目前專案所有 dirty 節點到第一寫入檔；無 dirty 時才執行發布。"""
         if self._is_preview_tree_mode:
             self._set_status_message("預覽模式不可同步寫入正式專案。", level="info")
             self._refresh_tree_sync_button_state()
             return
 
         project_uuid = self._current_tree_project_uuid.strip()
-        path_key = self._current_tree_path_key
+        selected_path_key = self._current_tree_path_key
         current_comment = self.tree_comment_editor.toPlainText() if hasattr(self, "tree_comment_editor") else ""
 
         if not project_uuid:
@@ -2682,10 +2778,21 @@ class DashboardWidget(QWidget):
         has_publish_targets = bool(current_project and len(current_project.output_file) > 1)
 
         if self._current_tree_dirty:
-            if path_key is None:
-                self._set_status_message("目前沒有選取任何節點，無法同步寫入。", level="error")
-                return
+            self._upsert_current_node_state_cache(
+                draft_comment=current_comment,
+            )
 
+        dirty_entries: list[tuple[str, str]] = []
+        for (cache_project_uuid, cache_path_key), entry in self._node_state_cache.items():
+            if cache_project_uuid != project_uuid:
+                continue
+            if not bool(entry.get("dirty", False)):
+                continue
+
+            draft_comment = str(entry.get("draft_comment", entry.get("original_comment", "")))
+            dirty_entries.append((cache_path_key, draft_comment))
+
+        if dirty_entries:
             if hasattr(self, 'btn_sync_write'):
                 self.btn_sync_write.setEnabled(False)
                 self.btn_sync_write.setText("⏳ 同步中…")
@@ -2693,7 +2800,22 @@ class DashboardWidget(QWidget):
             QApplication.processEvents()
 
             try:
-                adapter.save_tree_comment(project_uuid, path_key, current_comment)
+                for dirty_path_key, dirty_comment in dirty_entries:
+                    adapter.save_tree_comment(project_uuid, dirty_path_key, dirty_comment)
+
+                for dirty_path_key, dirty_comment in dirty_entries:
+                    cache_key = self._make_node_state_cache_key(project_uuid, dirty_path_key)
+                    if cache_key is None:
+                        continue
+
+                    current_entry = self._node_state_cache.get(cache_key, {})
+                    self._node_state_cache[cache_key] = {
+                        "original_comment": dirty_comment,
+                        "draft_comment": dirty_comment,
+                        "dirty": False,
+                        "sync_state": "synced",
+                        "publish_state": current_entry.get("publish_state", "idle"),
+                    }
 
                 tree_payload = adapter.get_project_tree(project_uuid)
                 tree_only = tree_payload.get("tree", {})
@@ -2704,7 +2826,7 @@ class DashboardWidget(QWidget):
                     self._populate_tree_widget(tree_only)
                     self.tree_viewer.expandToDepth(1)
 
-                    target_item = self._find_tree_item_by_path_key(path_key)
+                    target_item = self._find_tree_item_by_path_key(selected_path_key)
                     if target_item is None and self.tree_viewer.topLevelItemCount() > 0:
                         target_item = self.tree_viewer.topLevelItem(0)
 
@@ -2712,10 +2834,21 @@ class DashboardWidget(QWidget):
                         self.tree_viewer.setCurrentItem(target_item)
                         self._on_tree_item_changed(target_item)
 
-                self._set_status_message("✓ 目前節點註解已同步寫入第一寫入檔。", level="success")
+                self._set_status_message(
+                    f"✓ 已同步 {len(dirty_entries)} 個節點到第一寫入檔。",
+                    level="success",
+                )
 
             except Exception as e:
-                self._current_tree_dirty = True
+                for dirty_path_key, _dirty_comment in dirty_entries:
+                    cache_key = self._make_node_state_cache_key(project_uuid, dirty_path_key)
+                    if cache_key is None:
+                        continue
+
+                    current_entry = self._node_state_cache.get(cache_key, {})
+                    current_entry["sync_state"] = "error"
+                    self._node_state_cache[cache_key] = current_entry
+
                 self._refresh_tree_sync_button_state()
                 self._set_status_message(f"註解同步失敗：{e}", level="error")
             finally:
