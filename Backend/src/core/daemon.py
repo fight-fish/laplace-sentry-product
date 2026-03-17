@@ -1192,7 +1192,8 @@ def handle_save_tree_comment(args: List[str], projects_file_path: Optional[str] 
         raise ValueError(f"未找到具有該 UUID 的專案 '{uuid_target}'。")
 
     target_doc = _get_primary_target_markdown(selected_project)
-    updated_comment = str(comment)
+    normalized_comment = str(comment)
+    updated_comment = normalized_comment if normalized_comment.strip() else "# TODO: Add comment here"
 
     def update_comment_callback(full_old_content: Any) -> str:
         if not isinstance(full_old_content, str):
@@ -1217,10 +1218,7 @@ def handle_save_tree_comment(args: List[str], projects_file_path: Optional[str] 
 
         original_line = lines[target_line_index]
         base_part, _ = _split_tree_line_comment(original_line)
-        new_line = base_part.rstrip()
-
-        if updated_comment.strip():
-            new_line = f"{new_line}  # {updated_comment}"
+        new_line = f"{base_part.rstrip()}  # {updated_comment}"
 
         lines[target_line_index] = new_line
         new_tree_block = "\n".join(lines)
