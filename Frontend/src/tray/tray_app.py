@@ -7,6 +7,7 @@ import sys
 import json
 from typing import List, Dict, Any
 import math
+import ctypes
 from pathlib import Path
 
 # --- 2. PySide6 核心與介面元件 ---
@@ -19,6 +20,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     Signal,
     QSettings,
+    QEvent,
 )
 
 from PySide6.QtGui import (
@@ -1245,6 +1247,10 @@ from PySide6.QtWidgets import QTextEdit
 # ==========================================
 from PySide6.QtWidgets import QTextEdit
 
+class CommentEditorWidget(QTextEdit):
+    """註解編輯器：不做輸入前事件偵測，狀態列統一交由 textChanged / dirty 路徑處理。"""
+    pass
+
 class LogViewerWidget(QTextEdit):
     """
     黑底白字的日誌顯示器 (內建翻譯機 + 時間軸)。
@@ -1660,11 +1666,11 @@ class DashboardWidget(QWidget):
         # 建立主佈局，採用水平佈局（QHBoxLayout），把左側控制區與右側工作區並排。
         layout = QHBoxLayout(frame)
 
-        # 左側：忽略設定 + 狀態訊息 + 偏好設定（採用垂直佈局）
+        # 左側：詳情提要 + 狀態訊息 + 偏好設定（採用垂直佈局）
         left_panel = QVBoxLayout()
 
         # [1] 忽略設定說明
-        self.ignore_info_label = QLabel("忽略設定區（暫時版）：尚未載入設定。")
+        self.ignore_info_label = QLabel("詳情提要：\n尚未載入設定。")
         self.ignore_info_label.setWordWrap(True)
         left_panel.addWidget(self.ignore_info_label)
 
@@ -1776,6 +1782,20 @@ class DashboardWidget(QWidget):
         self.tree_viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tree_viewer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.tree_viewer.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.tree_viewer.setStyleSheet("""
+            QTreeWidget::item:selected {
+                background-color: #dbeafe;
+                color: #1f2937;
+            }
+            QTreeWidget::item:selected:active {
+                background-color: #dbeafe;
+                color: #1f2937;
+            }
+            QTreeWidget::item:selected:!active {
+                background-color: #e8f1fd;
+                color: #1f2937;
+            }
+        """)
 
         tree_header = self.tree_viewer.header()
         tree_header.setStretchLastSection(True)
@@ -1794,7 +1814,7 @@ class DashboardWidget(QWidget):
         self.tree_meta_viewer.setPlaceholderText("選取目錄樹節點後，會在這裡顯示系統資訊。")
         self.tree_meta_viewer.setPlainText("節點資訊區：\n請先選取左側專案，並點選目錄樹節點。")
 
-        self.tree_comment_editor = QTextEdit()
+        self.tree_comment_editor = CommentEditorWidget()
         self.tree_comment_editor.setReadOnly(False)
         self.tree_comment_editor.setFrameShape(QFrame.Shape.StyledPanel)
         self.tree_comment_editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1802,9 +1822,16 @@ class DashboardWidget(QWidget):
         self.tree_comment_editor.setPlaceholderText("可在這裡編輯目前節點的註解。")
         self.tree_comment_editor.setPlainText("請先選取左側專案，並點選目錄樹節點。")
 
+        self.tree_edit_status_label = QLabel("準備編輯註釋…")
+        self.tree_edit_status_label.setStyleSheet("color: #1f8b4c; font-weight: bold;")
+        self.tree_edit_status_label.setWordWrap(True)
+
+        # 註解欄狀態列只保留 textChanged / dirty 單一路徑。
+
         detail_layout.addWidget(QLabel("<b>節點資訊</b>"))
         detail_layout.addWidget(self.tree_meta_viewer, stretch=3)
         detail_layout.addWidget(QLabel("<b>註解編輯</b>"))
+        detail_layout.addWidget(self.tree_edit_status_label)
         detail_layout.addWidget(self.tree_comment_editor, stretch=2)
 
         placeholder_item = QTreeWidgetItem(["目錄樹工作區"])
@@ -2091,22 +2118,17 @@ class DashboardWidget(QWidget):
 
 # 這裡，我們用「def」來定義（define）載入忽略設定的函式。
     def _load_ignore_settings(self) -> None:
-        """從 adapter 取得忽略設定，顯示在底部文字區。"""
-        # 呼叫（call）後端（adapter）的 get_ignore_settings 函式，獲取忽略設定物件。
+        """載入底部左側的詳情提要基礎資訊。"""
         settings = adapter.get_ignore_settings()
-        
-        # 建立（[]）一個叫 text_lines 的「文字籃子」，準備好要顯示的每一行文字。
+
         text_lines = [
-            "忽略設定區（暫時版）：",
+            "詳情提要：",
             "",
-            # 這是 f-string 的寫法，用於組裝文字。
-            # .join(settings.sentry_ignore_patterns) 會把忽略樣式用逗號連接起來。
+            "此區顯示目前工作區的補充資訊與批次摘要。",
             f"- 哨兵忽略樣式：{', '.join(settings.sentry_ignore_patterns) or '(無)'}",
-            # 顯示目錄樹的深度限制。
             f"- 目錄樹深度限制：{settings.tree_depth_limit}",
         ]
-        # 用換行符號（\n）將「文字籃子」中的每一行文字連接（join）起來，
-        # 然後設定（setText）到忽略資訊標籤（ignore_info_label）上。
+
         self.ignore_info_label.setText("\n".join(text_lines))
 
 
@@ -2120,27 +2142,102 @@ class DashboardWidget(QWidget):
             - "success" 成功訊息（綠色）
             - "error"   錯誤訊息（紅色）
         """
-        # .strip() 是去除文字前後的空格。
-        # 如果（or）輸入的 text 是空字串，就用預設文字「狀態訊息：」來代替。
         text = text.strip() or "狀態訊息："
 
-        # 用「if」來判斷（if）：如果 level 是 "error"（錯誤）...
         if level == "error":
-            # 顏色就設定為紅色（#aa0000）。
             color = "#aa0000"
-        # 用「elif」來判斷（else if）：否則，如果 level 是 "success"（成功）...
         elif level == "success":
-            # 顏色就設定為綠色（#006600）。
             color = "#006600"
-        # 用「else」來判斷：都不是的話（預設是 "info"）...
         else:
-            # 顏色就設定為灰色（#666666）。
             color = "#666666"
 
-        # 設定（setText）狀態訊息標籤的文字。
         self.status_message_label.setText(text)
-        # 設定（setStyleSheet）標籤的樣式，把前面判斷好的顏色放進去。
         self.status_message_label.setStyleSheet(f"color: {color};")
+
+    def _status_icon_dir(self) -> Path:
+        """狀態 icon 目錄。"""
+        return Path(__file__).resolve().parents[2] / "assets" / "icons"
+
+    def _status_icon_path(self, indicator_type: str) -> str:
+        """依狀態類型回傳對應 icon 檔案路徑。"""
+        icon_map = {
+            "failed": "icon_failed.png",
+            "pending_sync": "icon_pending_sync.png",
+            "missing": "icon_missing_annotation.png",
+            "done": "icon_done.png",
+            "pending_publish": "icon_pending_publish.png",
+        }
+
+        filename = icon_map.get(indicator_type, "")
+        if not filename:
+            return ""
+
+        icon_path = self._status_icon_dir() / filename
+        return str(icon_path) if icon_path.is_file() else ""
+
+    def _resolve_indicator_type(
+        self,
+        *,
+        node_dirty: bool,
+        node_comment_exists: bool,
+        node_sync_state: str,
+        node_publish_state: str,
+    ) -> str:
+        """依目前節點狀態輸出單一主圖示類型。"""
+        if node_publish_state == "failed":
+            return "failed"
+        elif node_dirty:
+            return "pending_sync"
+        elif not node_comment_exists:
+            return "missing"
+        elif node_sync_state == "synced" and node_publish_state == "ok":
+            return "done"
+        elif node_sync_state == "synced":
+            return "pending_publish"
+        else:
+            return ""
+
+    def _render_tree_meta_html(
+        self,
+        *,
+        name: str,
+        node_type: str,
+        path_key: str,
+        indicator_type: str,
+        status_label: str,
+        status_desc: str,
+        source_label: str,
+        copy_scope: str,
+    ) -> str:
+        """把節點資訊區組成 HTML，讓節點狀態可顯示 icon + 中文。"""
+        import html
+
+        safe_name = html.escape(name)
+        safe_node_type = html.escape(node_type)
+        safe_path_key = html.escape(path_key)
+        safe_status_label = html.escape(status_label)
+        safe_status_desc = html.escape(status_desc)
+        safe_source_label = html.escape(source_label)
+        safe_copy_scope = html.escape(copy_scope)
+
+        icon_path = self._status_icon_path(indicator_type)
+        if icon_path:
+            icon_html = (
+                f'<img src="{icon_path}" width="16" height="16" '
+                f'style="vertical-align: middle; margin-right: 6px;">'
+            )
+        else:
+            icon_html = ""
+
+        return (
+            f"名稱：{safe_name}<br>"
+            f"類型：{safe_node_type}<br>"
+            f"路徑鍵：{safe_path_key}<br>"
+            f"節點狀態：{icon_html}{safe_status_label}<br>"
+            f"狀態說明：{safe_status_desc}<br>"
+            f"{safe_source_label}<br>"
+            f"按下「複製目錄樹」時：會複製 {safe_copy_scope}"
+        )
 
     def _enter_preview_tree_mode(self) -> None:
         """切換到臨時 preview tree 模式，並清空正式寫入上下文。"""
@@ -2250,7 +2347,7 @@ class DashboardWidget(QWidget):
         self.btn_sync_write.setEnabled(project_has_dirty or has_publish_targets)
 
         if project_has_dirty:
-            self.btn_sync_write.setText("🔄 同步寫入 *")
+            self.btn_sync_write.setText("🔄 同步寫入")
         elif has_publish_targets:
             self.btn_sync_write.setText("📢 發布")
         else:
@@ -2264,20 +2361,102 @@ class DashboardWidget(QWidget):
         current_text = self.tree_comment_editor.toPlainText()
         self._current_tree_dirty = (current_text != self._current_tree_original_comment)
 
+        if hasattr(self, "tree_edit_status_label"):
+            if self._current_tree_dirty:
+                self.tree_edit_status_label.setText("編輯中…")
+            else:
+                self.tree_edit_status_label.setText("準備編輯註釋…")
+
         self._upsert_current_node_state_cache(
             draft_comment=current_text,
         )
 
         current_item = self.tree_viewer.currentItem() if hasattr(self, "tree_viewer") else None
         if current_item is not None:
-            item_text = current_item.text(0)
+            payload = current_item.data(0, Qt.ItemDataRole.UserRole)
 
-            if self._current_tree_dirty:
-                if not item_text.endswith(" *"):
-                    current_item.setText(0, f"{item_text} *")
-            else:
-                if item_text.endswith(" *"):
-                    current_item.setText(0, item_text[:-2])
+            if isinstance(payload, dict):
+                node_name = str(payload.get("name", "") or "")
+                node_comment_exists = bool(payload.get("comment_exists", False))
+
+                cache_key = self._make_node_state_cache_key(
+                    self._current_tree_project_uuid,
+                    self._current_tree_path_key,
+                )
+                cached_entry = self._node_state_cache.get(cache_key, {}) if cache_key is not None else {}
+
+                node_dirty = bool(cached_entry.get("dirty", False))
+                node_sync_state = str(cached_entry.get("sync_state", "idle"))
+                node_publish_state = str(cached_entry.get("publish_state", "idle"))
+
+                indicator_type = self._resolve_indicator_type(
+                    node_dirty=node_dirty,
+                    node_comment_exists=node_comment_exists,
+                    node_sync_state=node_sync_state,
+                    node_publish_state=node_publish_state,
+                )
+
+                current_item.setText(0, node_name)
+
+                icon_path = self._status_icon_path(indicator_type)
+                if icon_path:
+                    current_item.setIcon(0, QIcon(icon_path))
+                else:
+                    current_item.setIcon(0, QIcon())
+
+                if hasattr(self, "tree_meta_viewer"):
+                    payload_path_key = str(payload.get("path_key", "") or "").strip()
+                    payload_is_dir = bool(payload.get("is_dir", False))
+                    is_root_node = payload_path_key in ("", "(root)")
+
+                    if is_root_node:
+                        path_key = "(root)"
+                        if getattr(self, "_is_preview_tree_mode", False):
+                            node_type = "資料夾根目錄"
+                            copy_scope = "資料夾目錄樹"
+                            source_label = "目前複製來源：整個資料夾目錄"
+                        else:
+                            node_type = "專案根資料夾"
+                            copy_scope = "整個專案樹"
+                            source_label = "目前複製來源：整個專案根目錄"
+                    else:
+                        normalized_path_key = payload_path_key.rstrip("/") if payload_is_dir else payload_path_key
+                        path_key = normalized_path_key
+                        node_type = "資料夾" if payload_is_dir else "檔案"
+                        copy_scope = f"此節點子樹：{path_key}"
+                        source_label = f"目前複製來源：{path_key}"
+
+                    if node_publish_state == "failed":
+                        status_label = "失敗"
+                        status_desc = "批次處理失敗，請查看詳情提要"
+                    elif node_dirty:
+                        status_label = "未同步"
+                        status_desc = "已修改，尚未同步"
+                    elif not current_text.strip() or current_text.strip() == "# TODO: Add comment here":
+                        status_label = "缺註解"
+                        status_desc = "目前沒有註解"
+                    elif node_sync_state == "synced" and node_publish_state == "ok":
+                        status_label = "已完成"
+                        status_desc = "已同步並發布"
+                    elif node_sync_state == "synced":
+                        status_label = "未發布"
+                        status_desc = "已同步，尚未發布"
+                    else:
+                        status_label = "—"
+                        status_desc = "目前沒有未處理狀態"
+
+                    self.tree_meta_viewer.setHtml(
+                        self._render_tree_meta_html(
+                            name=node_name,
+                            node_type=node_type,
+                            path_key=path_key,
+                            indicator_type=indicator_type,
+                            status_label=status_label,
+                            status_desc=status_desc,
+                            source_label=source_label,
+                            copy_scope=copy_scope,
+                        )
+                    )
 
         self._refresh_tree_sync_button_state()
 
@@ -2417,16 +2596,27 @@ class DashboardWidget(QWidget):
 
         project_uuid = self._current_tree_project_uuid if not self._is_preview_tree_mode else ""
 
-        display_name = name if comment_exists else f"⚠ {name}"
-
         cache_key = self._make_node_state_cache_key(project_uuid, path_key)
-        if cache_key is not None:
-            cached_entry = self._node_state_cache.get(cache_key, {})
-            if bool(cached_entry.get("dirty", False)):
-                display_name = f"{display_name} *"
+        cached_entry = self._node_state_cache.get(cache_key, {}) if cache_key is not None else {}
 
-        item = QTreeWidgetItem([display_name])
+        node_dirty = bool(cached_entry.get("dirty", False))
+        node_sync_state = str(cached_entry.get("sync_state", "idle"))
+        node_publish_state = str(cached_entry.get("publish_state", "idle"))
+
+        indicator_type = self._resolve_indicator_type(
+            node_dirty=node_dirty,
+            node_comment_exists=comment_exists,
+            node_sync_state=node_sync_state,
+            node_publish_state=node_publish_state,
+        )
+
+        item = QTreeWidgetItem([name])
+
+        icon_path = self._status_icon_path(indicator_type)
+        if icon_path:
+            item.setIcon(0, QIcon(icon_path))
         item.setData(0, Qt.ItemDataRole.UserRole, {
+            "name": name,
             "comment": comment_text,
             "comment_exists": comment_exists,
             "path_key": path_key,
@@ -2489,7 +2679,11 @@ class DashboardWidget(QWidget):
             self._load_tree_comment_into_editor("")
             return
 
-        name = current.text(0)
+        tree_node = payload.get("tree_node")
+        if isinstance(tree_node, dict):
+            name = str(tree_node.get("name", "") or "")
+        else:
+            name = str(payload.get("name", "") or "")
         raw_comment = payload.get("comment", "")
         comment_text = "" if raw_comment is None else str(raw_comment)
         raw_path_key = str(payload.get("path_key", "") or "").strip()
@@ -2520,23 +2714,58 @@ class DashboardWidget(QWidget):
         self._current_tree_original_comment = comment_text
         self._current_tree_dirty = False
 
+        if hasattr(self, "tree_edit_status_label"):
+            self.tree_edit_status_label.setText("準備編輯註釋…")
+
         # T-02-05：優先載入 NodeStateCache 的 draft_comment
         cache_key = (current_project_uuid, path_key)
-        cached = self._node_state_cache.get(cache_key)
+        cached_entry = self._node_state_cache.get(cache_key, {})
 
-        if cached and "draft_comment" in cached:
-            editor_comment = cached["draft_comment"]
+        if "draft_comment" in cached_entry:
+            editor_comment = str(cached_entry["draft_comment"])
         else:
             editor_comment = comment_text
 
-        detail_lines = [
-            f"名稱：{name}",
-            f"類型：{node_type}",
-            f"路徑鍵：{path_key}",
-            source_label,
-            f"按下「複製目錄樹」時：會複製 {copy_scope}",
-        ]
-        self.tree_meta_viewer.setPlainText("\n".join(detail_lines))
+        effective_comment = str(editor_comment or "").strip()
+
+        indicator_type = self._resolve_indicator_type(
+            node_dirty=bool(cached_entry.get("dirty", False)),
+            node_comment_exists=bool(effective_comment and effective_comment != "# TODO: Add comment here"),
+            node_sync_state=str(cached_entry.get("sync_state", "idle")),
+            node_publish_state=str(cached_entry.get("publish_state", "idle")),
+        )
+
+        if indicator_type == "failed":
+            status_label = "失敗"
+            status_desc = "批次處理失敗，請查看詳情提要"
+        elif indicator_type == "pending_sync":
+            status_label = "未同步"
+            status_desc = "已修改，尚未同步"
+        elif indicator_type == "missing":
+            status_label = "缺註解"
+            status_desc = "目前沒有註解"
+        elif indicator_type == "done":
+            status_label = "已完成"
+            status_desc = "已同步並發布"
+        elif indicator_type == "pending_publish":
+            status_label = "未發布"
+            status_desc = "已同步，尚未發布"
+        else:
+            status_label = "—"
+            status_desc = "目前沒有未處理狀態"
+
+        self.tree_meta_viewer.setHtml(
+            self._render_tree_meta_html(
+                name=name,
+                node_type=node_type,
+                path_key=path_key,
+                indicator_type=indicator_type,
+                status_label=status_label,
+                status_desc=status_desc,
+                source_label=source_label,
+                copy_scope=copy_scope,
+            )
+        )
         self._load_tree_comment_into_editor(editor_comment)
         self._refresh_tree_sync_button_state()
 
@@ -2851,6 +3080,7 @@ class DashboardWidget(QWidget):
 
                 self._refresh_tree_sync_button_state()
                 self._set_status_message(f"註解同步失敗：{e}", level="error")
+
             finally:
                 if hasattr(self, 'btn_sync_write'):
                     self._refresh_tree_sync_button_state()
@@ -2872,6 +3102,35 @@ class DashboardWidget(QWidget):
             published_count = int(result.get("published_count", 0))
             failed_count = int(result.get("failed_count", 0))
 
+            next_publish_state = "ok" if failed_count == 0 else "failed"
+
+            for (cache_project_uuid, cache_path_key), entry in list(self._node_state_cache.items()):
+                if cache_project_uuid != project_uuid:
+                    continue
+                if str(entry.get("sync_state", "idle")) != "synced":
+                    continue
+
+                updated_entry = dict(entry)
+                updated_entry["publish_state"] = next_publish_state
+                self._node_state_cache[(cache_project_uuid, cache_path_key)] = updated_entry
+
+            tree_payload = adapter.get_project_tree(project_uuid)
+            tree_only = tree_payload.get("tree", {})
+
+            self.tree_viewer.clear()
+            if isinstance(tree_only, dict) and tree_only:
+                self._current_tree_payload = tree_only
+                self._populate_tree_widget(tree_only)
+                self.tree_viewer.expandToDepth(1)
+
+                target_item = self._find_tree_item_by_path_key(selected_path_key)
+                if target_item is None and self.tree_viewer.topLevelItemCount() > 0:
+                    target_item = self.tree_viewer.topLevelItem(0)
+
+                if target_item is not None:
+                    self.tree_viewer.setCurrentItem(target_item)
+                    self._on_tree_item_changed(target_item)
+
             if failed_count == 0:
                 self._set_status_message(f"✓ 已完成發布：{published_count} 個後續寫入檔。", level="success")
             else:
@@ -2881,7 +3140,35 @@ class DashboardWidget(QWidget):
                 )
 
         except Exception as e:
+            for (cache_project_uuid, cache_path_key), entry in list(self._node_state_cache.items()):
+                if cache_project_uuid != project_uuid:
+                    continue
+                if str(entry.get("sync_state", "idle")) != "synced":
+                    continue
+
+                updated_entry = dict(entry)
+                updated_entry["publish_state"] = "failed"
+                self._node_state_cache[(cache_project_uuid, cache_path_key)] = updated_entry
+
+            tree_payload = adapter.get_project_tree(project_uuid)
+            tree_only = tree_payload.get("tree", {})
+
+            self.tree_viewer.clear()
+            if isinstance(tree_only, dict) and tree_only:
+                self._current_tree_payload = tree_only
+                self._populate_tree_widget(tree_only)
+                self.tree_viewer.expandToDepth(1)
+
+                target_item = self._find_tree_item_by_path_key(selected_path_key)
+                if target_item is None and self.tree_viewer.topLevelItemCount() > 0:
+                    target_item = self.tree_viewer.topLevelItem(0)
+
+                if target_item is not None:
+                    self.tree_viewer.setCurrentItem(target_item)
+                    self._on_tree_item_changed(target_item)
+
             self._set_status_message(f"註解發布失敗：{e}", level="error")
+
         finally:
             if hasattr(self, 'btn_sync_write'):
                 self._refresh_tree_sync_button_state()
@@ -3167,9 +3454,11 @@ class SentryTrayAppV2:
         self.tray_icon.setToolTip(msg)
     def __init__(self, app: QApplication):
         self.app = app
+        self.app_icon = self._load_icon()
+        self.app.setWindowIcon(self.app_icon)
         
         # --- 1. 建立托盤圖示 ---
-        self.tray_icon = QSystemTrayIcon(self._load_icon(), self.app)
+        self.tray_icon = QSystemTrayIcon(self.app_icon, self.app)
         
         # 建立右鍵選單
         menu = QMenu()
@@ -3194,6 +3483,7 @@ class SentryTrayAppV2:
         # 我們建立（create）一個堆疊容器，它可以像紙牌一樣切換頁面。
         self.container = CurrentPageStackedWidget()
         self.container.setWindowTitle("Sentry v2.0 Sandbox")
+        self.container.setWindowIcon(self.app_icon)
         self.container.resize(900, 600)
         # [UI-Only Phase] 記錄 Dashboard 最近一次尺寸，避免切回後丟失使用者調整結果
         self.dashboard_size = QSize(900, 700)
@@ -3360,20 +3650,27 @@ class SentryTrayAppV2:
             self.toggle_window()
 
     def _load_icon(self) -> QIcon:
-        """從 assets/icons/tray_icon.png 載入圖示"""
-        # 我們計算（calculate）專案根目錄位置 (往上找兩層：src -> root)
+        """優先從 assets/icons/tray_icon.ico 載入圖示；找不到時退回 tray_icon.png。"""
         root = Path(__file__).resolve().parents[2]
-        icon_path = root / "assets" / "icons" / "tray_icon.png"
+        icon_dir = root / "assets" / "icons"
 
-        # 我們用「if」檢查檔案是否存在
-        if icon_path.is_file():
-            return QIcon(str(icon_path))
+        ico_path = icon_dir / "tray_icon.ico"
+        png_path = icon_dir / "tray_icon.png"
+
+        if ico_path.is_file():
+            return QIcon(str(ico_path))
+
+        if png_path.is_file():
+            return QIcon(str(png_path))
         
-        # 如果找不到，回傳系統預設圖示當作備案
         return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
 
 # --- 程式進入點 ---
 def main():
+    # Windows：先設定 AppUserModelID，讓工作列圖示不要沿用 python.exe 預設圖示
+    if sys.platform.startswith("win"):
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("laplace.sentry.tray")
+
     app = QApplication(sys.argv)
     # 這是為了確保關閉視窗時不會直接殺死程式 (因為有 Tray)。
     app.setQuitOnLastWindowClosed(False)
