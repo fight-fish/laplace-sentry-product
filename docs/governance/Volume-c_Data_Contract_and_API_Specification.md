@@ -54,6 +54,10 @@
   "path_key": "string",
   "is_dir": "boolean",
   "comment": "string|null",
+  "comment_exists": "boolean",
+  "has_children": "boolean",
+  "children_loaded": "boolean",
+  "depth_limited": "boolean",
   "children": "TreeNode[]"
 }
 ```
@@ -66,6 +70,10 @@
 | path_key | string      | ✔  | 相對專案根目錄的唯一識別路徑 |
 | is_dir   | boolean     | ✔  | 是否為資料夾         |
 | comment  | string/null | ✘  | 使用者自訂註解        |
+| comment_exists | boolean | ✔ | 是否存在非 TODO 的正式註解 |
+| has_children | boolean | ✔ | 資料夾在現行 ignore 規則後是否仍有子項 |
+| children_loaded | boolean | ✔ | 本次 response 是否已載入該節點 children |
+| depth_limited | boolean | ✔ | 是否因 depth 限制而尚有 children 未載入 |
 | children | array       | ✔  | 子節點清單          |
 
 ### ■ 不變量（Invariants）
@@ -74,9 +82,35 @@
 2. 資料夾節點必須允許 children
 3. 檔案節點 children 必為空陣列
 4. 結構不得形成循環參照
+5. `children=[]` 不自動等於空資料夾；必須同時查看 `has_children / children_loaded`
+6. `depth_limited=true` 時，`has_children` 必須為 true 且 `children_loaded` 必須為 false
+
+## 2.1.1 Bounded Tree Query Contract 限深與子節點查詢契約
+
+### ■ 相容查詢
+
+```bash
+python main.py get_project_tree <uuid>
+python main.py get_project_tree <uuid> --max-depth <n>
+```
+
+- 未傳 `--max-depth` 時保持舊有完整樹查詢語義。
+- `max_depth=0` 只回查詢根節點；`max_depth=1` 包含第一層。
+- bounded response 額外回傳 `max_depth` 與 response-level `depth_limited`。
+
+### ■ Children 查詢
+
+```bash
+python main.py get_tree_children <uuid> <project-relative-path-key> [depth]
+```
+
+- `path_key` 必須相對於專案根目錄，不得含 `..`、absolute path、drive / URI 前綴。
+- daemon 必須在 realpath 後再做 project containment check，拒絕 symlink escape。
+- children response 中的所有 `path_key` 仍以專案根目錄為基準，不得將子資料夾重設為新 root。
+- 註解來源仍是專案第一個 target markdown，children query 不建立新註解儲存層。
 
 
-## 2.1.1 TreeNode Comment Persistence Rule 樹節點註解持久化規則
+## 2.1.2 TreeNode Comment Persistence Rule 樹節點註解持久化規則
 
 ### ■ 用途
 

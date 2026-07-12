@@ -605,17 +605,45 @@ class BackendAdapter:
             return [str(x) for x in result]
         return []
 
-    def get_project_tree(self, uuid: str) -> Dict[str, Any]:
-        """呼叫 WSL 獲取指定專案的結構化目錄樹資料。"""
+    def get_project_tree(self, uuid: str, max_depth: int | None = None) -> Dict[str, Any]:
+        """呼叫 WSL 獲取結構化目錄樹；未傳 depth 時保持舊契約。"""
         if not uuid:
             raise BackendError("讀取目錄樹失敗：UUID 為空。")
 
-        result = self._run_wsl_command("get_project_tree", uuid)
+        if max_depth is None:
+            result = self._run_wsl_command("get_project_tree", uuid)
+        else:
+            if max_depth < 0:
+                raise BackendError("讀取目錄樹失敗：max_depth 必須是 0 以上整數。")
+            result = self._run_wsl_command(
+                "get_project_tree",
+                uuid,
+                "--max-depth",
+                str(max_depth),
+            )
 
         if isinstance(result, dict):
             return result
 
         raise BackendError("讀取目錄樹失敗：後端未回傳合法 JSON 物件。")
+
+    def get_tree_children(self, uuid: str, path_key: str, depth: int = 1) -> Dict[str, Any]:
+        """呼叫 WSL 讀取指定 project-relative path_key 的 bounded children。"""
+        if not uuid:
+            raise BackendError("讀取子節點失敗：UUID 為空。")
+        if depth < 0:
+            raise BackendError("讀取子節點失敗：depth 必須是 0 以上整數。")
+
+        result = self._run_wsl_command(
+            "get_tree_children",
+            uuid,
+            str(path_key or ""),
+            str(depth),
+        )
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("讀取子節點失敗：後端未回傳合法 JSON 物件。")
 
     def preview_tree_from_path(self, path: str) -> Dict[str, Any]:
         """呼叫 WSL 取得臨時資料夾的結構化預覽樹資料。"""
@@ -851,9 +879,13 @@ def get_log_content(uuid: str) -> List[str]:
     adapter = _ensure_adapter()
     return adapter.get_log_content(uuid)
 
-def get_project_tree(uuid: str) -> Dict[str, Any]:
+def get_project_tree(uuid: str, max_depth: int | None = None) -> Dict[str, Any]:
     adapter = _ensure_adapter()
-    return adapter.get_project_tree(uuid)
+    return adapter.get_project_tree(uuid, max_depth=max_depth)
+
+def get_tree_children(uuid: str, path_key: str, depth: int = 1) -> Dict[str, Any]:
+    adapter = _ensure_adapter()
+    return adapter.get_tree_children(uuid, path_key, depth=depth)
 
 def preview_tree_from_path(path: str) -> Dict[str, Any]:
     adapter = _ensure_adapter()
