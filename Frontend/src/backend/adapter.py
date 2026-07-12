@@ -55,6 +55,7 @@ WSL_PYTHON = f"{WSL_PROJECT_ROOT}/.venv/bin/python"
 
 # 3. 最後定義主腳本路徑
 WSL_MAIN_SCRIPT = "src.core.daemon"
+WSL_COMMAND_TIMEOUT_SECONDS = 30
 
 # 這裡，我們用「@dataclass」標記（mark）這是一個資料類別（只有數據）。
 @dataclass
@@ -198,6 +199,7 @@ class BackendAdapter:
                 encoding="utf-8",
                 creationflags=0x08000000,
                 check=True,
+                timeout=WSL_COMMAND_TIMEOUT_SECONDS,
             )
 
             output = result.stdout.strip()
@@ -228,6 +230,11 @@ class BackendAdapter:
 
             raise BackendError(f"資料解析失敗 (非 JSON 且無法識別為 OK): {output}")
 
+        except subprocess.TimeoutExpired as e:
+            elapsed = e.timeout if e.timeout is not None else WSL_COMMAND_TIMEOUT_SECONDS
+            raise BackendError(
+                f"WSL 執行逾時：命令 {cmd} 超過 {elapsed:.0f} 秒未回應，請稍後重試或檢查 WSL 後端狀態。"
+            )
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr.strip() or "未知錯誤"
             raise BackendError(f"WSL 執行失敗: {error_msg}")

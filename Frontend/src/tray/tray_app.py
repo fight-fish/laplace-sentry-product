@@ -5,7 +5,8 @@
 # --- 1. 系統與基礎工具 ---
 import sys
 import json
-from typing import List, Dict, Any
+import os
+from typing import List, Dict, Any, Callable
 import math
 import ctypes
 from pathlib import Path
@@ -18,6 +19,9 @@ from PySide6.QtCore import (
     QTimer,            # (心跳計時器)
     QPropertyAnimation,# (動畫工具，預留給之後用)
     QEasingCurve,
+    QObject,
+    QThread,
+    QLockFile,
     Signal,
     QSettings,
     QEvent,
@@ -1357,6 +1361,47 @@ class LogViewerWidget(QTextEdit):
 
         # 預設：原樣顯示
         return f'<font color="#AAAAAA">{raw_line}</font>'
+
+
+class ProjectQueryWorker(QObject):
+    """背景查詢 worker：只承接純查詢，不處理 start/stop 或寫入流程。"""
+
+    finished = Signal(str, str, int, object)
+    failed = Signal(str, str, int, str)
+
+    def __init__(
+        self,
+        query_kind: str,
+        project_uuid: str,
+        request_id: int,
+        query_func: Callable[[str], object],
+    ) -> None:
+        super().__init__()
+        self.query_kind = query_kind
+        self.project_uuid = project_uuid
+        self.request_id = request_id
+        self.query_func = query_func
+
+    def run(self) -> None:
+        try:
+            result = self.query_func(self.project_uuid)
+        except Exception as e:
+            self.failed.emit(
+                self.query_kind,
+                self.project_uuid,
+                self.request_id,
+                str(e),
+            )
+            return
+
+        self.finished.emit(
+            self.query_kind,
+            self.project_uuid,
+            self.request_id,
+            result,
+        )
+
+
 class DashboardWidget(QWidget):
     """
     Sentry 控制台主視窗
@@ -1417,6 +1462,11 @@ class DashboardWidget(QWidget):
 
         self._is_loading_tree_comment: bool = False
         self._is_preview_tree_mode: bool = False
+        self._query_request_seq: int = 0
+        self._latest_log_request_id: int = 0
+        self._latest_tree_request_id: int = 0
+        self._active_query_threads: list[QThread] = []
+        self._active_query_workers: list[ProjectQueryWorker] = []
 
         # 呼叫各類函式來 建立介面 和 載入初始資料。        
         self._build_ui()
@@ -2015,12 +2065,7 @@ class DashboardWidget(QWidget):
         # 獲取 UUID
         proj = self.current_projects[row]
         
-        # 呼叫 Adapter 獲取最新日誌
-        logs = adapter.get_log_content(proj.uuid)
-        
-        # 更新顯示 (LogViewerWidget 會自動處理捲動)
-        if hasattr(self, 'log_viewer'):
-            self.log_viewer.set_logs(logs)
+        self._start_project_query("log", proj.uuid, adapter.get_log_content)
 
     def _open_audit_dialog(self) -> None:
         """[Task 9.4] 審查靜默項目 (Audit)"""
@@ -2153,6 +2198,139 @@ class DashboardWidget(QWidget):
 
         self.status_message_label.setText(text)
         self.status_message_label.setStyleSheet(f"color: {color};")
+
+    def _current_selected_project_uuid(self) -> str:
+        """回傳目前表格選取專案 UUID；沒有有效選取時回傳空字串。"""
+        row = self.project_table.currentRow()
+        if row < 0 or row >= len(self.current_projects):
+            return ""
+
+        return str(self.current_projects[row].uuid or "").strip()
+
+    def _next_project_query_request_id(self, query_kind: str) -> int:
+        self._query_request_seq += 1
+        request_id = self._query_request_seq
+
+        if query_kind == "log":
+            self._latest_log_request_id = request_id
+        elif query_kind == "tree":
+            self._latest_tree_request_id = request_id
+
+        return request_id
+
+    def _start_project_query(
+        self,
+        query_kind: str,
+        project_uuid: str,
+        query_func: Callable[[str], object],
+    ) -> None:
+        """啟動純查詢 worker；結果套用前仍會再檢查目前選取專案。"""
+        normalized_uuid = str(project_uuid or "").strip()
+        if not normalized_uuid:
+            return
+
+        request_id = self._next_project_query_request_id(query_kind)
+        worker = ProjectQueryWorker(query_kind, normalized_uuid, request_id, query_func)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self._active_query_threads.append(thread)
+        self._active_query_workers.append(worker)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_project_query_finished)
+        worker.failed.connect(self._on_project_query_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda t=thread, w=worker: self._cleanup_project_query(t, w))
+
+        thread.start()
+
+    def _cleanup_project_query(self, thread: QThread, worker: ProjectQueryWorker) -> None:
+        if thread in self._active_query_threads:
+            self._active_query_threads.remove(thread)
+        if worker in self._active_query_workers:
+            self._active_query_workers.remove(worker)
+
+        thread.deleteLater()
+
+    def _is_current_project_query(self, query_kind: str, project_uuid: str, request_id: int) -> bool:
+        current_uuid = self._current_selected_project_uuid()
+        if current_uuid != project_uuid:
+            return False
+
+        if query_kind == "log":
+            return request_id == self._latest_log_request_id
+
+        if query_kind == "tree":
+            return (
+                request_id == self._latest_tree_request_id
+                and not getattr(self, "_is_preview_tree_mode", False)
+            )
+
+        return False
+
+    def _on_project_query_finished(
+        self,
+        query_kind: str,
+        project_uuid: str,
+        request_id: int,
+        result: object,
+    ) -> None:
+        if not self._is_current_project_query(query_kind, project_uuid, request_id):
+            return
+
+        if query_kind == "log":
+            logs = result if isinstance(result, list) else []
+            self.log_viewer.set_logs([str(line) for line in logs])
+            return
+
+        if query_kind == "tree":
+            if not isinstance(result, dict):
+                self._show_tree_placeholder()
+                self._set_status_message("讀取目錄樹失敗：後端未回傳合法資料。", level="error")
+                return
+
+            self._apply_project_tree_payload(project_uuid, result)
+
+    def _on_project_query_failed(
+        self,
+        query_kind: str,
+        project_uuid: str,
+        request_id: int,
+        error_message: str,
+    ) -> None:
+        if not self._is_current_project_query(query_kind, project_uuid, request_id):
+            return
+
+        if query_kind == "log":
+            if hasattr(self, "log_viewer"):
+                self.log_viewer.set_logs([f"[ERROR] 日誌讀取失敗：{error_message}"])
+        elif query_kind == "tree":
+            self._show_tree_placeholder()
+
+        self._set_status_message(error_message, level="error")
+
+    def _apply_project_tree_payload(self, project_uuid: str, tree_payload: dict[str, Any]) -> None:
+        """套用專案目錄樹查詢結果；呼叫前必須已完成 request guard。"""
+        tree_only = tree_payload.get("tree", {})
+
+        self.tree_viewer.clear()
+        if isinstance(tree_only, dict) and tree_only:
+            self._current_tree_payload = tree_only
+            self._current_tree_project_uuid = project_uuid
+            if hasattr(self, 'btn_copy_tree'):
+                self.btn_copy_tree.setEnabled(True)
+
+            self._populate_tree_widget(tree_only)
+            self.tree_viewer.expandToDepth(1)
+
+            first_item = self.tree_viewer.topLevelItem(0)
+            if first_item is not None:
+                self.tree_viewer.setCurrentItem(first_item)
+                self._on_tree_item_changed(first_item)
+        else:
+            self._show_tree_placeholder()
 
     def _status_icon_dir(self) -> Path:
         """狀態 icon 目錄。"""
@@ -2661,6 +2839,32 @@ class DashboardWidget(QWidget):
         if hasattr(self, 'btn_copy_tree'):
             self.btn_copy_tree.setEnabled(False)
 
+    def _show_tree_loading_placeholder(self, project_name: str) -> None:
+        """顯示目錄樹背景載入狀態，避免舊樹停在畫面上誤導使用者。"""
+        self.tree_viewer.clear()
+        self._current_tree_payload = None
+        self._reset_tree_edit_context()
+
+        label = f"正在載入目錄樹：{project_name}"
+        loading_item = QTreeWidgetItem([label])
+        loading_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "comment": "目錄樹正在背景載入，請稍候。",
+            "path_key": "",
+            "is_dir": True,
+            "tree_node": None,
+        })
+        self.tree_viewer.addTopLevelItem(loading_item)
+        self.tree_viewer.expandAll()
+
+        if hasattr(self, 'tree_meta_viewer'):
+            self.tree_meta_viewer.setPlainText("節點資訊區：\n目錄樹正在背景載入，請稍候。")
+
+        if hasattr(self, 'tree_comment_editor'):
+            self._load_tree_comment_into_editor("目錄樹正在背景載入，請稍候。")
+
+        if hasattr(self, 'btn_copy_tree'):
+            self.btn_copy_tree.setEnabled(False)
+
     def _on_tree_item_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None = None) -> None:
         """當使用者點選樹節點時，更新右側節點資訊與註解編輯區。"""
         if not hasattr(self, 'tree_meta_viewer') or not hasattr(self, 'tree_comment_editor'):
@@ -2803,29 +3007,13 @@ class DashboardWidget(QWidget):
             self.btn_sync_write.setEnabled(True)
 
         # [New] 讀取並顯示日誌
-        logs = adapter.get_log_content(proj.uuid)
-        self.log_viewer.set_logs(logs)
+        if hasattr(self, 'log_viewer'):
+            self.log_viewer.set_logs([])
+        self._start_project_query("log", proj.uuid, adapter.get_log_content)
 
         # [R-02-02] 讀取並顯示結構化目錄樹
-        tree_payload = adapter.get_project_tree(proj.uuid)
-        tree_only = tree_payload.get("tree", {})
-
-        self.tree_viewer.clear()
-        if isinstance(tree_only, dict) and tree_only:
-            self._current_tree_payload = tree_only
-            self._current_tree_project_uuid = proj.uuid
-            if hasattr(self, 'btn_copy_tree'):
-                self.btn_copy_tree.setEnabled(True)
-
-            self._populate_tree_widget(tree_only)
-            self.tree_viewer.expandToDepth(1)
-
-            first_item = self.tree_viewer.topLevelItem(0)
-            if first_item is not None:
-                self.tree_viewer.setCurrentItem(first_item)
-                self._on_tree_item_changed(first_item)
-        else:
-            self._show_tree_placeholder()
+        self._show_tree_loading_placeholder(proj.name)
+        self._start_project_query("tree", proj.uuid, adapter.get_project_tree)
     
     # 這裡，我們用「def」來定義（define）當專案列表被雙擊時（double_clicked）執行的函式。
     def _on_project_double_clicked(self) -> None:
@@ -3665,11 +3853,38 @@ class SentryTrayAppV2:
         
         return self.app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
 
+
+def _resolve_single_instance_lock_path() -> Path:
+    """單例鎖路徑：放在使用者 runtime 區，不寫入 repo 工作樹。"""
+    if sys.platform.startswith("win"):
+        base_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LaplaceSentry"
+    else:
+        base_dir = Path.home() / ".laplace_sentry"
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir / "laplace_sentry_tray.lock"
+
+
+def _acquire_single_instance_lock() -> QLockFile | None:
+    """第一版單例策略：若已有前端執行中，第二個 process 安全退出。"""
+    lock_file = QLockFile(str(_resolve_single_instance_lock_path()))
+    lock_file.setStaleLockTime(30000)
+
+    if lock_file.tryLock(0):
+        return lock_file
+
+    print("Laplace Sentry UI is already running; second instance exits safely.")
+    return None
+
 # --- 程式進入點 ---
 def main():
     # Windows：先設定 AppUserModelID，讓工作列圖示不要沿用 python.exe 預設圖示
     if sys.platform.startswith("win"):
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("laplace.sentry.tray")
+
+    single_instance_lock = _acquire_single_instance_lock()
+    if single_instance_lock is None:
+        return
 
     app = QApplication(sys.argv)
     # 這是為了確保關閉視窗時不會直接殺死程式 (因為有 Tray)。
