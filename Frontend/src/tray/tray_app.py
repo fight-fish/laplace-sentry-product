@@ -24,7 +24,6 @@ from PySide6.QtCore import (
     QLockFile,
     Signal,
     QSettings,
-    QEvent,
 )
 
 from PySide6.QtGui import (
@@ -1465,6 +1464,7 @@ class DashboardWidget(QWidget):
         self._query_request_seq: int = 0
         self._latest_log_request_id: int = 0
         self._latest_tree_request_id: int = 0
+        self._latest_children_request_ids: dict[tuple[str, str], int] = {}
         self._active_query_threads: list[QThread] = []
         self._active_query_workers: list[ProjectQueryWorker] = []
 
@@ -1608,6 +1608,7 @@ class DashboardWidget(QWidget):
             self._on_project_selection_changed
         )
         self.tree_viewer.currentItemChanged.connect(self._on_tree_item_changed)
+        self.tree_viewer.itemExpanded.connect(self._on_tree_item_expanded)
         self.tree_comment_editor.textChanged.connect(self._on_tree_comment_text_changed)
         # 當表格的項目被雙擊時（itemDoubleClicked），連結（connect）到處理函式。
         self.project_table.itemDoubleClicked.connect(
@@ -2207,7 +2208,14 @@ class DashboardWidget(QWidget):
 
         return str(self.current_projects[row].uuid or "").strip()
 
-    def _next_project_query_request_id(self, query_kind: str) -> int:
+    @staticmethod
+    def _children_query_path_key(query_kind: str) -> str | None:
+        prefix = "tree_children:"
+        if not query_kind.startswith(prefix):
+            return None
+        return query_kind[len(prefix):]
+
+    def _next_project_query_request_id(self, query_kind: str, project_uuid: str) -> int:
         self._query_request_seq += 1
         request_id = self._query_request_seq
 
@@ -2215,6 +2223,10 @@ class DashboardWidget(QWidget):
             self._latest_log_request_id = request_id
         elif query_kind == "tree":
             self._latest_tree_request_id = request_id
+        else:
+            path_key = self._children_query_path_key(query_kind)
+            if path_key is not None:
+                self._latest_children_request_ids[(project_uuid, path_key)] = request_id
 
         return request_id
 
@@ -2229,7 +2241,7 @@ class DashboardWidget(QWidget):
         if not normalized_uuid:
             return
 
-        request_id = self._next_project_query_request_id(query_kind)
+        request_id = self._next_project_query_request_id(query_kind, normalized_uuid)
         worker = ProjectQueryWorker(query_kind, normalized_uuid, request_id, query_func)
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -2268,6 +2280,23 @@ class DashboardWidget(QWidget):
                 and not getattr(self, "_is_preview_tree_mode", False)
             )
 
+        path_key = self._children_query_path_key(query_kind)
+        if path_key is not None:
+            if getattr(self, "_is_preview_tree_mode", False):
+                return False
+            if request_id != self._latest_children_request_ids.get((project_uuid, path_key)):
+                return False
+
+            item = self._find_tree_item_by_path_key(path_key)
+            if item is None:
+                return False
+            payload = item.data(0, Qt.ItemDataRole.UserRole)
+            return (
+                isinstance(payload, dict)
+                and str(payload.get("project_uuid", "") or "").strip() == project_uuid
+                and str(payload.get("path_key", "") or "") == path_key
+            )
+
         return False
 
     def _on_project_query_finished(
@@ -2292,6 +2321,11 @@ class DashboardWidget(QWidget):
                 return
 
             self._apply_project_tree_payload(project_uuid, result)
+            return
+
+        path_key = self._children_query_path_key(query_kind)
+        if path_key is not None:
+            self._apply_tree_children_payload(project_uuid, path_key, request_id, result)
 
     def _on_project_query_failed(
         self,
@@ -2309,6 +2343,120 @@ class DashboardWidget(QWidget):
         elif query_kind == "tree":
             self._show_tree_placeholder()
 
+        path_key = self._children_query_path_key(query_kind)
+        if path_key is not None:
+            self._show_tree_children_failure(project_uuid, path_key, request_id, error_message)
+            return
+
+        self._set_status_message(error_message, level="error")
+
+    def _apply_tree_children_payload(
+        self,
+        project_uuid: str,
+        path_key: str,
+        request_id: int,
+        result: object,
+    ) -> None:
+        """合併背景 children 查詢；呼叫前已通過 project/path/token guard。"""
+        if not isinstance(result, dict):
+            self._show_tree_children_failure(
+                project_uuid,
+                path_key,
+                request_id,
+                "讀取子節點失敗：後端未回傳合法資料。",
+            )
+            return
+
+        response_uuid = str(result.get("uuid", "") or "").strip()
+        if response_uuid != project_uuid:
+            self._show_tree_children_failure(
+                project_uuid,
+                path_key,
+                request_id,
+                "讀取子節點失敗：回傳專案與目前選取專案不一致。",
+            )
+            return
+
+        response_path_key = str(result.get("parent_path_key", "") or "")
+        if response_path_key != path_key:
+            self._show_tree_children_failure(
+                project_uuid,
+                path_key,
+                request_id,
+                "讀取子節點失敗：回傳路徑與目前節點不一致。",
+            )
+            return
+
+        item = self._find_tree_item_by_path_key(path_key)
+        if item is None:
+            return
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+
+        children = result.get("children", [])
+        if not isinstance(children, list):
+            self._show_tree_children_failure(
+                project_uuid,
+                path_key,
+                request_id,
+                "讀取子節點失敗：children 格式不正確。",
+            )
+            return
+
+        item.takeChildren()
+        for child in children:
+            if isinstance(child, dict):
+                self._populate_tree_widget(child, item)
+
+        parent_metadata = result.get("parent", {})
+        tree_node = payload.get("tree_node")
+        if isinstance(tree_node, dict):
+            tree_node["children"] = children
+            tree_node["children_loaded"] = True
+            tree_node["has_children"] = bool(children)
+            if isinstance(parent_metadata, dict):
+                tree_node["depth_limited"] = bool(parent_metadata.get("depth_limited", False))
+
+        payload["children_loaded"] = True
+        payload["has_children"] = bool(children)
+        payload["children_loading"] = False
+        item.setData(0, Qt.ItemDataRole.UserRole, payload)
+        self._latest_children_request_ids.pop((project_uuid, path_key), None)
+        self._set_status_message(f"✓ 已載入子節點：{path_key or '(root)'}", level="success")
+
+    def _show_tree_children_failure(
+        self,
+        project_uuid: str,
+        path_key: str,
+        request_id: int,
+        error_message: str,
+    ) -> None:
+        """顯示可重試的 children 失敗狀態，不把失敗偽裝成空資料夾。"""
+        if not self._is_current_project_query(
+            f"tree_children:{path_key}",
+            project_uuid,
+            request_id,
+        ):
+            return
+
+        item = self._find_tree_item_by_path_key(path_key)
+        if item is None:
+            return
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+
+        payload["children_loading"] = False
+        item.setData(0, Qt.ItemDataRole.UserRole, payload)
+        item.takeChildren()
+        failure_item = QTreeWidgetItem(["載入失敗；收合後可重試"])
+        failure_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "is_tree_children_placeholder": True,
+            "load_state": "failed",
+        })
+        item.addChild(failure_item)
+        self._latest_children_request_ids.pop((project_uuid, path_key), None)
         self._set_status_message(error_message, level="error")
 
     def _apply_project_tree_payload(self, project_uuid: str, tree_payload: dict[str, Any]) -> None:
@@ -2323,7 +2471,9 @@ class DashboardWidget(QWidget):
                 self.btn_copy_tree.setEnabled(True)
 
             self._populate_tree_widget(tree_only)
-            self.tree_viewer.expandToDepth(1)
+            # 只展開專案根節點；若自動展開 depth=1，會立刻觸發所有第一層
+            # 資料夾的 itemExpanded，失去 lazy loading 的意義。
+            self.tree_viewer.expandToDepth(0)
 
             first_item = self.tree_viewer.topLevelItem(0)
             if first_item is not None:
@@ -2771,6 +2921,9 @@ class DashboardWidget(QWidget):
         comment_exists = bool(node.get("comment_exists", False))
         path_key = str(node.get("path_key", ""))
         is_dir = bool(node.get("is_dir", False))
+        has_children = bool(node.get("has_children", False))
+        children_loaded = bool(node.get("children_loaded", True))
+        depth_limited = bool(node.get("depth_limited", False))
 
         project_uuid = self._current_tree_project_uuid if not self._is_preview_tree_mode else ""
 
@@ -2799,6 +2952,10 @@ class DashboardWidget(QWidget):
             "comment_exists": comment_exists,
             "path_key": path_key,
             "is_dir": is_dir,
+            "has_children": has_children,
+            "children_loaded": children_loaded,
+            "children_loading": False,
+            "depth_limited": depth_limited,
             "tree_node": node,
             "project_uuid": project_uuid,
         })
@@ -2813,6 +2970,51 @@ class DashboardWidget(QWidget):
             for child in children:
                 if isinstance(child, dict):
                     self._populate_tree_widget(child, item)
+
+        if is_dir and has_children and not children_loaded and item.childCount() == 0:
+            placeholder_item = QTreeWidgetItem(["尚未載入；展開以讀取"])
+            placeholder_item.setData(0, Qt.ItemDataRole.UserRole, {
+                "is_tree_children_placeholder": True,
+                "load_state": "pending",
+            })
+            item.addChild(placeholder_item)
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """資料夾首次展開時，以背景 worker 查詢 bounded children。"""
+        if getattr(self, "_is_preview_tree_mode", False):
+            return
+
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict) or payload.get("is_tree_children_placeholder"):
+            return
+        if not bool(payload.get("is_dir", False)):
+            return
+        if not bool(payload.get("has_children", False)):
+            return
+        if bool(payload.get("children_loaded", True)) or bool(payload.get("children_loading", False)):
+            return
+
+        project_uuid = str(payload.get("project_uuid", "") or "").strip()
+        path_key = str(payload.get("path_key", "") or "")
+        if not project_uuid:
+            return
+
+        payload["children_loading"] = True
+        item.setData(0, Qt.ItemDataRole.UserRole, payload)
+        item.takeChildren()
+        loading_item = QTreeWidgetItem(["正在載入子節點…"])
+        loading_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "is_tree_children_placeholder": True,
+            "load_state": "loading",
+        })
+        item.addChild(loading_item)
+
+        query_kind = f"tree_children:{path_key}"
+        self._start_project_query(
+            query_kind,
+            project_uuid,
+            lambda uuid, key=path_key: adapter.get_tree_children(uuid, key, depth=1),
+        )
 
     def _show_tree_placeholder(self) -> None:
         """恢復目錄樹工作區的預設提示。"""
@@ -2994,6 +3196,7 @@ class DashboardWidget(QWidget):
             return
 
         self._enter_project_tree_mode()
+        self._latest_children_request_ids.clear()
 
         # 從「專案籃子」（self.current_projects）中，根據行號（row）取出選取的專案（proj）。
         proj = self.current_projects[row]
@@ -3013,7 +3216,11 @@ class DashboardWidget(QWidget):
 
         # [R-02-02] 讀取並顯示結構化目錄樹
         self._show_tree_loading_placeholder(proj.name)
-        self._start_project_query("tree", proj.uuid, adapter.get_project_tree)
+        self._start_project_query(
+            "tree",
+            proj.uuid,
+            lambda uuid: adapter.get_project_tree(uuid, max_depth=1),
+        )
     
     # 這裡，我們用「def」來定義（define）當專案列表被雙擊時（double_clicked）執行的函式。
     def _on_project_double_clicked(self) -> None:
