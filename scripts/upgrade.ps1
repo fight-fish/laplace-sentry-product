@@ -1,9 +1,17 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('DryRun', 'Stage')]
+    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated')]
     [string]$Mode = 'DryRun',
 
     [string]$StagingRoot,
+
+    [string]$IsolationRoot,
+
+    [ValidateSet('Apply', 'Rollback')]
+    [string]$IsolatedAction = 'Apply',
+
+    [ValidateSet('None', 'DirtySource', 'FrontendApply', 'BackendApply', 'Version', 'Smoke', 'Rollback')]
+    [string]$FailureInjection = 'None',
 
     [string]$FrontendTarget = (Join-Path $env:LOCALAPPDATA 'LaplaceSentry'),
 
@@ -17,19 +25,19 @@ param(
 Builds a safe Laplace Sentry upgrade plan or an isolated staging package.
 
 .DESCRIPTION
-Purpose: provide the policy-bearing implementation behind upgrade.bat.
-Inputs: repo sources, read-only target paths, mode, staging root, version override.
-Outputs: JSON plan on stdout; Stage also writes package, backup, and manifest under StagingRoot.
-SSOT Output: upgrade-plan.json in Stage mode; stdout JSON in DryRun mode.
-Exit codes: 0 success, 2 preflight/argument failure, 3 isolated staging failure.
-Idempotency: DryRun is read-only. Stage requires an empty/nonexistent StagingRoot.
-Side effects: Stage writes only beneath StagingRoot; formal targets are never written.
+Purpose: provide the policy-bearing implementation behind upgrade.bat and an internal fake-target transaction proof.
+Inputs: repo sources, target paths, mode, staging/isolation roots, isolated action, failure injection, version override.
+Outputs: JSON plan on stdout; Stage writes package/backup/manifest; ApplyIsolated writes a fake-target transaction journal.
+SSOT Output: stdout JSON in DryRun, upgrade-plan.json in Stage, transaction-journal.json in ApplyIsolated.
+Exit codes: 0 success, 2 preflight/argument failure, 3 isolated staging failure, 4 isolated apply/rollback failure.
+Idempotency: DryRun is read-only. Stage requires an empty/nonexistent StagingRoot. ApplyIsolated refuses an existing transaction and only permits explicit rollback.
+Side effects: Stage and ApplyIsolated write only inside their verified TEMP isolation boundary; formal targets and real processes are never touched.
 #>
 
-# 這支腳本在做什麼：建立安全升級計畫，並可在隔離 staging 產生升級包與備份演練。
-# 這支腳本不做什麼：本階段沒有 apply、process stop、正式 version 更新或正式 rollback 能力。
-# 常改區塊：allowlist、保留資料清單、smoke 計畫。
-# 不要亂動的區塊：正式目標唯讀、Backend/data 永不進 package、StageRoot 邊界檢查。
+# 這支腳本在做什麼：建立安全升級計畫、隔離 staging，並用 TEMP 假目標證明 apply／rollback transaction。
+# 這支腳本不做什麼：不提供正式 apply 入口，不啟停真實程序，不更新正式 runtime 或正式版本。
+# 常改區塊：allowlist、保留資料清單、隔離 transaction 與 smoke 證明。
+# 不要亂動的區塊：正式目標拒絕、Git blob 來源驗證、Backend/data 保護、journal 驅動 rollback。
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -38,6 +46,9 @@ $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptRoot
 $FrontendSource = Join-Path $RepoRoot 'Frontend'
 $BackendSource = Join-Path $RepoRoot 'Backend'
+$TempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
+$FormalFrontendTarget = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
+$FormalBackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
 
 $FrontendAllowlist = @(
     'assets',
@@ -89,6 +100,56 @@ function Test-PathInside {
         $candidatePath.StartsWith($containerPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-StrictPathInside {
+    param(
+        [Parameter(Mandatory = $true)][string]$Candidate,
+        [Parameter(Mandatory = $true)][string]$Container
+    )
+    $candidatePath = Get-NormalizedFullPath $Candidate
+    $containerPath = Get-NormalizedFullPath $Container
+    return -not $candidatePath.Equals($containerPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $candidatePath.StartsWith($containerPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-PathsOverlap {
+    param(
+        [Parameter(Mandatory = $true)][string]$First,
+        [Parameter(Mandatory = $true)][string]$Second
+    )
+    return (Test-PathInside -Candidate $First -Container $Second) -or
+        (Test-PathInside -Candidate $Second -Container $First)
+}
+
+function Get-FileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+}
+
+function Get-GitOutput {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    $priorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& git -C $RepoRoot @Arguments 2>$null)
+        $gitExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $priorPreference
+    }
+    if ($gitExitCode -ne 0) {
+        throw "[UPGRADE_GIT_FAIL] git $($Arguments -join ' ') failed."
+    }
+    return @($output)
+}
+
+function Get-HeadCommit {
+    return ((Get-GitOutput -Arguments @('rev-parse', 'HEAD') | Select-Object -First 1).Trim())
+}
+
+function Get-HeadShortCommit {
+    return ((Get-GitOutput -Arguments @('rev-parse', '--short', 'HEAD') | Select-Object -First 1).Trim())
+}
+
 function Resolve-BuildVersion {
     if ($BuildVersion) {
         return $BuildVersion
@@ -113,6 +174,43 @@ function Resolve-UpgradeInputs {
         StagingRoot = Get-NormalizedFullPath $resolvedStage
         FrontendTarget = $FrontendTarget
         BackendTarget = $BackendTarget
+        IsolationRoot = if ($IsolationRoot) { Get-NormalizedFullPath $IsolationRoot } else { $null }
+    }
+}
+
+function Assert-IsolatedBoundary {
+    param([Parameter(Mandatory = $true)]$Inputs)
+
+    if (-not $Inputs.IsolationRoot) {
+        throw '[UPGRADE_ISOLATED_PREFLIGHT_FAIL] IsolationRoot is required.'
+    }
+    if (-not (Test-StrictPathInside -Candidate $Inputs.IsolationRoot -Container $TempRoot)) {
+        throw '[UPGRADE_ISOLATED_PREFLIGHT_FAIL] IsolationRoot must be a strict child of the system TEMP root.'
+    }
+    foreach ($candidate in @($Inputs.StagingRoot, $Inputs.FrontendTarget, $Inputs.BackendTarget)) {
+        if (-not (Test-StrictPathInside -Candidate $candidate -Container $Inputs.IsolationRoot)) {
+            throw "[UPGRADE_ISOLATED_PREFLIGHT_FAIL] Every staging/target path must be a strict child of IsolationRoot: $candidate"
+        }
+        if (Test-PathInside -Candidate $candidate -Container $RepoRoot) {
+            throw "[UPGRADE_ISOLATED_PREFLIGHT_FAIL] Repository paths are forbidden targets: $candidate"
+        }
+        if ((Test-PathInside -Candidate $candidate -Container $FormalFrontendTarget) -or
+            (Test-PathInside -Candidate $candidate -Container $FormalBackendTarget)) {
+            throw "[UPGRADE_ISOLATED_PREFLIGHT_FAIL] Formal runtime paths are forbidden: $candidate"
+        }
+    }
+    if ($Inputs.BackendTarget -match '(?i)(^|[\\/])\.laplace_sentry_backend([\\/]|$)') {
+        throw '[UPGRADE_ISOLATED_PREFLIGHT_FAIL] A real backend runtime-shaped target is forbidden.'
+    }
+    $pathPairs = @(
+        [pscustomobject]@{ First = $Inputs.StagingRoot; Second = $Inputs.FrontendTarget; Label = 'StagingRoot and FrontendTarget' },
+        [pscustomobject]@{ First = $Inputs.StagingRoot; Second = $Inputs.BackendTarget; Label = 'StagingRoot and BackendTarget' },
+        [pscustomobject]@{ First = $Inputs.FrontendTarget; Second = $Inputs.BackendTarget; Label = 'FrontendTarget and BackendTarget' }
+    )
+    foreach ($pair in $pathPairs) {
+        if (Test-PathsOverlap -First $pair.First -Second $pair.Second) {
+            throw "[UPGRADE_ISOLATED_PREFLIGHT_FAIL] $($pair.Label) must be mutually exclusive trees."
+        }
     }
 }
 
@@ -123,6 +221,11 @@ function Assert-UpgradePreflight {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Container)) {
             throw "[UPGRADE_PREFLIGHT_FAIL] Missing source directory: $requiredPath"
         }
+    }
+
+    if ($Inputs.Mode -eq 'ApplyIsolated') {
+        Assert-IsolatedBoundary -Inputs $Inputs
+        return
     }
 
     if (Test-PathInside -Candidate $Inputs.StagingRoot -Container $RepoRoot) {
@@ -296,16 +399,471 @@ function Invoke-IsolatedStage {
     Write-JsonAtomic -Path (Join-Path $Inputs.StagingRoot 'upgrade-plan.json') -Payload $manifest
 }
 
+function Assert-ManagedSourcesMatchHead {
+    param([Parameter(Mandatory = $true)]$Plan)
+
+    foreach ($side in @('frontend', 'backend')) {
+        $prefix = if ($side -eq 'frontend') { 'Frontend' } else { 'Backend' }
+        foreach ($file in $Plan.files[$side]) {
+            $gitPath = ($prefix + '/' + $file.RelativePath.Replace('\', '/'))
+            [void](Get-GitOutput -Arguments @('ls-files', '--error-unmatch', '--', $gitPath))
+            $headBlob = (Get-GitOutput -Arguments @('rev-parse', "HEAD:$gitPath") | Select-Object -First 1).Trim()
+            $workingBlob = (Get-GitOutput -Arguments @('hash-object', '--', $file.FullName) | Select-Object -First 1).Trim()
+            if (-not $headBlob.Equals($workingBlob, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "[UPGRADE_SOURCE_DIRTY] Managed source differs from HEAD: $gitPath"
+            }
+        }
+    }
+
+    $workingDeletions = @(Get-GitOutput -Arguments @('diff', '--name-only', '--diff-filter=D', 'HEAD', '--', 'Frontend', 'Backend'))
+    if ($workingDeletions.Count -gt 0) {
+        throw "[UPGRADE_SOURCE_DELETE] Working tree contains tracked deletion(s): $($workingDeletions -join ', ')"
+    }
+    if ($FailureInjection -eq 'DirtySource') {
+        throw '[UPGRADE_SOURCE_DIRTY] Injected dirty managed source rejection.'
+    }
+}
+
+function Resolve-IsolatedVersionContract {
+    param([Parameter(Mandatory = $true)]$Inputs)
+
+    $frontendVersionPath = Join-Path $Inputs.FrontendTarget 'version.txt'
+    $backendVersionPath = Join-Path $Inputs.BackendTarget 'version.txt'
+    foreach ($path in @($frontendVersionPath, $backendVersionPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "[UPGRADE_VERSION_FAIL] Isolated target version marker is missing: $path"
+        }
+    }
+    $frontendOld = (Get-Content -LiteralPath $frontendVersionPath -Raw).Trim()
+    $backendOld = (Get-Content -LiteralPath $backendVersionPath -Raw).Trim()
+    if (-not $frontendOld -or -not $frontendOld.Equals($backendOld, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw '[UPGRADE_VERSION_FAIL] Frontend and Backend old version markers must match.'
+    }
+
+    $oldCommit = (Get-GitOutput -Arguments @('rev-parse', "$frontendOld^{commit}") | Select-Object -First 1).Trim()
+    $headCommit = Get-HeadCommit
+    $headShort = Get-HeadShortCommit
+    $priorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git -C $RepoRoot merge-base --is-ancestor $oldCommit $headCommit 2>$null
+        $isAncestor = ($LASTEXITCODE -eq 0)
+    }
+    finally {
+        $ErrorActionPreference = $priorPreference
+    }
+    if (-not $isAncestor) {
+        throw '[UPGRADE_VERSION_FAIL] Old version must be an ancestor of the current HEAD.'
+    }
+    if ($BuildVersion -and -not $BuildVersion.Equals($headShort, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw '[UPGRADE_VERSION_FAIL] ApplyIsolated BuildVersion must equal the current HEAD short commit.'
+    }
+
+    $deletions = @(Get-GitOutput -Arguments @('diff', '--name-only', '--diff-filter=D', "$oldCommit..$headCommit", '--', 'Frontend', 'Backend'))
+    if ($deletions.Count -gt 0) {
+        throw "[UPGRADE_POLICY_FAIL] No-delete overlay rejects tracked deletion(s): $($deletions -join ', ')"
+    }
+    $requirements = @(Get-GitOutput -Arguments @('diff', '--name-only', "$oldCommit..$headCommit", '--', 'Frontend/requirements.txt', 'Backend/requirements.txt'))
+    if ($requirements.Count -gt 0) {
+        throw "[UPGRADE_POLICY_FAIL] Requirements changes require a separately ruled migration: $($requirements -join ', ')"
+    }
+    return [pscustomobject]@{
+        OldVersion = $frontendOld
+        OldCommit = $oldCommit
+        HeadCommit = $headCommit
+        NewVersion = $headShort
+        FrontendPath = $frontendVersionPath
+        BackendPath = $backendVersionPath
+    }
+}
+
+function Copy-FileAtomicVerified {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedHash,
+        [Parameter(Mandatory = $true)][string]$TransactionId
+    )
+    $parent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $temporary = "$Destination.$TransactionId.tmp"
+    Copy-Item -LiteralPath $Source -Destination $temporary -Force
+    if (-not (Get-FileSha256 $temporary).Equals($ExpectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[UPGRADE_HASH_FAIL] Temporary copy hash mismatch: $Destination"
+    }
+    Move-Item -LiteralPath $temporary -Destination $Destination -Force
+    if (-not (Get-FileSha256 $Destination).Equals($ExpectedHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[UPGRADE_HASH_FAIL] Installed file hash mismatch: $Destination"
+    }
+}
+
+function Save-TransactionJournal {
+    param(
+        [Parameter(Mandatory = $true)][string]$JournalPath,
+        [Parameter(Mandatory = $true)]$Journal
+    )
+    $Journal.updated_at_utc = [DateTime]::UtcNow.ToString('o')
+    Write-JsonAtomic -Path $JournalPath -Payload $Journal
+}
+
+function Get-ProtectedSnapshot {
+    param([Parameter(Mandatory = $true)]$Inputs)
+    $records = @()
+    foreach ($item in $ProtectedBackupItems) {
+        if ($item.RelativePath -eq 'version.txt') { continue }
+        $targetRoot = if ($item.Side -eq 'Frontend') { $Inputs.FrontendTarget } else { $Inputs.BackendTarget }
+        $path = Join-Path $targetRoot $item.RelativePath
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $records += [pscustomobject]@{ side = $item.Side; relative_path = $item.RelativePath; path = $path; existed_before = $true; sha256 = Get-FileSha256 $path }
+        }
+        elseif ($item.Required) {
+            throw "[UPGRADE_PROTECTED_FAIL] Required protected data is missing: $path"
+        }
+        else {
+            $records += [pscustomobject]@{ side = $item.Side; relative_path = $item.RelativePath; path = $path; existed_before = $false; sha256 = $null }
+        }
+    }
+    return $records
+}
+
+function Assert-ProtectedSnapshotUnchanged {
+    param([Parameter(Mandatory = $true)]$Records)
+    foreach ($record in $Records) {
+        $existsNow = Test-Path -LiteralPath $record.path -PathType Leaf
+        if ($record.existed_before -ne $existsNow) {
+            throw "[UPGRADE_PROTECTED_FAIL] Protected file existence changed: $($record.path)"
+        }
+        if ($existsNow -and -not (Get-FileSha256 $record.path).Equals($record.sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "[UPGRADE_PROTECTED_FAIL] Protected file hash changed: $($record.path)"
+        }
+    }
+}
+
+function New-IsolatedTransaction {
+    param(
+        [Parameter(Mandatory = $true)]$Inputs,
+        [Parameter(Mandatory = $true)]$Plan,
+        [Parameter(Mandatory = $true)]$Version
+    )
+    $transactionId = [Guid]::NewGuid().ToString('N')
+    $packageRoot = Join-Path $Inputs.StagingRoot 'package'
+    $preimageRoot = Join-Path $Inputs.StagingRoot 'managed-preimage'
+    New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $preimageRoot -Force | Out-Null
+
+    $fileRecords = @()
+    $manifestLines = @()
+    foreach ($side in @('frontend', 'backend')) {
+        $sideName = if ($side -eq 'frontend') { 'Frontend' } else { 'Backend' }
+        $targetRoot = if ($side -eq 'frontend') { $Inputs.FrontendTarget } else { $Inputs.BackendTarget }
+        foreach ($file in $Plan.files[$side]) {
+            $packagePath = Join-Path (Join-Path $packageRoot $sideName) $file.RelativePath
+            Copy-FilePreservingRelativePath -SourcePath $file.FullName -RelativePath $file.RelativePath -DestinationRoot (Join-Path $packageRoot $sideName)
+            $packageHash = Get-FileSha256 $packagePath
+            $targetPath = Join-Path $targetRoot $file.RelativePath
+            $existedBefore = Test-Path -LiteralPath $targetPath -PathType Leaf
+            $preimagePath = $null
+            $preimageHash = $null
+            if ($existedBefore) {
+                $preimagePath = Join-Path (Join-Path $preimageRoot $sideName) $file.RelativePath
+                Copy-FilePreservingRelativePath -SourcePath $targetPath -RelativePath $file.RelativePath -DestinationRoot (Join-Path $preimageRoot $sideName)
+                $preimageHash = Get-FileSha256 $preimagePath
+            }
+            $fileRecords += [pscustomobject]@{
+                side = $sideName
+                relative_path = $file.RelativePath
+                package_path = $packagePath
+                package_sha256 = $packageHash
+                target_path = $targetPath
+                existed_before = $existedBefore
+                preimage_path = $preimagePath
+                preimage_sha256 = $preimageHash
+                apply_state = 'pending'
+                applied_sha256 = $null
+                restore_state = 'pending'
+                restored_sha256 = $null
+            }
+            $manifestLines += "$sideName|$($file.RelativePath.Replace('\', '/'))|$packageHash"
+        }
+    }
+    $manifestText = ($manifestLines | Sort-Object) -join "`n"
+    $manifestBytes = [System.Text.Encoding]::UTF8.GetBytes($manifestText)
+    $manifestHash = ([System.BitConverter]::ToString(([System.Security.Cryptography.SHA256]::Create()).ComputeHash($manifestBytes))).Replace('-', '')
+    $protected = @(Get-ProtectedSnapshot -Inputs $Inputs)
+    $versionRecords = @()
+    foreach ($versionSide in @(
+        [pscustomobject]@{ Name = 'Frontend'; Target = $Version.FrontendPath },
+        [pscustomobject]@{ Name = 'Backend'; Target = $Version.BackendPath }
+    )) {
+        $versionPackagePath = Join-Path (Join-Path $packageRoot 'version-markers') ("$($versionSide.Name)-version.txt")
+        $versionPackageParent = Split-Path -Parent $versionPackagePath
+        New-Item -ItemType Directory -Path $versionPackageParent -Force | Out-Null
+        $Version.NewVersion | Set-Content -LiteralPath $versionPackagePath -Encoding ASCII -NoNewline
+        $versionPreimagePath = Join-Path (Join-Path $preimageRoot 'version-markers') ("$($versionSide.Name)-version.txt")
+        $versionPreimageParent = Split-Path -Parent $versionPreimagePath
+        New-Item -ItemType Directory -Path $versionPreimageParent -Force | Out-Null
+        Copy-Item -LiteralPath $versionSide.Target -Destination $versionPreimagePath -Force
+        $versionRecords += [pscustomobject]@{
+            side = $versionSide.Name
+            target_path = $versionSide.Target
+            old_value = $Version.OldVersion
+            new_value = $Version.NewVersion
+            package_path = $versionPackagePath
+            package_sha256 = Get-FileSha256 $versionPackagePath
+            preimage_path = $versionPreimagePath
+            preimage_sha256 = Get-FileSha256 $versionPreimagePath
+            apply_state = 'pending'
+            applied_sha256 = $null
+            restore_state = 'pending'
+            restored_sha256 = $null
+        }
+    }
+    return [pscustomobject]@{
+        schema_version = 1
+        transaction_id = $transactionId
+        state = 'prepared'
+        head_commit = $Version.HeadCommit
+        manifest_sha256 = $manifestHash
+        old_version = $Version.OldVersion
+        new_version = $Version.NewVersion
+        targets = [pscustomobject]@{ frontend = $Inputs.FrontendTarget; backend = $Inputs.BackendTarget }
+        isolation_root = $Inputs.IsolationRoot
+        staging_root = $Inputs.StagingRoot
+        last_completed_step = 'prepared'
+        failed_file = $null
+        failure_injection = $FailureInjection
+        process_policy = [pscustomobject]@{
+            behavior = 'journal-only-no-process-operations'
+            ui = 'future formal preflight rejects exact owned UI process or QLockFile; user exits normally; no force termination or auto-restart'
+            workers = 'future formal flow restores exact live ownership set only; stale registry is neither restored nor cleaned; paper watcher excluded'
+            fake_snapshot = @()
+        }
+        protected = $protected
+        files = $fileRecords
+        versions = $versionRecords
+        created_at_utc = [DateTime]::UtcNow.ToString('o')
+        updated_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+
+function Invoke-IsolatedRollback {
+    param(
+        [Parameter(Mandatory = $true)]$Journal,
+        [Parameter(Mandatory = $true)][string]$JournalPath,
+        [switch]$PermitInjectedFailure
+    )
+    $Journal.state = 'rolling_back'
+    Save-TransactionJournal -JournalPath $JournalPath -Journal $Journal
+    try {
+        for ($index = $Journal.versions.Count - 1; $index -ge 0; $index--) {
+            $record = $Journal.versions[$index]
+            if ($record.apply_state -ne 'applied') { continue }
+            $Journal.failed_file = $record.target_path
+            if ($PermitInjectedFailure -and $FailureInjection -eq 'Rollback') {
+                throw '[UPGRADE_INJECTED_FAIL] Rollback restore injection.'
+            }
+            Copy-FileAtomicVerified -Source $record.preimage_path -Destination $record.target_path -ExpectedHash $record.preimage_sha256 -TransactionId $Journal.transaction_id
+            $record.restored_sha256 = Get-FileSha256 $record.target_path
+            $record.restore_state = 'restored'
+            $Journal.last_completed_step = "restore-version-$($record.side)"
+            Save-TransactionJournal -JournalPath $JournalPath -Journal $Journal
+        }
+        for ($index = $Journal.files.Count - 1; $index -ge 0; $index--) {
+            $record = $Journal.files[$index]
+            if ($record.apply_state -ne 'applied') { continue }
+            $Journal.failed_file = $record.target_path
+            if ($PermitInjectedFailure -and $FailureInjection -eq 'Rollback') {
+                throw '[UPGRADE_INJECTED_FAIL] Rollback restore injection.'
+            }
+            if ($record.existed_before) {
+                Copy-FileAtomicVerified -Source $record.preimage_path -Destination $record.target_path -ExpectedHash $record.preimage_sha256 -TransactionId $Journal.transaction_id
+                $record.restored_sha256 = Get-FileSha256 $record.target_path
+            }
+            elseif (Test-Path -LiteralPath $record.target_path -PathType Leaf) {
+                Remove-Item -LiteralPath $record.target_path -Force
+                if (Test-Path -LiteralPath $record.target_path) {
+                    throw "[UPGRADE_ROLLBACK_FAIL] New file was not removed: $($record.target_path)"
+                }
+            }
+            $record.restore_state = 'restored'
+            $Journal.last_completed_step = "restore-$($record.side)-$($record.relative_path)"
+            Save-TransactionJournal -JournalPath $JournalPath -Journal $Journal
+        }
+        Assert-ProtectedSnapshotUnchanged -Records $Journal.protected
+        $Journal.failed_file = $null
+        $Journal.state = 'rolled_back'
+        $Journal.last_completed_step = 'rollback-complete'
+        Save-TransactionJournal -JournalPath $JournalPath -Journal $Journal
+    }
+    catch {
+        $Journal.state = 'rollback_failed'
+        Save-TransactionJournal -JournalPath $JournalPath -Journal $Journal
+        throw
+    }
+}
+
+function Invoke-IsolatedApply {
+    param(
+        [Parameter(Mandatory = $true)]$Inputs,
+        [Parameter(Mandatory = $true)]$Plan,
+        [Parameter(Mandatory = $true)]$Version,
+        [Parameter(Mandatory = $true)][string]$JournalPath
+    )
+    $journal = New-IsolatedTransaction -Inputs $Inputs -Plan $Plan -Version $Version
+    Save-TransactionJournal -JournalPath $JournalPath -Journal $journal
+    try {
+        $journal.state = 'applying'
+        Save-TransactionJournal -JournalPath $JournalPath -Journal $journal
+        foreach ($side in @('Frontend', 'Backend')) {
+            $sideApplied = 0
+            foreach ($record in @($journal.files | Where-Object { $_.side -eq $side })) {
+                $journal.failed_file = $record.target_path
+                Copy-FileAtomicVerified -Source $record.package_path -Destination $record.target_path -ExpectedHash $record.package_sha256 -TransactionId $journal.transaction_id
+                $record.apply_state = 'applied'
+                $record.applied_sha256 = Get-FileSha256 $record.target_path
+                $journal.last_completed_step = "apply-$side-$($record.relative_path)"
+                Save-TransactionJournal -JournalPath $JournalPath -Journal $journal
+                $sideApplied++
+                if ($sideApplied -eq 1 -and $FailureInjection -eq "${side}Apply") {
+                    throw "[UPGRADE_INJECTED_FAIL] $side apply injection."
+                }
+            }
+        }
+        foreach ($record in $journal.versions) {
+            $journal.failed_file = $record.target_path
+            Copy-FileAtomicVerified -Source $record.package_path -Destination $record.target_path -ExpectedHash $record.package_sha256 -TransactionId $journal.transaction_id
+            $record.apply_state = 'applied'
+            $record.applied_sha256 = Get-FileSha256 $record.target_path
+            $journal.last_completed_step = "apply-version-$($record.side)"
+            Save-TransactionJournal -JournalPath $JournalPath -Journal $journal
+            if ($record.side -eq 'Frontend' -and $FailureInjection -eq 'Version') {
+                throw '[UPGRADE_INJECTED_FAIL] Version injection.'
+            }
+        }
+        foreach ($record in $journal.files) {
+            if (-not (Get-FileSha256 $record.target_path).Equals($record.package_sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "[UPGRADE_SMOKE_FAIL] Managed target hash mismatch: $($record.target_path)"
+            }
+        }
+        Assert-ProtectedSnapshotUnchanged -Records $journal.protected
+        if ($FailureInjection -in @('Smoke', 'Rollback')) {
+            throw '[UPGRADE_INJECTED_FAIL] Smoke/rollback injection.'
+        }
+        $journal.failed_file = $null
+        $journal.state = 'committed'
+        $journal.last_completed_step = 'isolated-smoke-complete'
+        Save-TransactionJournal -JournalPath $JournalPath -Journal $journal
+        return $journal
+    }
+    catch {
+        $applyError = $_
+        try {
+            Invoke-IsolatedRollback -Journal $journal -JournalPath $JournalPath -PermitInjectedFailure
+        }
+        catch {
+            throw "[UPGRADE_ROLLBACK_FAIL] Apply failed: $($applyError.Exception.Message) Rollback failed: $($_.Exception.Message)"
+        }
+        throw $applyError
+    }
+}
+
+function Assert-TransactionJournalBoundary {
+    param(
+        [Parameter(Mandatory = $true)]$Inputs,
+        [Parameter(Mandatory = $true)]$Journal
+    )
+    if ($Journal.transaction_id -notmatch '^[0-9a-fA-F]{32}$') {
+        throw '[UPGRADE_TRANSACTION_FAIL] Journal transaction ID is invalid.'
+    }
+    foreach ($pair in @(
+        [pscustomobject]@{ Actual = $Journal.isolation_root; Expected = $Inputs.IsolationRoot; Label = 'IsolationRoot' },
+        [pscustomobject]@{ Actual = $Journal.staging_root; Expected = $Inputs.StagingRoot; Label = 'StagingRoot' },
+        [pscustomobject]@{ Actual = $Journal.targets.frontend; Expected = $Inputs.FrontendTarget; Label = 'FrontendTarget' },
+        [pscustomobject]@{ Actual = $Journal.targets.backend; Expected = $Inputs.BackendTarget; Label = 'BackendTarget' }
+    )) {
+        if (-not (Get-NormalizedFullPath $pair.Actual).Equals((Get-NormalizedFullPath $pair.Expected), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "[UPGRADE_TRANSACTION_FAIL] Journal $($pair.Label) does not match the explicit rollback boundary."
+        }
+    }
+    foreach ($record in $Journal.files) {
+        $targetRoot = if ($record.side -eq 'Frontend') { $Inputs.FrontendTarget } elseif ($record.side -eq 'Backend') { $Inputs.BackendTarget } else { throw '[UPGRADE_TRANSACTION_FAIL] Journal file side is invalid.' }
+        if (-not (Test-StrictPathInside -Candidate $record.target_path -Container $targetRoot)) {
+            throw "[UPGRADE_TRANSACTION_FAIL] Journal managed target escaped its fake target: $($record.target_path)"
+        }
+        foreach ($evidencePath in @($record.package_path, $record.preimage_path)) {
+            if ($evidencePath -and -not (Test-StrictPathInside -Candidate $evidencePath -Container $Inputs.StagingRoot)) {
+                throw "[UPGRADE_TRANSACTION_FAIL] Journal evidence path escaped staging: $evidencePath"
+            }
+        }
+    }
+    foreach ($record in $Journal.versions) {
+        $expectedTarget = if ($record.side -eq 'Frontend') { Join-Path $Inputs.FrontendTarget 'version.txt' } elseif ($record.side -eq 'Backend') { Join-Path $Inputs.BackendTarget 'version.txt' } else { throw '[UPGRADE_TRANSACTION_FAIL] Journal version side is invalid.' }
+        if (-not (Get-NormalizedFullPath $record.target_path).Equals((Get-NormalizedFullPath $expectedTarget), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "[UPGRADE_TRANSACTION_FAIL] Journal version target escaped its fake target: $($record.target_path)"
+        }
+        foreach ($evidencePath in @($record.package_path, $record.preimage_path)) {
+            if (-not (Test-StrictPathInside -Candidate $evidencePath -Container $Inputs.StagingRoot)) {
+                throw "[UPGRADE_TRANSACTION_FAIL] Journal version evidence escaped staging: $evidencePath"
+            }
+        }
+    }
+}
+
+function Invoke-ApplyIsolatedMode {
+    param(
+        [Parameter(Mandatory = $true)]$Inputs,
+        [AllowNull()]$Plan
+    )
+    $journalPath = Join-Path $Inputs.StagingRoot 'transaction-journal.json'
+    if ($IsolatedAction -eq 'Rollback') {
+        if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+            throw '[UPGRADE_TRANSACTION_FAIL] Rollback requires an existing transaction journal.'
+        }
+        $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+        Assert-TransactionJournalBoundary -Inputs $Inputs -Journal $journal
+        if ($journal.state -eq 'committed') {
+            throw '[UPGRADE_TRANSACTION_FAIL] A committed transaction is not eligible for automatic rollback.'
+        }
+        Invoke-IsolatedRollback -Journal $journal -JournalPath $journalPath
+        return $journal
+    }
+
+    if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        $existing = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+        throw "[UPGRADE_TRANSACTION_FAIL] Existing transaction state '$($existing.state)'; only explicit Rollback may continue an unfinished transaction."
+    }
+    if (Test-Path -LiteralPath $Inputs.StagingRoot) {
+        $existingEntries = @(Get-ChildItem -LiteralPath $Inputs.StagingRoot -Force)
+        if ($existingEntries.Count -gt 0) {
+            throw '[UPGRADE_TRANSACTION_FAIL] Apply requires an empty or nonexistent StagingRoot.'
+        }
+    }
+    Assert-ManagedSourcesMatchHead -Plan $Plan
+    $version = Resolve-IsolatedVersionContract -Inputs $Inputs
+    return Invoke-IsolatedApply -Inputs $Inputs -Plan $Plan -Version $version -JournalPath $journalPath
+}
+
 $script:UpgradeExitCode = 0
 
 function Invoke-UpgradeMain {
     try {
         $inputs = Resolve-UpgradeInputs
         Assert-UpgradePreflight -Inputs $inputs
+        if ($inputs.Mode -eq 'ApplyIsolated' -and $IsolatedAction -eq 'Rollback') {
+            $result = Invoke-ApplyIsolatedMode -Inputs $inputs -Plan $null
+            $result | ConvertTo-Json -Depth 12
+            return
+        }
         $plan = New-UpgradePlan -Inputs $inputs
 
         if ($inputs.Mode -eq 'DryRun') {
             $plan | ConvertTo-Json -Depth 12
+            return
+        }
+
+        if ($inputs.Mode -eq 'ApplyIsolated') {
+            $result = Invoke-ApplyIsolatedMode -Inputs $inputs -Plan $plan
+            $result | ConvertTo-Json -Depth 12
             return
         }
 
@@ -314,9 +872,9 @@ function Invoke-UpgradeMain {
         return
     }
     catch {
-        $tag = if ($Mode -eq 'Stage') { 'UPGRADE_STAGE_FAIL' } else { 'UPGRADE_PREFLIGHT_FAIL' }
+        $tag = if ($Mode -eq 'Stage') { 'UPGRADE_STAGE_FAIL' } elseif ($Mode -eq 'ApplyIsolated') { 'UPGRADE_ISOLATED_FAIL' } else { 'UPGRADE_PREFLIGHT_FAIL' }
         [Console]::Error.WriteLine("[$tag] $($_.Exception.Message)")
-        $script:UpgradeExitCode = if ($Mode -eq 'Stage') { 3 } else { 2 }
+        $script:UpgradeExitCode = if ($Mode -eq 'Stage') { 3 } elseif ($Mode -eq 'ApplyIsolated') { 4 } else { 2 }
         return
     }
 }
