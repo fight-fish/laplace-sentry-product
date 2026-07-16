@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'RepairMixedIsolated')]
+    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'PrepareFormal', 'RepairMixedIsolated')]
     [string]$Mode = 'DryRun',
 
     [string]$StagingRoot,
@@ -17,7 +17,7 @@ param(
     [ValidateSet('Base', 'OriginallyAbsent', 'ExtraDelete')]
     [string]$MixedFixtureVariant = 'Base',
 
-    [ValidateSet('None', 'Preimage', 'Package', 'Prepare', 'AdapterBeforeReplace', 'AdapterAfterReplace', 'BackendMarkerAfterReplace', 'PostCheck')]
+    [ValidateSet('None', 'Preimage', 'Package', 'Prepare', 'Journal', 'SecondSnapshot', 'EvidenceTamper', 'AdapterBeforeReplace', 'AdapterAfterReplace', 'BackendMarkerAfterReplace', 'PostCheck')]
     [string]$MixedFailureInjection = 'None',
 
     [ValidateSet('None', 'DirtySource', 'FrontendApply', 'BackendApply', 'Version', 'Smoke', 'Rollback')]
@@ -59,7 +59,6 @@ $BackendSource = Join-Path $RepoRoot 'Backend'
 $TempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $FormalFrontendTarget = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
-$MixedRepairRepoHead = '79f71463940d8291a3056cd9a7482d8c21a6f798'
 $MixedRepairOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $MixedRepairTargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
 $MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
@@ -386,6 +385,11 @@ function Assert-UpgradePreflight {
 
     if ($Inputs.Mode -eq 'PreflightFormal') {
         Assert-FormalPreflightBoundary -Inputs $Inputs
+        return
+    }
+
+    if ($Inputs.Mode -eq 'PrepareFormal') {
+        Assert-FormalPrepareBoundary -Inputs $Inputs
         return
     }
 
@@ -1137,9 +1141,8 @@ function Assert-MixedRepoBasis {
     $head = Get-HeadCommit
     $originMain = (Get-GitOutput -Arguments @('rev-parse', 'origin/main') | Select-Object -First 1).Trim()
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
-    if ($branch -ne 'main' -or -not $head.Equals($MixedRepairRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "[UPGRADE_MIXED_BASIS_FAIL] Expected main @ $MixedRepairRepoHead, got $branch @ $head."
-    }
+    if ($branch -ne 'main') { throw "[UPGRADE_MIXED_BASIS_FAIL] Expected branch main, got $branch." }
+    [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head -FailureTag 'UPGRADE_MIXED_BASIS_FAIL')
     if (-not $originMain.Equals($MixedRepairOriginMain, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "[UPGRADE_MIXED_BASIS_FAIL] origin/main changed: $originMain"
     }
@@ -2441,6 +2444,9 @@ function Invoke-MixedRepairMode {
     return Invoke-MixedRepairApply -Inputs $Inputs -JournalPath $journalPath
 }
 
+# PrepareFormal transaction details stay in the dedicated helper; this file keeps only dispatch and exit mapping.
+. (Join-Path $ScriptRoot 'upgrade_formal_prepare.ps1')
+
 $script:UpgradeExitCode = 0
 
 function Invoke-UpgradeMain {
@@ -2452,6 +2458,12 @@ function Invoke-UpgradeMain {
             $result = Invoke-FormalPreflightMode -Inputs $inputs
             $result | ConvertTo-Json -Depth 12 -Compress
             $script:UpgradeExitCode = if ($result.safe_to_upgrade) { 0 } else { 2 }
+            return
+        }
+        if ($inputs.Mode -eq 'PrepareFormal') {
+            $result = Invoke-FormalPrepareMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 20 -Compress
+            $script:UpgradeExitCode = 0
             return
         }
         if ($inputs.Mode -eq 'RepairMixedIsolated') {
@@ -2493,6 +2505,14 @@ function Invoke-UpgradeMain {
             $failureResult | ConvertTo-Json -Depth 12 -Compress
             [Console]::Error.WriteLine("[UPGRADE_PREFLIGHT_FAIL] $failureMessage")
             $script:UpgradeExitCode = 2
+            return
+        }
+        if ($Mode -eq 'PrepareFormal') {
+            $failureMessage = "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+            $failureResult = New-FormalPrepareFailureResult -Message $failureMessage
+            $failureResult | ConvertTo-Json -Depth 12 -Compress
+            [Console]::Error.WriteLine("[UPGRADE_PREPARE_FAIL] $failureMessage")
+            $script:UpgradeExitCode = 6
             return
         }
         $tag = if ($Mode -eq 'Stage') { 'UPGRADE_STAGE_FAIL' } elseif ($Mode -eq 'ApplyIsolated') { 'UPGRADE_ISOLATED_FAIL' } elseif ($Mode -eq 'RepairMixedIsolated') { 'UPGRADE_MIXED_FAIL' } else { 'UPGRADE_PREFLIGHT_FAIL' }
