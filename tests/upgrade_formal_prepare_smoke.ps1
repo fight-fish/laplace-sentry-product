@@ -3,23 +3,23 @@ param()
 
 <#
 .SYNOPSIS
-Proves PrepareFormal under isolated TEMP fixtures without touching formal targets.
+Proves PrepareFormal under isolated TEMP fixtures and the read-only production WSL metadata seam.
 
 .DESCRIPTION
-Purpose: exercise prepare success, rejection, interruption, reentry, integrity sealing, and the zero-formal-write boundary.
-Inputs: fixed Git objects plus generated mixed Frontend/Backend targets and complete observation JSON below system TEMP.
+Purpose: exercise prepare success, rejection, interruption, reentry, integrity sealing, the zero-formal-write boundary, and production WSL stat argument handling.
+Inputs: fixed Git objects, generated mixed Frontend/Backend targets and observation JSON below system TEMP, plus formal backend main.py as a read-only metadata witness.
 Outputs: one PASS/FAIL result; all fixture evidence is removed before exit.
 SSOT Output: process exit code; zero means every prepare-only assertion passed.
 Exit codes: 0 pass, 1 assertion, boundary, script, or cleanup failure.
 SKIP conditions: none.
-FAIL conditions: any wrong exit/result/state/count/hash/reentry/boundary result or TEMP residue.
+FAIL conditions: any wrong exit/result/state/count/hash/reentry/boundary result, TEMP residue, or production metadata command/parser result.
 Order-sensitive checks: formal-boundary and fixture target snapshots are captured before prepare and compared after every case.
-Side effects: creates and removes only verified strict children of system TEMP; never invokes live PrepareFormal, upgrade.bat, Git writes, processes, registry, or runtime changes.
+Side effects: creates and removes only verified strict children of system TEMP and issues read-only WSL stat calls; never invokes live PrepareFormal, upgrade.bat, Git writes, processes, registry, or runtime changes.
 #>
 
-# 這支腳本在做什麼：用 TEMP 假目標證明完整備份、資料包、journal、重跑與失敗停點。
+# 這支腳本在做什麼：用 TEMP 假目標證明完整 prepare 契約，並唯讀走過 production WSL metadata 接縫。
 # 這支腳本不做什麼：不執行真實 prepare、不建立正式 transaction root，也不測 apply／repair／rollback。
-# 常改區塊：拒絕案例、故障注入、manifest 與重入斷言。
+# 常改區塊：production metadata 接縫、拒絕案例、故障注入、manifest 與重入斷言。
 # 不要亂動的區塊：正式邊界前後 fingerprint、嚴格 TEMP 清理與 0 formal target writes。
 
 Set-StrictMode -Version Latest
@@ -34,6 +34,7 @@ $OutsideRoot = Join-Path $TempBase ('LaplaceSentryFormalPrepareOutside-' + [Guid
 $TemplateRoot = Join-Path $SuiteRoot '_template'
 $FormalFrontend = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackend = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
+$FormalBackendLinux = '/home/serpal/.laplace_sentry_backend'
 $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade'
 $TargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
@@ -51,13 +52,54 @@ function Assert-True {
     if (-not $Condition) { throw "[ASSERT_FAIL] $Message" }
 }
 
+function Assert-ThrowsLike {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+    $caught = $null
+    try { & $Action }
+    catch { $caught = $_ }
+    $actual = if ($null -ne $caught) { $caught.Exception.Message } else { '<no exception>' }
+    Assert-True ($null -ne $caught -and $actual -match $Pattern) "$Message Actual=$actual"
+}
+
+function Assert-ProductionWslMetadataSeam {
+    $relativePath = 'main.py'
+    $windowsPath = Join-Path $FormalBackend $relativePath
+    $linuxPath = "$FormalBackendLinux/$relativePath"
+    Assert-True (Test-Path -LiteralPath $windowsPath -PathType Leaf) "Formal backend witness is unavailable: $windowsPath"
+
+    $direct = @(& wsl.exe -d Ubuntu --exec stat -c '%a|%u|%g|%F' -- $linuxPath 2>$null)
+    $directExit = $LASTEXITCODE
+    Assert-True ($directExit -eq 0 -and $direct.Count -eq 1) "Literal argv control failed. exit=$directExit count=$($direct.Count)"
+    Assert-True ($direct[0] -match '^(\d+)\|(\d+)\|(\d+)\|regular file$') "Literal argv control returned malformed metadata: $($direct -join ';')"
+    $expectedMode = $Matches[1]
+    $expectedUid = [int]$Matches[2]
+    $expectedGid = [int]$Matches[3]
+
+    $metadata = Get-FormalPrepareFileMetadata -Side 'Backend' -RelativePath $relativePath -Path $windowsPath -Observation ([pscustomobject]@{}) -FixtureMode $false
+    Assert-True ($metadata.exists -and $metadata.posix_mode -eq $expectedMode -and $metadata.uid -eq $expectedUid -and $metadata.gid -eq $expectedGid) 'Production metadata helper diverged from the literal argv control.'
+
+    $missing = "/tmp/LaplaceSentryWslMetadataMissing-$([Guid]::NewGuid().ToString('N'))"
+    Assert-ThrowsLike { Get-FormalPrepareWslFileMetadata -LinuxPath $missing } 'UPGRADE_PREPARE_SOURCE_FAIL' 'A failed production stat command was accepted.'
+    Assert-ThrowsLike { Get-FormalPrepareWslFileMetadata -LinuxPath '/tmp' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'A non-regular WSL path was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000') -ExitCode 0 -LinuxPath '/synthetic/incomplete' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Incomplete metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|directory') -ExitCode 0 -LinuxPath '/synthetic/directory' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Malformed file type metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular file', 'extra') -ExitCode 0 -LinuxPath '/synthetic/multiple' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Multiple metadata lines were accepted.'
+}
+
 function Assert-CheckpointBasisContract {
     $syntheticHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    $expectedPaths = @('scripts/upgrade.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
+    $priorRepoHead = '3f3321046a0f32691ca63ad67c887f32188b7ffc'
+    $expectedPaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareRepoHead -ParentHead '' -ChangedPaths @()) -eq 'working_tree') 'Original working-tree basis was rejected.'
-    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $expectedPaths) -eq 'checkpoint') 'Legal direct three-file checkpoint was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $expectedPaths) -eq 'checkpoint') 'Legal direct two-file checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $priorRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $expectedPaths))) 'Prior three-file checkpoint lineage was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead ('b' * 40) -ChangedPaths $expectedPaths)) 'Wrong checkpoint parent was accepted.'
-    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths @('scripts/upgrade.ps1'))) 'Partial checkpoint was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths @('scripts/upgrade_formal_prepare.ps1'))) 'Partial checkpoint was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $expectedPaths))) 'Checkpoint with an unapproved prior-work path was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths ($expectedPaths + 'fourth-file.txt'))) 'Checkpoint with a fourth file was accepted.'
 }
 
@@ -353,6 +395,7 @@ try {
     New-Item -ItemType Directory -Path $SuiteRoot, $OutsideRoot -Force | Out-Null
     Initialize-PrepareTemplate
     $formalBefore = @(Get-FormalBoundaryCanonical) -join "`n"
+    Assert-ProductionWslMetadataSeam
 
     $success = New-PrepareCase 'success-and-rerun'
     $targetBefore = Get-CaseTargetCanonical $success

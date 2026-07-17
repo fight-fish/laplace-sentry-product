@@ -22,9 +22,8 @@ Side effects: writes only below the verified transaction parent; never writes fo
 Set-StrictMode -Version Latest
 
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
-$FormalPrepareRepoHead = '3f3321046a0f32691ca63ad67c887f32188b7ffc'
+$FormalPrepareRepoHead = '942b418b23c86bda1f8a7382877798d0d89279b0'
 $FormalPrepareCheckpointPaths = @(
-    'scripts/upgrade.ps1',
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
 )
@@ -135,7 +134,7 @@ function Assert-FormalPrepareBoundary {
 # 前置檢查與 canonical 證據
 # =========================
 
-# checkpoint 相容只接受原基準的單一直接子提交，且提交內容必須精確等於本工單三檔。
+# checkpoint 相容只接受已驗收基準的單一直接子提交，且提交內容必須精確等於本工單兩檔。
 function Test-FormalPrepareCheckpointShape {
     param(
         [Parameter(Mandatory = $true)][string]$CurrentHead,
@@ -163,7 +162,7 @@ function Assert-FormalPrepareCheckpointBasis {
         $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead))
     }
     if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths)) {
-        throw "[$FailureTag] Expected $FormalPrepareRepoHead or its single direct three-file PrepareFormal checkpoint, got $CurrentHead."
+        throw "[$FailureTag] Expected $FormalPrepareRepoHead or its single direct two-file PrepareFormal checkpoint, got $CurrentHead."
     }
     return 'checkpoint'
 }
@@ -282,6 +281,40 @@ function Get-FormalPrepareSourceSnapshot {
     }
 }
 
+function ConvertFrom-FormalPrepareWslStat {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$StatOutput,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][string]$LinuxPath
+    )
+    $lines = @($StatOutput)
+    $match = if ($lines.Count -eq 1) { [regex]::Match([string]$lines[0], '^(\d+)\|(\d+)\|(\d+)\|regular file$') } else { $null }
+    if ($ExitCode -ne 0 -or $null -eq $match -or -not $match.Success) {
+        throw "[UPGRADE_PREPARE_SOURCE_FAIL] WSL metadata is not a regular file: $LinuxPath"
+    }
+    return [pscustomobject]@{
+        exists = $true
+        attributes = $null
+        sddl = $null
+        posix_mode = $match.Groups[1].Value
+        uid = [int]$match.Groups[2].Value
+        gid = [int]$match.Groups[3].Value
+    }
+}
+
+function Get-FormalPrepareWslFileMetadata {
+    param([Parameter(Mandatory = $true)][string]$LinuxPath)
+    # DEFENSE: --exec preserves the stat format and path as literal argv; bare -- is re-parsed by the WSL shell.
+    $priorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $stat = @(& wsl.exe -d Ubuntu --exec stat -c '%a|%u|%g|%F' -- $LinuxPath 2>$null)
+        $statExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $priorPreference }
+    return ConvertFrom-FormalPrepareWslStat -StatOutput $stat -ExitCode $statExitCode -LinuxPath $LinuxPath
+}
+
 function Get-FormalPrepareFileMetadata {
     param(
         [Parameter(Mandatory = $true)][string]$Side,
@@ -312,11 +345,7 @@ function Get-FormalPrepareFileMetadata {
         }
     }
     $linuxPath = '/home/serpal/.laplace_sentry_backend/' + $RelativePath.Replace('\\', '/').TrimStart('/')
-    $stat = @(& wsl.exe -d Ubuntu -- stat -c '%a|%u|%g|%F' -- $linuxPath 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $stat.Count -ne 1 -or $stat[0] -notmatch '^(\d+)\|(\d+)\|(\d+)\|regular file$') {
-        throw "[UPGRADE_PREPARE_SOURCE_FAIL] WSL metadata is not a regular file: $linuxPath"
-    }
-    return [pscustomobject]@{ exists = $true; attributes = $null; sddl = $null; posix_mode = $Matches[1]; uid = [int]$Matches[2]; gid = [int]$Matches[3] }
+    return Get-FormalPrepareWslFileMetadata -LinuxPath $linuxPath
 }
 
 function Assert-FormalPrepareAclAndOwner {
