@@ -66,41 +66,73 @@ function Assert-ThrowsLike {
 }
 
 function Assert-ProductionWslMetadataSeam {
-    $relativePath = 'main.py'
-    $windowsPath = Join-Path $FormalBackend $relativePath
-    $linuxPath = "$FormalBackendLinux/$relativePath"
-    Assert-True (Test-Path -LiteralPath $windowsPath -PathType Leaf) "Formal backend witness is unavailable: $windowsPath"
+    $witnesses = @(
+        [pscustomobject]@{ RelativePath = 'main.py'; ExpectEmpty = $false },
+        [pscustomobject]@{ RelativePath = 'src/core/__init__.py'; ExpectEmpty = $true }
+    )
+    foreach ($witness in $witnesses) {
+        $relativePath = $witness.RelativePath
+        $linuxPath = "$FormalBackendLinux/$relativePath"
 
-    $direct = @(& wsl.exe -d Ubuntu --exec stat -c '%a|%u|%g|%F' -- $linuxPath 2>$null)
-    $directExit = $LASTEXITCODE
-    Assert-True ($directExit -eq 0 -and $direct.Count -eq 1) "Literal argv control failed. exit=$directExit count=$($direct.Count)"
-    Assert-True ($direct[0] -match '^(\d+)\|(\d+)\|(\d+)\|regular file$') "Literal argv control returned malformed metadata: $($direct -join ';')"
-    $expectedMode = $Matches[1]
-    $expectedUid = [int]$Matches[2]
-    $expectedGid = [int]$Matches[3]
+        $direct = @(& wsl.exe -d Ubuntu --exec stat -c '%a|%u|%g|%F' -- $linuxPath 2>$null)
+        $directExit = $LASTEXITCODE
+        Assert-True ($directExit -eq 0 -and $direct.Count -eq 1) "Literal argv control failed. path=$linuxPath exit=$directExit count=$($direct.Count)"
+        $parts = @([string]$direct[0] -split '\|')
+        Assert-True ($parts.Count -eq 4 -and @('regular file', 'regular empty file') -contains $parts[3]) "Literal argv control returned malformed metadata: $($direct -join ';')"
+        $expectedMode = $parts[0]
+        $expectedUid = [int]$parts[1]
+        $expectedGid = [int]$parts[2]
 
-    $metadata = Get-FormalPrepareFileMetadata -Side 'Backend' -RelativePath $relativePath -Path $windowsPath -Observation ([pscustomobject]@{}) -FixtureMode $false
-    Assert-True ($metadata.exists -and $metadata.posix_mode -eq $expectedMode -and $metadata.uid -eq $expectedUid -and $metadata.gid -eq $expectedGid) 'Production metadata helper diverged from the literal argv control.'
+        $sizeControl = @(& wsl.exe -d Ubuntu --exec stat -c '%s' -- $linuxPath 2>$null)
+        $sizeExit = $LASTEXITCODE
+        Assert-True ($sizeExit -eq 0 -and $sizeControl.Count -eq 1) "WSL size control failed. path=$linuxPath exit=$sizeExit count=$($sizeControl.Count)"
+        $actualSize = [long]$sizeControl[0]
+        Assert-True (($actualSize -eq 0) -eq $witness.ExpectEmpty) "Formal backend witness has the wrong empty/non-empty shape: $linuxPath"
+
+        # This production helper call is the contract under test; the direct stat call above is only its read-only control.
+        $metadata = Get-FormalPrepareWslFileMetadata -LinuxPath $linuxPath
+        Assert-True ($metadata.exists -and $metadata.posix_mode -eq $expectedMode -and $metadata.uid -eq $expectedUid -and $metadata.gid -eq $expectedGid) "Production metadata helper diverged from the literal argv control: $relativePath"
+    }
+
+    $ordinary = ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular file') -ExitCode 0 -LinuxPath '/synthetic/ordinary'
+    $emptyOrdinary = ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular empty file') -ExitCode 0 -LinuxPath '/synthetic/empty-ordinary'
+    Assert-True ($ordinary.posix_mode -eq '755' -and $ordinary.uid -eq 1000 -and $ordinary.gid -eq 1000) 'Synthetic regular file metadata was not parsed exactly.'
+    Assert-True ($emptyOrdinary.posix_mode -eq '755' -and $emptyOrdinary.uid -eq 1000 -and $emptyOrdinary.gid -eq 1000) 'Synthetic regular empty file metadata was not parsed exactly.'
 
     $missing = "/tmp/LaplaceSentryWslMetadataMissing-$([Guid]::NewGuid().ToString('N'))"
     Assert-ThrowsLike { Get-FormalPrepareWslFileMetadata -LinuxPath $missing } 'UPGRADE_PREPARE_SOURCE_FAIL' 'A failed production stat command was accepted.'
     Assert-ThrowsLike { Get-FormalPrepareWslFileMetadata -LinuxPath '/tmp' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'A non-regular WSL path was accepted.'
     Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000') -ExitCode 0 -LinuxPath '/synthetic/incomplete' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Incomplete metadata was accepted.'
-    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|directory') -ExitCode 0 -LinuxPath '/synthetic/directory' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Malformed file type metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|directory') -ExitCode 0 -LinuxPath '/synthetic/directory' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Directory metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|symbolic link') -ExitCode 0 -LinuxPath '/synthetic/symlink' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Symlink metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular sparse file') -ExitCode 0 -LinuxPath '/synthetic/unknown' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Unknown file type metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('seven|1000|1000|regular file') -ExitCode 0 -LinuxPath '/synthetic/nonnumeric' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Illegal numeric metadata was accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular file|extra') -ExitCode 0 -LinuxPath '/synthetic/extra-field' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Extra metadata fields were accepted.'
     Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular file', 'extra') -ExitCode 0 -LinuxPath '/synthetic/multiple' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'Multiple metadata lines were accepted.'
+    Assert-ThrowsLike { ConvertFrom-FormalPrepareWslStat -StatOutput @('755|1000|1000|regular file') -ExitCode 1 -LinuxPath '/synthetic/stat-failure' } 'UPGRADE_PREPARE_SOURCE_FAIL' 'A failed stat exit code was accepted.'
 }
 
 function Assert-CheckpointBasisContract {
     $syntheticHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $syntheticGrandchild = 'cccccccccccccccccccccccccccccccccccccccc'
     $priorRepoHead = '3f3321046a0f32691ca63ad67c887f32188b7ffc'
     $expectedPaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareRepoHead -ParentHead '' -ChangedPaths @()) -eq 'working_tree') 'Original working-tree basis was rejected.'
-    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $expectedPaths) -eq 'checkpoint') 'Legal direct two-file checkpoint was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved first checkpoint was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths $expectedPaths) -eq 'checkpoint') 'Legal direct two-file checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $expectedPaths)) 'A sibling checkpoint from the original basis was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticHead -ChangedPaths $expectedPaths)) 'An arbitrary checkpoint descendant was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $priorRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $expectedPaths))) 'Prior three-file checkpoint lineage was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead ('b' * 40) -ChangedPaths $expectedPaths)) 'Wrong checkpoint parent was accepted.'
-    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths @('scripts/upgrade_formal_prepare.ps1'))) 'Partial checkpoint was accepted.'
-    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $expectedPaths))) 'Checkpoint with an unapproved prior-work path was accepted.'
-    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareRepoHead -ChangedPaths ($expectedPaths + 'fourth-file.txt'))) 'Checkpoint with a fourth file was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths @('scripts/upgrade_formal_prepare.ps1'))) 'Partial checkpoint was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths (@('scripts/upgrade.ps1') + $expectedPaths))) 'Checkpoint with an unapproved prior-work path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths ($expectedPaths + 'fourth-file.txt'))) 'Checkpoint with a fourth file was accepted.'
+
+    Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false
+    Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty ($expectedPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain ('f' * 40) -Staged @() -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Wrong origin/main was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Staged changes were accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty @('unexpected.txt') -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Unexpected dirty path was accepted.'
 }
 
 function Assert-StrictTempPath {

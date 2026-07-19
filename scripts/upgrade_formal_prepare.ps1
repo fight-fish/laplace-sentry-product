@@ -23,6 +23,8 @@ Set-StrictMode -Version Latest
 
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
 $FormalPrepareRepoHead = '942b418b23c86bda1f8a7382877798d0d89279b0'
+$FormalPrepareCheckpointHead = '97165869fb82f6eeb1bf3803fbe868d20532ffc7'
+$FormalPrepareOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $FormalPrepareCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
@@ -134,15 +136,16 @@ function Assert-FormalPrepareBoundary {
 # 前置檢查與 canonical 證據
 # =========================
 
-# checkpoint 相容只接受已驗收基準的單一直接子提交，且提交內容必須精確等於本工單兩檔。
+# checkpoint 相容只接受兩個已驗收錨點，或 9716586 的單一精確兩檔直接子提交；不接受任意 descendant。
 function Test-FormalPrepareCheckpointShape {
     param(
         [Parameter(Mandatory = $true)][string]$CurrentHead,
         [Parameter(Mandatory = $true)][string]$ParentHead,
         [Parameter(Mandatory = $true)][string[]]$ChangedPaths
     )
-    if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-    if (-not $ParentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if (-not $ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
     $actual = @($ChangedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $expected = @($FormalPrepareCheckpointPaths | Sort-Object -Unique)
     return $actual.Count -eq $expected.Count -and @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual).Count -eq 0
@@ -156,15 +159,37 @@ function Assert-FormalPrepareCheckpointBasis {
         [string[]]$ChangedPaths
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'working_tree' }
+    if ($CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
     if (-not $PSBoundParameters.ContainsKey('ParentHead') -or -not $PSBoundParameters.ContainsKey('ChangedPaths')) {
         $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $CurrentHead) | Select-Object -First 1).Trim()) -split '\s+'
         $ParentHead = if ($identity.Count -eq 2) { $identity[1] } else { '' }
         $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead))
     }
     if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths)) {
-        throw "[$FailureTag] Expected $FormalPrepareRepoHead or its single direct two-file PrepareFormal checkpoint, got $CurrentHead."
+        throw "[$FailureTag] Expected $FormalPrepareRepoHead, approved checkpoint $FormalPrepareCheckpointHead, or its single direct two-file PrepareFormal checkpoint; got $CurrentHead."
     }
     return 'checkpoint'
+}
+
+function Assert-FormalPrepareRepoState {
+    param(
+        [Parameter(Mandatory = $true)][string]$OriginMain,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Staged,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Dirty,
+        [bool]$FixtureMode
+    )
+    if (-not $OriginMain.Equals($FormalPrepareOriginMain, [System.StringComparison]::OrdinalIgnoreCase) -or $Staged.Count -gt 0) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] origin/main changed or staged files exist.'
+    }
+    $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
+    if ($FixtureMode) {
+        $allowed += @('scripts/upgrade.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
+    }
+    $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
+    $unexpected = @($normalizedDirty | Where-Object { $_ -notin $allowed })
+    if ($unexpected.Count -gt 0) {
+        throw "[UPGRADE_PREPARE_BASIS_FAIL] Unexpected working-tree path(s): $($unexpected -join ', ')"
+    }
 }
 
 function Assert-FormalPrepareRepoBasis {
@@ -175,20 +200,10 @@ function Assert-FormalPrepareRepoBasis {
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
     if ($branch -ne 'main') { throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got $branch." }
     [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head)
-    if (-not $originMain.Equals($MixedRepairOriginMain, [System.StringComparison]::OrdinalIgnoreCase) -or $staged.Count -gt 0) {
-        throw '[UPGRADE_PREPARE_BASIS_FAIL] origin/main changed or staged files exist.'
-    }
-    $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
-    if ($FixtureMode) {
-        $allowed += @('scripts/upgrade.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
-    }
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }
     })
-    $unexpected = @($dirty | Where-Object { $_ -notin $allowed })
-    if ($unexpected.Count -gt 0) {
-        throw "[UPGRADE_PREPARE_BASIS_FAIL] Unexpected working-tree path(s): $($unexpected -join ', ')"
-    }
+    Assert-FormalPrepareRepoState -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
     $plan = New-UpgradePlan -Inputs ([pscustomobject]@{
         Mode = 'PrepareFormal'
         BuildVersion = $FormalPrepareTargetCommit.Substring(0, 7)
@@ -288,7 +303,8 @@ function ConvertFrom-FormalPrepareWslStat {
         [Parameter(Mandatory = $true)][string]$LinuxPath
     )
     $lines = @($StatOutput)
-    $match = if ($lines.Count -eq 1) { [regex]::Match([string]$lines[0], '^(\d+)\|(\d+)\|(\d+)\|regular file$') } else { $null }
+    # COMPAT: GNU stat names zero-byte ordinary files "regular empty file"; accept only its two exact ordinary-file descriptions.
+    $match = if ($lines.Count -eq 1) { [regex]::Match([string]$lines[0], '^(\d+)\|(\d+)\|(\d+)\|regular (?:empty )?file$') } else { $null }
     if ($ExitCode -ne 0 -or $null -eq $match -or -not $match.Success) {
         throw "[UPGRADE_PREPARE_SOURCE_FAIL] WSL metadata is not a regular file: $LinuxPath"
     }
