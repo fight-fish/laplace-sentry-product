@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'PrepareFormal', 'RepairMixedIsolated')]
+    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'PrepareFormal', 'ValidateFormalApply', 'ApplyFormalFixture', 'RecoverFormalFixture', 'ApplyFormalInternal', 'RecoverFormalInternal', 'RepairMixedIsolated')]
     [string]$Mode = 'DryRun',
 
     [string]$StagingRoot,
@@ -23,6 +23,9 @@ param(
     [ValidateSet('None', 'DirtySource', 'FrontendApply', 'BackendApply', 'Version', 'Smoke', 'Rollback')]
     [string]$FailureInjection = 'None',
 
+    [ValidateSet('None', 'BeforeManagedWrites', 'AfterFirstManagedWriteBeforeRecord', 'AfterFrontendManaged', 'AfterBackendManaged', 'BeforeBackendMarkerWrite', 'AfterBackendMarkerWriteBeforeRecord', 'BeforeFrontendMarkerWrite', 'AfterFrontendMarkerWriteBeforeRecord', 'AfterAllMarkers', 'AbruptAfterFirstManagedWriteBeforeRecord', 'RollbackBeforeFirstRestore', 'RuntimeAfterUpgradeLock', 'RuntimeBeforeFirstWrite', 'RuntimeBeforeMarkers', 'JournalDurabilityBeforeFirstWrite')]
+    [string]$FormalApplyFailureInjection = 'None',
+
     [string]$FrontendTarget = (Join-Path $env:LOCALAPPDATA 'LaplaceSentry'),
 
     [string]$BackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend',
@@ -35,17 +38,17 @@ param(
 Builds a safe Laplace Sentry upgrade plan or an isolated staging package.
 
 .DESCRIPTION
-Purpose: provide the policy-bearing upgrade plan, isolated transaction proofs, and formal read-only preflight.
+Purpose: provide the policy-bearing upgrade plan, isolated transaction proofs, formal read-only preflight, prepare evidence, apply eligibility validation, strict-TEMP recovery drills, and a locked internal formal-write capability.
 Inputs: repo sources, target paths, mode, staging/isolation/transaction roots, optional fixture observation, isolated action, failure injection, version override.
 Outputs: JSON plan/result on stdout; Stage writes package/backup/manifest; isolated modes write fake-target transaction evidence.
 SSOT Output: stdout JSON in DryRun/PreflightFormal, upgrade-plan.json in Stage, transaction-journal.json in isolated modes.
-Exit codes: 0 success, 2 preflight/argument failure, 3 isolated staging failure, 4 legacy isolated apply/rollback failure, 5 mixed repair proof failure.
+Exit codes: 0 success/eligible, 2 preflight/argument failure, 3 isolated staging failure, 4 legacy isolated apply/rollback failure, 5 mixed repair proof failure, 6 formal prepare failure, 7 formal apply eligibility rejection, 8 formal-apply interruption/indeterminate/rollback failure.
 Idempotency: read-only modes never write. Stage requires an empty/nonexistent StagingRoot. Isolated modes refuse an existing apply transaction and only permit explicit rollback.
-Side effects: Stage and isolated modes write only inside verified TEMP boundaries; formal targets and real processes are never touched.
+Side effects: Stage and isolated/fixture modes write only inside verified TEMP boundaries. ApplyFormalInternal/RecoverFormalInternal are non-public capabilities locked to fixed formal targets and one pre-existing formal transaction; this work order does not authorize invoking them.
 #>
 
-# 這支腳本在做什麼：建立安全升級計畫、只讀檢查正式環境，並用 TEMP 假目標證明 apply／rollback transaction。
-# 這支腳本不做什麼：不提供正式 apply 入口，不啟停真實程序，不更新正式 runtime 或正式版本。
+# 這支腳本在做什麼：建立安全升級計畫、只讀檢查正式環境，並用 TEMP 假目標證明 apply／rollback transaction 與中斷恢復。
+# 這支腳本不做什麼：不提供公開正式 apply 入口，不啟停真實程序；正式內部模式必須另有明確裁決才可執行。
 # 常改區塊：allowlist、Preflight 判定、保留資料清單、隔離 transaction 與 smoke 證明。
 # 不要亂動的區塊：Preflight 零寫入邊界、正式目標拒絕、Git blob 來源驗證、Backend/data 保護、journal 驅動 rollback。
 
@@ -390,6 +393,16 @@ function Assert-UpgradePreflight {
 
     if ($Inputs.Mode -eq 'PrepareFormal') {
         Assert-FormalPrepareBoundary -Inputs $Inputs
+        return
+    }
+
+    if ($Inputs.Mode -eq 'ValidateFormalApply') {
+        Assert-FormalApplyValidationBoundary -Inputs $Inputs
+        return
+    }
+
+    if ($Inputs.Mode -in @('ApplyFormalFixture', 'RecoverFormalFixture', 'ApplyFormalInternal', 'RecoverFormalInternal')) {
+        Assert-FormalApplyExecutionBoundary -Inputs $Inputs
         return
     }
 
@@ -2444,8 +2457,9 @@ function Invoke-MixedRepairMode {
     return Invoke-MixedRepairApply -Inputs $Inputs -JournalPath $journalPath
 }
 
-# PrepareFormal transaction details stay in the dedicated helper; this file keeps only dispatch and exit mapping.
+# PrepareFormal and formal-apply validation/fixture-drill details stay in dedicated helpers; this file keeps only dispatch and exit mapping.
 . (Join-Path $ScriptRoot 'upgrade_formal_prepare.ps1')
+. (Join-Path $ScriptRoot 'upgrade_formal_apply.ps1')
 
 $script:UpgradeExitCode = 0
 
@@ -2464,6 +2478,36 @@ function Invoke-UpgradeMain {
             $result = Invoke-FormalPrepareMode -Inputs $inputs
             $result | ConvertTo-Json -Depth 20 -Compress
             $script:UpgradeExitCode = 0
+            return
+        }
+        if ($inputs.Mode -eq 'ValidateFormalApply') {
+            $result = Invoke-FormalApplyValidationMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 20 -Compress
+            $script:UpgradeExitCode = if ($result.eligible) { 0 } else { 7 }
+            return
+        }
+        if ($inputs.Mode -eq 'ApplyFormalFixture') {
+            $result = Invoke-FormalApplyFixtureMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 30 -Compress
+            $script:UpgradeExitCode = if ($result.result -in @('installed_pending_acceptance', 'rolled_back')) { 0 } else { 8 }
+            return
+        }
+        if ($inputs.Mode -eq 'RecoverFormalFixture') {
+            $result = Invoke-FormalApplyFixtureRecoveryMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 30 -Compress
+            $script:UpgradeExitCode = if ($result.result -eq 'rolled_back') { 0 } else { 8 }
+            return
+        }
+        if ($inputs.Mode -eq 'ApplyFormalInternal') {
+            $result = Invoke-FormalApplyInternalMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 30 -Compress
+            $script:UpgradeExitCode = if ($result.result -in @('installed_pending_acceptance', 'rolled_back')) { 0 } else { 8 }
+            return
+        }
+        if ($inputs.Mode -eq 'RecoverFormalInternal') {
+            $result = Invoke-FormalApplyInternalRecoveryMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 30 -Compress
+            $script:UpgradeExitCode = if ($result.result -eq 'rolled_back') { 0 } else { 8 }
             return
         }
         if ($inputs.Mode -eq 'RepairMixedIsolated') {
@@ -2513,6 +2557,22 @@ function Invoke-UpgradeMain {
             $failureResult | ConvertTo-Json -Depth 12 -Compress
             [Console]::Error.WriteLine("[UPGRADE_PREPARE_FAIL] $failureMessage")
             $script:UpgradeExitCode = 6
+            return
+        }
+        if ($Mode -eq 'ValidateFormalApply') {
+            $failureMessage = "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+            $failureResult = New-FormalApplyValidationFailureResult -Inputs $inputs -Message $failureMessage
+            $failureResult | ConvertTo-Json -Depth 20 -Compress
+            [Console]::Error.WriteLine("[UPGRADE_APPLY_VALIDATION_FAIL] $failureMessage")
+            $script:UpgradeExitCode = 7
+            return
+        }
+        if ($Mode -in @('ApplyFormalFixture', 'RecoverFormalFixture', 'ApplyFormalInternal', 'RecoverFormalInternal')) {
+            $failureMessage = "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+            $failureResult = New-FormalApplyFixtureFailureResult -Inputs $inputs -Message $failureMessage
+            $failureResult | ConvertTo-Json -Depth 20 -Compress
+            [Console]::Error.WriteLine("[UPGRADE_APPLY_EXECUTION_FAIL] $failureMessage")
+            $script:UpgradeExitCode = 8
             return
         }
         $tag = if ($Mode -eq 'Stage') { 'UPGRADE_STAGE_FAIL' } elseif ($Mode -eq 'ApplyIsolated') { 'UPGRADE_ISOLATED_FAIL' } elseif ($Mode -eq 'RepairMixedIsolated') { 'UPGRADE_MIXED_FAIL' } else { 'UPGRADE_PREFLIGHT_FAIL' }

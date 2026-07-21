@@ -24,8 +24,16 @@ Set-StrictMode -Version Latest
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
 $FormalPrepareRepoHead = '942b418b23c86bda1f8a7382877798d0d89279b0'
 $FormalPrepareCheckpointHead = '97165869fb82f6eeb1bf3803fbe868d20532ffc7'
+$FormalPrepareApplyCheckpointHead = '175dc2f1000e17e3977e856fd2501e7afa40690b'
 $FormalPrepareOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $FormalPrepareCheckpointPaths = @(
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1'
+)
+$FormalPrepareApplyCheckpointPaths = @(
+    'scripts/upgrade.ps1',
+    'scripts/upgrade_formal_apply.ps1',
+    'tests/upgrade_formal_apply_smoke.ps1',
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
 )
@@ -136,7 +144,7 @@ function Assert-FormalPrepareBoundary {
 # 前置檢查與 canonical 證據
 # =========================
 
-# checkpoint 相容只接受兩個已驗收錨點，或 9716586 的單一精確兩檔直接子提交；不接受任意 descendant。
+# checkpoint 相容只接受三個已驗收錨點，以及各自核准的單一精確直接子提交；不接受任意 descendant。
 function Test-FormalPrepareCheckpointShape {
     param(
         [Parameter(Mandatory = $true)][string]$CurrentHead,
@@ -144,10 +152,16 @@ function Test-FormalPrepareCheckpointShape {
         [Parameter(Mandatory = $true)][string[]]$ChangedPaths
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-    if (-not $ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     $actual = @($ChangedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
-    $expected = @($FormalPrepareCheckpointPaths | Sort-Object -Unique)
+    $expected = if ($ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        @($FormalPrepareCheckpointPaths | Sort-Object -Unique)
+    }
+    elseif ($ParentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        @($FormalPrepareApplyCheckpointPaths | Sort-Object -Unique)
+    }
+    else { return $false }
     return $actual.Count -eq $expected.Count -and @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual).Count -eq 0
 }
 
@@ -159,14 +173,15 @@ function Assert-FormalPrepareCheckpointBasis {
         [string[]]$ChangedPaths
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'working_tree' }
-    if ($CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
+    if ($CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
     if (-not $PSBoundParameters.ContainsKey('ParentHead') -or -not $PSBoundParameters.ContainsKey('ChangedPaths')) {
         $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $CurrentHead) | Select-Object -First 1).Trim()) -split '\s+'
         $ParentHead = if ($identity.Count -eq 2) { $identity[1] } else { '' }
         $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead))
     }
     if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths)) {
-        throw "[$FailureTag] Expected $FormalPrepareRepoHead, approved checkpoint $FormalPrepareCheckpointHead, or its single direct two-file PrepareFormal checkpoint; got $CurrentHead."
+        throw "[$FailureTag] Expected an approved prepare/apply checkpoint anchor or its exact single authorized direct child; got $CurrentHead."
     }
     return 'checkpoint'
 }
@@ -183,7 +198,7 @@ function Assert-FormalPrepareRepoState {
     }
     $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
     if ($FixtureMode) {
-        $allowed += @('scripts/upgrade.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
+        $allowed += $FormalPrepareApplyCheckpointPaths
     }
     $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
     $unexpected = @($normalizedDirty | Where-Object { $_ -notin $allowed })
