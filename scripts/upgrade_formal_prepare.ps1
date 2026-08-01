@@ -37,7 +37,8 @@ $FormalPrepareApplyCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
 )
-$FormalPrepareTargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+$FormalPrepareFixtureDirtyPaths = @($FormalPrepareApplyCheckpointPaths + 'tests/upgrade_mixed_repair_smoke.ps1')
+$FormalUpgradeTargetCommit = 'd9bd8b21fb47a07154d0c730f90dab9ec69b85f1'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
 $FormalPrepareJournalReserveBytes = [int64](1MB)
 $FormalPrepareSafetyMarginBytes = [int64](64MB)
@@ -155,13 +156,16 @@ function Test-FormalPrepareCheckpointShape {
         $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
         $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     $actual = @($ChangedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
-    $expected = if ($ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) {
-        @($FormalPrepareCheckpointPaths | Sort-Object -Unique)
+    $isPrepareCheckpointChild = $ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
+    $isApplyCheckpointChild = $ParentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
+    if ($isPrepareCheckpointChild) {
+        $expected = @($FormalPrepareCheckpointPaths)
     }
-    elseif ($ParentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) {
-        @($FormalPrepareApplyCheckpointPaths | Sort-Object -Unique)
+    elseif ($isApplyCheckpointChild) {
+        $expected = @($FormalPrepareApplyCheckpointPaths)
     }
     else { return $false }
+    $expected = @($expected | Sort-Object -Unique)
     return $actual.Count -eq $expected.Count -and @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual).Count -eq 0
 }
 
@@ -198,7 +202,7 @@ function Assert-FormalPrepareRepoState {
     }
     $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
     if ($FixtureMode) {
-        $allowed += $FormalPrepareApplyCheckpointPaths
+        $allowed += $FormalPrepareFixtureDirtyPaths
     }
     $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
     $unexpected = @($normalizedDirty | Where-Object { $_ -notin $allowed })
@@ -221,7 +225,7 @@ function Assert-FormalPrepareRepoBasis {
     Assert-FormalPrepareRepoState -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
     $plan = New-UpgradePlan -Inputs ([pscustomobject]@{
         Mode = 'PrepareFormal'
-        BuildVersion = $FormalPrepareTargetCommit.Substring(0, 7)
+        BuildVersion = $FormalUpgradeTargetCommit.Substring(0, 7)
         Timestamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
         StagingRoot = Join-Path $TempRoot 'LaplaceSentryPreparePlan-ReadOnly'
         FrontendTarget = $FormalFrontendTarget
@@ -418,10 +422,10 @@ function Get-FormalPrepareRequiredSpace {
         (Join-Path $Inputs.BackendTarget 'data\projects.json')
     )) { $preimageBytes += [int64](Get-Item -LiteralPath $path -Force -ErrorAction Stop).Length }
     $packageBytes = [int64]0
-    foreach ($path in @(Get-ExpectedManagedGitPaths -Commit $FormalPrepareTargetCommit)) {
-        $packageBytes += [int64]((Get-GitOutput -Arguments @('cat-file', '-s', "$FormalPrepareTargetCommit`:$path") | Select-Object -First 1).Trim())
+    foreach ($path in @(Get-ExpectedManagedGitPaths -Commit $FormalUpgradeTargetCommit)) {
+        $packageBytes += [int64]((Get-GitOutput -Arguments @('cat-file', '-s', "$FormalUpgradeTargetCommit`:$path") | Select-Object -First 1).Trim())
     }
-    $packageBytes += [int64](2 * [System.Text.Encoding]::ASCII.GetByteCount($FormalPrepareTargetCommit.Substring(0, 7)))
+    $packageBytes += [int64](2 * [System.Text.Encoding]::ASCII.GetByteCount($FormalUpgradeTargetCommit.Substring(0, 7)))
     $required = $preimageBytes + (2 * $packageBytes) + $FormalPrepareJournalReserveBytes + $FormalPrepareSafetyMarginBytes
     return [pscustomobject]@{ preimage_bytes = $preimageBytes; package_bytes = $packageBytes; required_free_bytes = [int64]$required }
 }
@@ -644,10 +648,13 @@ function Find-FormalPreparedTransaction {
         }
         try { $journal = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
         catch { throw '[UPGRADE_PREPARE_RECOVERY_REQUIRED] Transaction journal is unreadable or corrupt.' }
+        if ($journal.state -eq 'invalidated') {
+            continue
+        }
         if ($journal.state -ne 'prepared_pending_apply') {
             throw "[UPGRADE_PREPARE_RECOVERY_REQUIRED] Transaction requires explicit recovery: $($journal.state)"
         }
-        if ($journal.target_commit -eq $FormalPrepareTargetCommit -and
+        if ($journal.target_commit -eq $FormalUpgradeTargetCommit -and
             $journal.software_state_id -eq $Snapshot.software_state_id -and
             $journal.evidence_state_id -eq $Snapshot.evidence_state_id) {
             Assert-FormalPrepareTransactionIntegrity -TransactionRoot $directory.FullName -Journal $journal
@@ -788,7 +795,7 @@ function Invoke-FormalPrepareMode {
         transaction_parent = $transactionParent
         fixture_mode = $fixtureMode
         repo_head = Get-HeadCommit
-        target_commit = $FormalPrepareTargetCommit
+        target_commit = $FormalUpgradeTargetCommit
         targets = [pscustomobject]@{ frontend = $Inputs.FrontendTarget; backend = $Inputs.BackendTarget }
         software_state_id = $snapshot.software_state_id
         target_inventory_id = $snapshot.target_inventory_id

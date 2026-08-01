@@ -1,6 +1,6 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'PrepareFormal', 'ValidateFormalApply', 'ApplyFormalFixture', 'RecoverFormalFixture', 'ApplyFormalInternal', 'RecoverFormalInternal', 'RepairMixedIsolated')]
+    [ValidateSet('DryRun', 'Stage', 'ApplyIsolated', 'PreflightFormal', 'PrepareFormal', 'InvalidateFormalInternal', 'ValidateFormalApply', 'ApplyFormalFixture', 'RecoverFormalFixture', 'ApplyFormalInternal', 'RecoverFormalInternal', 'RepairMixedIsolated')]
     [string]$Mode = 'DryRun',
 
     [string]$StagingRoot,
@@ -63,7 +63,7 @@ $TempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimE
 $FormalFrontendTarget = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
 $MixedRepairOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
-$MixedRepairTargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+
 $MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
 $MixedRepairMarker = '1e7bc2b'
 $MixedRepairSchema = 'laplace-mixed-source-v1'
@@ -393,6 +393,11 @@ function Assert-UpgradePreflight {
 
     if ($Inputs.Mode -eq 'PrepareFormal') {
         Assert-FormalPrepareBoundary -Inputs $Inputs
+        return
+    }
+
+    if ($Inputs.Mode -eq 'InvalidateFormalInternal') {
+        Assert-FormalInvalidateInternalBoundary -Inputs $Inputs
         return
     }
 
@@ -1261,9 +1266,9 @@ function Get-MixedActualManagedFiles {
 function Resolve-MixedRepairLayout {
     param([Parameter(Mandatory = $true)]$Inputs)
 
-    $expectedPaths = @(Get-ExpectedManagedGitPaths -Commit $MixedRepairTargetCommit)
+    $expectedPaths = @(Get-ExpectedManagedGitPaths -Commit $FormalUpgradeTargetCommit)
     if ($expectedPaths.Count -ne 26) {
-        throw "[UPGRADE_MIXED_SOURCE_FAIL] Expected 26 managed paths at 971ba49, got $($expectedPaths.Count)."
+        throw "[UPGRADE_MIXED_SOURCE_FAIL] Expected 26 managed paths at formal target commit, got $($expectedPaths.Count)."
     }
     $actual = @()
     $actual += Get-MixedActualManagedFiles -TargetRoot $Inputs.FrontendTarget -GitPrefix 'Frontend' -Allowlist $FrontendAllowlist
@@ -1277,7 +1282,7 @@ function Resolve-MixedRepairLayout {
         $relative = $gitPath.Substring($side.Length + 1)
         $targetRoot = if ($side -eq 'Frontend') { $Inputs.FrontendTarget } else { $Inputs.BackendTarget }
         $targetPath = Join-Path $targetRoot $relative.Replace('/', '\')
-        $packageBlob = (Get-GitOutput -Arguments @('rev-parse', "$MixedRepairTargetCommit`:$gitPath") | Select-Object -First 1).Trim()
+        $packageBlob = (Get-GitOutput -Arguments @('rev-parse', "$FormalUpgradeTargetCommit`:$gitPath") | Select-Object -First 1).Trim()
         $expectedSourceBlob = if ($gitPath -eq 'Frontend/src/backend/adapter.py') {
             (Get-GitOutput -Arguments @('rev-parse', "$MixedRepairAdapterCommit`:$gitPath") | Select-Object -First 1).Trim()
         }
@@ -1435,7 +1440,7 @@ function Export-MixedGitPackage {
     $pathSpecs = @()
     $pathSpecs += @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_.Replace('\', '/') })
     $pathSpecs += @($BackendAllowlist | ForEach-Object { 'Backend/' + $_.Replace('\', '/') })
-    [void](Get-GitOutput -Arguments (@('archive', '--format=zip', "--output=$archivePath", $MixedRepairTargetCommit, '--') + $pathSpecs))
+    [void](Get-GitOutput -Arguments (@('archive', '--format=zip', "--output=$archivePath", $FormalUpgradeTargetCommit, '--') + $pathSpecs))
     Expand-Archive -LiteralPath $archivePath -DestinationPath $packageRoot -Force
     Remove-Item -LiteralPath $archivePath -Force
 
@@ -1476,7 +1481,7 @@ function Export-MixedGitPackage {
     $markers = @{}
     foreach ($side in @('Backend', 'Frontend')) {
         $path = Join-Path $markerRoot "$side-version.txt"
-        $MixedRepairTargetCommit.Substring(0, 7) | Set-Content -LiteralPath $path -Encoding ASCII -NoNewline
+        $FormalUpgradeTargetCommit.Substring(0, 7) | Set-Content -LiteralPath $path -Encoding ASCII -NoNewline
         $item = Get-Item -LiteralPath $path -Force
         $markers[$side] = [pscustomobject]@{ path = $path; sha256 = Get-FileSha256 $path; length = [int64]$item.Length; last_write_utc = $item.LastWriteTimeUtc.ToString('o') }
     }
@@ -2047,7 +2052,7 @@ function New-MixedRepairTransaction {
         transaction_id = $transactionId
         mode = 'RepairMixedIsolated'
         state = 'prepared'
-        target_commit = $MixedRepairTargetCommit
+        target_commit = $FormalUpgradeTargetCommit
         source_adapter_commit = $MixedRepairAdapterCommit
         source_marker = $MixedRepairMarker
         fixture_variant = $MixedFixtureVariant
@@ -2256,7 +2261,7 @@ function Assert-MixedRepairJournalBoundary {
         [Parameter(Mandatory = $true)]$Journal
     )
     if ($Journal.transaction_id -notmatch '^[0-9a-fA-F]{32}$' -or $Journal.schema -ne $MixedRepairSchema -or
-        $Journal.mode -ne 'RepairMixedIsolated' -or $Journal.target_commit -ne $MixedRepairTargetCommit) {
+        $Journal.mode -ne 'RepairMixedIsolated' -or $Journal.target_commit -ne $FormalUpgradeTargetCommit) {
         throw '[UPGRADE_MIXED_TRANSACTION_FAIL] Journal identity/schema/target commit is invalid.'
     }
     foreach ($pair in @(
@@ -2460,6 +2465,7 @@ function Invoke-MixedRepairMode {
 # PrepareFormal and formal-apply validation/fixture-drill details stay in dedicated helpers; this file keeps only dispatch and exit mapping.
 . (Join-Path $ScriptRoot 'upgrade_formal_prepare.ps1')
 . (Join-Path $ScriptRoot 'upgrade_formal_apply.ps1')
+. (Join-Path $ScriptRoot 'upgrade_formal_invalidate.ps1')
 
 $script:UpgradeExitCode = 0
 
@@ -2476,6 +2482,12 @@ function Invoke-UpgradeMain {
         }
         if ($inputs.Mode -eq 'PrepareFormal') {
             $result = Invoke-FormalPrepareMode -Inputs $inputs
+            $result | ConvertTo-Json -Depth 20 -Compress
+            $script:UpgradeExitCode = 0
+            return
+        }
+        if ($inputs.Mode -eq 'InvalidateFormalInternal') {
+            $result = Invoke-FormalInvalidateInternalMode -Inputs $inputs
             $result | ConvertTo-Json -Depth 20 -Compress
             $script:UpgradeExitCode = 0
             return
@@ -2559,7 +2571,14 @@ function Invoke-UpgradeMain {
             $script:UpgradeExitCode = 6
             return
         }
-        if ($Mode -eq 'ValidateFormalApply') {
+        if ($Mode -eq 'InvalidateFormalInternal') {
+            $failureMessage = "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+            $failureResult = New-FormalInvalidateFailureResult -Inputs $inputs -Message $failureMessage
+            $failureResult | ConvertTo-Json -Depth 20 -Compress
+            [Console]::Error.WriteLine("[UPGRADE_INVALIDATE_FAIL] $failureMessage")
+            $script:UpgradeExitCode = 9
+            return
+        }        if ($Mode -eq 'ValidateFormalApply') {
             $failureMessage = "$($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
             $failureResult = New-FormalApplyValidationFailureResult -Inputs $inputs -Message $failureMessage
             $failureResult | ConvertTo-Json -Depth 20 -Compress

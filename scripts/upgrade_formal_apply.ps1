@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 驗證一筆明確指定的 PrepareFormal 交易是否仍具備正式套用資格，但不執行套用。
 
@@ -174,6 +174,9 @@ function Assert-FormalApplyTransactionIdentity {
             throw "[UPGRADE_APPLY_TRANSACTION_FAIL] Journal is missing required field: $required"
         }
     }
+    if ([string]$Journal.state -eq 'invalidated') {
+        throw '[UPGRADE_APPLY_TRANSACTION_INVALIDATED] Selected transaction was invalidated and cannot be applied or recovered.'
+    }
     if ($Journal.schema -ne $FormalPrepareSchema -or $Journal.mode -ne 'PrepareFormal' -or
         $Journal.state -ne 'prepared_pending_apply' -or [int]$Journal.formal_target_write_count -ne 0) {
         throw '[UPGRADE_APPLY_TRANSACTION_FAIL] Journal schema, mode, state, or zero-write seal is invalid.'
@@ -190,7 +193,7 @@ function Assert-FormalApplyTransactionIdentity {
         -not (Test-PathsEqual -First $Inputs.BackendTarget -Second ([string]$Journal.targets.backend))) {
         throw '[UPGRADE_APPLY_TRANSACTION_FAIL] Journal targets disagree with the explicitly selected targets.'
     }
-    if (-not $Journal.target_commit.Equals($FormalPrepareTargetCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $Journal.target_commit.Equals($FormalUpgradeTargetCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '[UPGRADE_APPLY_TRANSACTION_FAIL] Journal target commit is not the ruled formal target commit.'
     }
 }
@@ -228,7 +231,7 @@ function Assert-FormalApplyNoCompetingTransaction {
         }
         try { $sibling = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
         catch { throw '[UPGRADE_APPLY_TRANSACTION_FAIL] A sibling transaction journal is unreadable.' }
-        if ([string]$sibling.state -notin @('committed', 'rolled_back')) {
+        if ([string]$sibling.state -notin @('committed', 'rolled_back', 'invalidated')) {
             throw "[UPGRADE_APPLY_TRANSACTION_FAIL] A competing nonterminal transaction exists: $($directory.Name) state=$($sibling.state)"
         }
     }
@@ -333,7 +336,7 @@ function Assert-FormalApplyPackageContract {
     $expected = @($managedLayout.git_path) + @('Backend/version.txt', 'Frontend/version.txt')
     Assert-FormalApplyKeySet -Name 'package' -Expected $expected -Actual @($PackageManifest.records.key)
     foreach ($record in @($PackageManifest.records | Where-Object { $_.key -in @('Backend/version.txt', 'Frontend/version.txt') })) {
-        if ($record.git_blob -or ((Get-Content -LiteralPath $record.artifact_path -Raw -Encoding UTF8).Trim()) -cne $FormalPrepareTargetCommit.Substring(0, 7)) {
+        if ($record.git_blob -or ((Get-Content -LiteralPath $record.artifact_path -Raw -Encoding UTF8).Trim()) -cne $FormalUpgradeTargetCommit.Substring(0, 7)) {
             throw "[UPGRADE_APPLY_EVIDENCE_FAIL] Package marker is invalid: $($record.key)"
         }
     }
