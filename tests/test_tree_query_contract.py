@@ -1,37 +1,23 @@
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from tests._tree_query_contract_bootstrap import load_backend_daemon, load_module_from_path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BACKEND_ROOT = REPO_ROOT / "Backend"
 ADAPTER_PATH = REPO_ROOT / "Frontend" / "src" / "backend" / "adapter.py"
 
-sys.path.insert(0, str(BACKEND_ROOT))
 
-from src.core import daemon  # noqa: E402
-
-
-def _load_frontend_adapter_module():
-    spec = importlib.util.spec_from_file_location("sentry_frontend_adapter_contract", ADAPTER_PATH)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Unable to load Frontend adapter module for contract tests.")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-frontend_adapter = _load_frontend_adapter_module()
+daemon = load_backend_daemon(REPO_ROOT)
+frontend_adapter = load_module_from_path("sentry_frontend_adapter_contract", ADAPTER_PATH)
 
 
 class TreeQueryContractTests(unittest.TestCase):
