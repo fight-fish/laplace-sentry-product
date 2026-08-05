@@ -25,6 +25,9 @@ $FormalPrepareSchema = 'laplace-formal-prepare-v1'
 $FormalPrepareRepoHead = '942b418b23c86bda1f8a7382877798d0d89279b0'
 $FormalPrepareCheckpointHead = '97165869fb82f6eeb1bf3803fbe868d20532ffc7'
 $FormalPrepareApplyCheckpointHead = '175dc2f1000e17e3977e856fd2501e7afa40690b'
+$FormalPrepareInvalidatedCheckpointHead = '0dfd996d11d72b188e1ae4c2407eb138140dbafb'
+# 決策 227 核准的五檔測試基線；只接受此精確 commit，不接受任意後續 descendant。
+$FormalPrepareTestBaselineHead = 'ff66dafb2e89491ec53976198231bee95e5b0dc7'
 $FormalPrepareOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $FormalPrepareCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
@@ -34,6 +37,10 @@ $FormalPrepareApplyCheckpointPaths = @(
     'scripts/upgrade.ps1',
     'scripts/upgrade_formal_apply.ps1',
     'tests/upgrade_formal_apply_smoke.ps1',
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1'
+)
+$FormalPrepareInvalidatedCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
 )
@@ -145,7 +152,7 @@ function Assert-FormalPrepareBoundary {
 # 前置檢查與 canonical 證據
 # =========================
 
-# checkpoint 相容只接受三個已驗收錨點，以及各自核准的單一精確直接子提交；不接受任意 descendant。
+# checkpoint 相容只接受五個已驗收錨點，以及各自核准的單一精確直接子提交；不接受任意 descendant。
 function Test-FormalPrepareCheckpointShape {
     param(
         [Parameter(Mandatory = $true)][string]$CurrentHead,
@@ -154,15 +161,21 @@ function Test-FormalPrepareCheckpointShape {
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase) -or
         $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareTestBaselineHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     $actual = @($ChangedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
     $isPrepareCheckpointChild = $ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
     $isApplyCheckpointChild = $ParentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
+    $isInvalidatedCheckpointChild = $ParentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
     if ($isPrepareCheckpointChild) {
         $expected = @($FormalPrepareCheckpointPaths)
     }
     elseif ($isApplyCheckpointChild) {
         $expected = @($FormalPrepareApplyCheckpointPaths)
+    }
+    elseif ($isInvalidatedCheckpointChild) {
+        $expected = @($FormalPrepareInvalidatedCheckpointPaths)
     }
     else { return $false }
     $expected = @($expected | Sort-Object -Unique)
@@ -178,7 +191,9 @@ function Assert-FormalPrepareCheckpointBasis {
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'working_tree' }
     if ($CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
+        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $CurrentHead.Equals($FormalPrepareTestBaselineHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
     if (-not $PSBoundParameters.ContainsKey('ParentHead') -or -not $PSBoundParameters.ContainsKey('ChangedPaths')) {
         $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $CurrentHead) | Select-Object -First 1).Trim()) -split '\s+'
         $ParentHead = if ($identity.Count -eq 2) { $identity[1] } else { '' }
@@ -211,13 +226,22 @@ function Assert-FormalPrepareRepoState {
     }
 }
 
+function Assert-FormalPrepareMainBranch {
+    param([AllowNull()][string]$BranchOutput)
+    $branch = ([string]$BranchOutput).Trim()
+    if ([string]::IsNullOrWhiteSpace($branch)) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got detached HEAD.'
+    }
+    if ($branch -ne 'main') { throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got $branch." }
+    return $branch
+}
+
 function Assert-FormalPrepareRepoBasis {
     param([bool]$FixtureMode)
-    $branch = (Get-GitOutput -Arguments @('branch', '--show-current') | Select-Object -First 1).Trim()
+    $branch = Assert-FormalPrepareMainBranch -BranchOutput (Get-GitOutput -Arguments @('branch', '--show-current') | Select-Object -First 1)
     $head = Get-HeadCommit
     $originMain = (Get-GitOutput -Arguments @('rev-parse', 'origin/main') | Select-Object -First 1).Trim()
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
-    if ($branch -ne 'main') { throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got $branch." }
     [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head)
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }

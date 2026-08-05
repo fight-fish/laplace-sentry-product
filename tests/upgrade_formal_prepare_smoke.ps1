@@ -1,5 +1,11 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [ValidateSet('all', 'basis-only', 'metadata', 'formal-boundary', 'success', 'runtime-rejection', 'acl-rejection', 'source-rejection', 'transaction-boundary', 'failure-injection', 'reentry-cleanup')]
+    [string[]]$Group = @('all'),
+
+    [ValidateSet('all', 'success-and-rerun', 'active-lock', 'owned-ui', 'owned-daemon', 'owned-worker', 'ambiguous-runtime', 'acl-reject', 'owner-reject', 'space-reject', 'adapter-drift', 'tray-drift', 'marker-drift', 'transaction-overlap', 'transaction-unc', 'transaction-reparse', 'inject-preimage', 'inject-package', 'inject-prepare', 'inject-journal', 'inject-secondsnapshot', 'inject-evidencetamper', 'incomplete-rerun', 'evidence-tamper-rerun', 'multiple-transactions')]
+    [string[]]$Case = @('all')
+)
 
 <#
 .SYNOPSIS
@@ -36,16 +42,80 @@ $FormalFrontend = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackend = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
 $FormalBackendLinux = '/home/serpal/.laplace_sentry_backend'
 $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade'
-$TargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+# 直接載入正式目標與純 basis 判定，避免 smoke test 自帶第二份 formal target。
+. (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1')
+
+$TargetCommit = $FormalUpgradeTargetCommit
+$TargetShort = $TargetCommit.Substring(0, 7)
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
 $SourceMarker = '1e7bc2b'
 $FixedTime = [DateTime]::Parse('2024-01-02T03:04:05.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
 $FrontendAllowlist = @('assets', 'src', 'requirements.txt', 'run_ui.bat', 'run_ui.vbs', 'run_dev_ui.bat')
 $BackendAllowlist = @('main.py', 'requirements.txt', 'src')
 $JunctionPath = $null
+$SelectedGroups = @($Group)
+$SelectedCases = @($Case)
+$RunAllCases = $SelectedCases -contains 'all'
+$RunAllGroups = $SelectedGroups -contains 'all'
+$script:FormalBefore = $null
 
-# 直接載入純 basis 判定，才能在不寫入 repo Git 的前提下模擬合法 checkpoint。
-. (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1')
+function Test-SmokeGroup {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return [bool]($RunAllGroups -or ($SelectedGroups -contains $Name))
+}
+
+function Invoke-SmokeGroup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+    if (-not (Test-SmokeGroup $Name)) {
+        Write-Output "prepare smoke group: SKIP name=$Name"
+        return
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    Write-Output "prepare smoke group: START name=$Name"
+    try {
+        & $Action
+        $watch.Stop()
+        Write-Output "prepare smoke group: PASS name=$Name duration_ms=$($watch.ElapsedMilliseconds)"
+    }
+    catch {
+        $watch.Stop()
+        Write-Output ("prepare smoke group: FAIL name={0} duration_ms={1} error={2}" -f $Name, $watch.ElapsedMilliseconds, $_.Exception.Message)
+        throw
+    }
+}
+
+function Test-SmokeCase {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return [bool]($RunAllCases -or ($SelectedCases -contains $Name))
+}
+
+
+function Invoke-SmokeCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+    if (-not (Test-SmokeCase $Name)) {
+        Write-Output "prepare smoke case: SKIP name=$Name"
+        return
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    Write-Output "prepare smoke case: START name=$Name"
+    try {
+        & $Action
+        $watch.Stop()
+        Write-Output "prepare smoke case: PASS name=$Name duration_ms=$($watch.ElapsedMilliseconds)"
+    }
+    catch {
+        $watch.Stop()
+        Write-Output ("prepare smoke case: FAIL name={0} duration_ms={1} error={2}" -f $Name, $watch.ElapsedMilliseconds, $_.Exception.Message)
+        throw
+    }
+}
+
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -115,28 +185,44 @@ function Assert-ProductionWslMetadataSeam {
 function Assert-CheckpointBasisContract {
     $syntheticPrepareHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     $syntheticApplyHead = 'dddddddddddddddddddddddddddddddddddddddd'
+    $syntheticInvalidatedHead = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     $syntheticGrandchild = 'cccccccccccccccccccccccccccccccccccccccc'
     $priorRepoHead = '3f3321046a0f32691ca63ad67c887f32188b7ffc'
     $preparePaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
     $applyPaths = @('scripts/upgrade.ps1', 'scripts/upgrade_formal_apply.ps1', 'tests/upgrade_formal_apply_smoke.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
+    $invalidatedPaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
+    $fixtureDirtyPaths = $applyPaths + 'tests/upgrade_mixed_repair_smoke.ps1'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareRepoHead -ParentHead '' -ChangedPaths @()) -eq 'working_tree') 'Original working-tree basis was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved first checkpoint was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareApplyCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved apply checkpoint anchor was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareInvalidatedCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved invalidated checkpoint anchor was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareTestBaselineHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Decision 227 approved test baseline was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticPrepareHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths $preparePaths) -eq 'checkpoint') 'Legal direct two-file PrepareFormal checkpoint was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths $applyPaths) -eq 'checkpoint') 'Legal direct five-file ValidateFormalApply checkpoint was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths $invalidatedPaths) -eq 'checkpoint') 'Legal direct checkpoint-lineage repair was rejected.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticPrepareHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $preparePaths)) 'A sibling checkpoint from the original basis was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticApplyHead -ChangedPaths $applyPaths)) 'An arbitrary checkpoint descendant was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticInvalidatedHead -ChangedPaths $invalidatedPaths)) 'An arbitrary invalidated-checkpoint descendant was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticPrepareHead -ParentHead $priorRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $preparePaths))) 'Prior three-file checkpoint lineage was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead ('b' * 40) -ChangedPaths $applyPaths)) 'Wrong checkpoint parent was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths @('scripts/upgrade.ps1'))) 'Partial apply checkpoint was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths ($applyPaths + 'sixth-file.txt'))) 'Apply checkpoint with an extra file was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths ($applyPaths | Where-Object { $_ -ne 'scripts/upgrade_formal_apply.ps1' }))) 'Apply checkpoint with a missing path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead ('b' * 40) -ChangedPaths $invalidatedPaths)) 'Checkpoint-lineage repair with a wrong parent was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths @('scripts/upgrade_formal_prepare.ps1'))) 'Checkpoint-lineage repair with a missing path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths ($invalidatedPaths + 'third-file.txt'))) 'Checkpoint-lineage repair with an extra file was accepted.'
 
     Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false
-    Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty ($applyPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
+    Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty ($fixtureDirtyPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain ('f' * 40) -Staged @() -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Wrong origin/main was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Staged changes were accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty @('unexpected.txt') -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Unexpected dirty path was accepted.'
+}
+
+function Assert-BranchGuardContract {
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main') -eq 'main') 'The main branch was rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'A non-main branch was accepted.'
 }
 
 function Assert-StrictTempPath {
@@ -159,6 +245,58 @@ function Get-Sha {
 function Quote-Argument {
     param([Parameter(Mandatory = $true)][string]$Value)
     return '"' + $Value.Replace('"', '\"') + '"'
+}
+
+function New-PrepareHarnessEntryScript {
+    param([Parameter(Mandatory = $true)]$Case)
+    $entry = Join-Path $Case.Root 'prepare-harness-entry.ps1'
+    Assert-StrictTempPath $entry
+    $repoLiteral = $RepoRoot.Replace("'", "''")
+    $content = @"
+[CmdletBinding()]
+param(
+    [ValidateSet('PrepareFormal')]
+    [string]`$Mode = 'PrepareFormal',
+
+    [string]`$IsolationRoot,
+    [string]`$TransactionRoot,
+    [string]`$FrontendTarget,
+    [string]`$BackendTarget,
+    [string]`$PreflightObservationPath,
+
+    [ValidateSet('None', 'Preimage', 'Package', 'Prepare', 'Journal', 'SecondSnapshot', 'EvidenceTamper')]
+    [string]`$MixedFailureInjection = 'None'
+)
+
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+
+`$RepoRoot = '$repoLiteral'
+`$PrepareScript = Join-Path `$RepoRoot 'scripts\upgrade_formal_prepare.ps1'
+`$UpgradeScript = Join-Path `$RepoRoot 'scripts\upgrade.ps1'
+
+# Import the shared formal prepare constants from the production helper, then
+# publish them to this child process so helper functions invoked through
+# upgrade.ps1 do not depend on a second target truth in the smoke test.
+. `$PrepareScript
+foreach (`$variable in @(Get-Variable -Name 'FormalPrepare*','FormalUpgradeTargetCommit' -ErrorAction SilentlyContinue)) {
+    Set-Variable -Scope Global -Name `$variable.Name -Value `$variable.Value
+}
+
+`$invokeParams = @{
+    Mode = `$Mode
+    IsolationRoot = `$IsolationRoot
+    TransactionRoot = `$TransactionRoot
+    FrontendTarget = `$FrontendTarget
+    BackendTarget = `$BackendTarget
+    PreflightObservationPath = `$PreflightObservationPath
+    MixedFailureInjection = `$MixedFailureInjection
+}
+& `$UpgradeScript @invokeParams
+exit `$LASTEXITCODE
+"@
+    $content | Set-Content -LiteralPath $entry -Encoding UTF8
+    return $entry
 }
 
 function Get-ExpectedManagedPaths {
@@ -344,6 +482,25 @@ function Get-FormalBoundaryCanonical {
     return @($parts | Sort-Object) -join "`n"
 }
 
+function Stop-PrepareChildProcess {
+    param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process)
+
+    # 防止 timeout 後只殺 parent、把 child Git 或 host process 留給下一個 case。
+    $childIds = @()
+    try {
+        $childIds = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object { $_.ParentProcessId -eq $Process.Id } |
+            Select-Object -ExpandProperty ProcessId)
+    }
+    catch {}
+    foreach ($childId in $childIds) {
+        Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-PrepareProcess {
     param(
         [Parameter(Mandatory = $true)]$Case,
@@ -352,10 +509,12 @@ function Invoke-PrepareProcess {
         [string]$Backend = $Case.Backend,
         [string]$Transactions = $Case.Transactions,
         [string]$Observation = $Case.Observation,
-        [string]$IsolationRoot = $Case.Root
+        [string]$IsolationRoot = $Case.Root,
+        [int]$TimeoutMilliseconds = 60000
     )
+    $harnessEntry = New-PrepareHarnessEntryScript -Case $Case
     $arguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Argument $UpgradeScript),
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Argument $harnessEntry),
         '-Mode', 'PrepareFormal',
         '-IsolationRoot', (Quote-Argument $IsolationRoot),
         '-TransactionRoot', (Quote-Argument $Transactions),
@@ -372,9 +531,17 @@ function Invoke-PrepareProcess {
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
     $process = [Diagnostics.Process]::Start($startInfo)
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+        $stdoutDone = $stdoutTask.IsCompleted
+        $stderrDone = $stderrTask.IsCompleted
+        Stop-PrepareChildProcess -Process $process
+        throw "[PREPARE_CHILD_TIMEOUT] case=$($Case.Name) timeout_ms=$TimeoutMilliseconds pid=$($process.Id) command=$($startInfo.FileName) stdout_done=$stdoutDone stderr_done=$stderrDone"
+    }
     $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
     $json = $null
     if (-not [string]::IsNullOrWhiteSpace($stdout)) {
         try { $json = $stdout.Trim() | ConvertFrom-Json -ErrorAction Stop }
@@ -391,143 +558,204 @@ function Assert-NoTransactionDirectory {
 
 function Assert-RejectedBeforeTransaction {
     param([string]$Name, [scriptblock]$Mutate, [hashtable]$InvokeOverrides = @{})
-    $case = New-PrepareCase $Name
-    $observation = Get-Content -LiteralPath $case.Observation -Raw -Encoding UTF8 | ConvertFrom-Json
-    & $Mutate $case $observation
-    Write-CaseObservation -Case $case -Observation $observation
-    $before = Get-CaseTargetCanonical $case
-    $parameters = @{ Case = $case }
-    foreach ($key in $InvokeOverrides.Keys) { $parameters[$key] = $InvokeOverrides[$key] }
-    $result = Invoke-PrepareProcess @parameters
-    Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6. stderr=$($result.Stderr)"
-    Assert-True ($result.Json.result -eq 'failed' -and $result.Json.state -eq 'rejected') "[$Name] pre-transaction result was not an explicit rejection."
-    Assert-True ($result.Json.failure_phase -eq 'before_transaction' -and -not $result.Json.transaction_id -and -not $result.Json.transaction_root) "[$Name] rejection exposed the wrong transaction phase."
-    Assert-NoTransactionDirectory $case
-    Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
+    Invoke-SmokeCase $Name {
+        $case = New-PrepareCase $Name
+        $observation = Get-Content -LiteralPath $case.Observation -Raw -Encoding UTF8 | ConvertFrom-Json
+        & $Mutate $case $observation
+        Write-CaseObservation -Case $case -Observation $observation
+        $before = Get-CaseTargetCanonical $case
+        $parameters = @{ Case = $case }
+        foreach ($key in $InvokeOverrides.Keys) { $parameters[$key] = $InvokeOverrides[$key] }
+        $result = Invoke-PrepareProcess @parameters
+        Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6. stderr=$($result.Stderr)"
+        Assert-True ($result.Json.result -eq 'failed' -and $result.Json.state -eq 'rejected') "[$Name] pre-transaction result was not an explicit rejection."
+        Assert-True ($result.Json.failure_phase -eq 'before_transaction' -and -not $result.Json.transaction_id -and -not $result.Json.transaction_root) "[$Name] rejection exposed the wrong transaction phase."
+        Assert-NoTransactionDirectory $case
+        Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
+    }
 }
+
+
 
 function Assert-InvalidatedZeroWrites {
     param([string]$Name, [string]$Injection)
-    $case = New-PrepareCase $Name
-    $before = Get-CaseTargetCanonical $case
-    $result = Invoke-PrepareProcess -Case $case -Injection $Injection
-    Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6 for $Injection. stderr=$($result.Stderr)"
-    Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
-    $journals = @(Get-ChildItem -LiteralPath $case.Transactions -Recurse -File -Filter 'transaction-journal.json')
-    Assert-True ($journals.Count -eq 1) "[$Name] did not preserve one journal."
-    $journal = Get-Content -LiteralPath $journals[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ($journal.state -eq 'prepare_invalidated') "[$Name] state was not prepare_invalidated."
-    Assert-True ($result.Json.state -eq $journal.state -and $result.Json.result -eq $journal.result) "[$Name] stdout state/result diverged from journal."
-    Assert-True ($result.Json.failure_phase -eq 'after_transaction' -and $result.Json.failure_phase -eq $journal.failure_phase) "[$Name] stdout did not identify an after-transaction failure."
-    Assert-True ($result.Json.transaction_id -eq $journal.transaction_id -and $result.Json.transaction_root -eq $journal.transaction_root) "[$Name] stdout transaction identity diverged from journal."
-    Assert-True ($result.Json.error -eq $journal.error) "[$Name] stdout error diverged from journal."
-    Assert-True ([int]$journal.formal_target_write_count -eq 0) "[$Name] formal write count was not zero."
+    Invoke-SmokeCase $Name {
+        $case = New-PrepareCase $Name
+        $before = Get-CaseTargetCanonical $case
+        $result = Invoke-PrepareProcess -Case $case -Injection $Injection
+        Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6 for $Injection. stderr=$($result.Stderr)"
+        Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
+        $journals = @(Get-ChildItem -LiteralPath $case.Transactions -Recurse -File -Filter 'transaction-journal.json')
+        Assert-True ($journals.Count -eq 1) "[$Name] did not preserve one journal."
+        $journal = Get-Content -LiteralPath $journals[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-True ($journal.state -eq 'prepare_invalidated') "[$Name] state was not prepare_invalidated."
+        Assert-True ($result.Json.state -eq $journal.state -and $result.Json.result -eq $journal.result) "[$Name] stdout state/result diverged from journal."
+        Assert-True ($result.Json.failure_phase -eq 'after_transaction' -and $result.Json.failure_phase -eq $journal.failure_phase) "[$Name] stdout did not identify an after-transaction failure."
+        Assert-True ($result.Json.transaction_id -eq $journal.transaction_id -and $result.Json.transaction_root -eq $journal.transaction_root) "[$Name] stdout transaction identity diverged from journal."
+        Assert-True ($result.Json.error -eq $journal.error) "[$Name] stdout error diverged from journal."
+        Assert-True ([int]$journal.formal_target_write_count -eq 0) "[$Name] formal write count was not zero."
+    }
 }
 
+
+
 try {
+    Write-Output "upgrade formal prepare smoke: SELECTED groups=$($SelectedGroups -join ',')"
     Assert-CheckpointBasisContract
+    Assert-BranchGuardContract
+    # `all` 會讓 Test-SmokeGroup 對每組回傳 true；只有明確單選 basis-only 才可提前退出。
+    if ($SelectedGroups.Count -eq 1 -and $SelectedGroups -contains 'basis-only') {
+        $actualHead = (git rev-parse HEAD).Trim()
+        Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead) -eq 'checkpoint') 'Current HEAD was not accepted as an approved checkpoint.'
+        Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead ('f' * 40) -ParentHead $actualHead -ChangedPaths @('README.md'))) 'An arbitrary direct descendant of the approved test baseline was accepted.'
+        Write-Output "prepare basis-only: PASS head=$actualHead temp_fixture=false wsl_metadata=false"
+        exit 0
+    }
     Assert-StrictTempPath $SuiteRoot
     Assert-StrictTempPath $OutsideRoot
     New-Item -ItemType Directory -Path $SuiteRoot, $OutsideRoot -Force | Out-Null
     Initialize-PrepareTemplate
+
     # 先單獨驗證 literal argv seam，避免正式邊界大量唯讀 WSL fingerprint 呼叫掩蓋此契約的原始結果。
-    Assert-ProductionWslMetadataSeam
-    $formalBefore = @(Get-FormalBoundaryCanonical) -join "`n"
+    Invoke-SmokeGroup 'metadata' { Assert-ProductionWslMetadataSeam }
 
-    $success = New-PrepareCase 'success-and-rerun'
-    $targetBefore = Get-CaseTargetCanonical $success
-    $prepared = Invoke-PrepareProcess -Case $success
-    Assert-True ($prepared.ExitCode -eq 0 -and $prepared.Json.result -eq 'prepared') "Success prepare failed. stderr=$($prepared.Stderr)"
-    Assert-True ($prepared.Json.state -eq 'prepared_pending_apply' -and [int]$prepared.Json.formal_target_write_count -eq 0) 'Success state/write count mismatch.'
-    Assert-True ((Get-CaseTargetCanonical $success) -ceq $targetBefore) 'Success prepare changed fixture targets.'
-    $transactionDirs = @(Get-ChildItem -LiteralPath $success.Transactions -Directory -Force)
-    Assert-True ($transactionDirs.Count -eq 1) 'Success did not create exactly one transaction.'
-    $journal = Get-Content -LiteralPath (Join-Path $transactionDirs[0].FullName 'transaction-journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    $sourceManifest = Get-Content -LiteralPath $journal.manifests.source.path -Raw -Encoding UTF8 | ConvertFrom-Json
-    $preimageManifest = Get-Content -LiteralPath $journal.manifests.preimage.path -Raw -Encoding UTF8 | ConvertFrom-Json
-    $packageManifest = Get-Content -LiteralPath $journal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ($journal.schema -eq 'laplace-formal-prepare-v1') 'Journal schema mismatch.'
-    Assert-True (@($sourceManifest.records).Count -eq 31) 'Source manifest must contain 30 target records plus runtime observation.'
-    Assert-True (@($preimageManifest.records).Count -eq 30) 'Preimage manifest must contain 30 records.'
-    Assert-True (@($packageManifest.records).Count -eq 28) 'Package manifest must contain 26 files and two markers.'
-    $frontendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Frontend/src/tray/tray_app.py' })[0]
-    $backendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Backend/src/core/daemon.py' })[0]
-    Assert-True ($frontendMetadata.attributes -and $frontendMetadata.sddl) 'Frontend attributes/SDDL were not sealed.'
-    Assert-True ($backendMetadata.posix_mode -eq '755' -and $backendMetadata.uid -eq 1000 -and $backendMetadata.gid -eq 1000) 'Backend POSIX metadata was not sealed.'
-    $runtimeEvidence = @($sourceManifest.records | Where-Object { $_.key -eq 'Runtime/observation.json' })[0]
-    Assert-True ($runtimeEvidence.sha256 -and $runtimeEvidence.observation.registry.Count -eq 1) 'Runtime/registry observation was not sealed.'
-    Assert-True (@($journal.warnings | Where-Object { $_.tag -eq '[UPGRADE_REGISTRY_STALE]' }).Count -eq 1) 'Stale registry warning was not preserved.'
-    Assert-True (@(Get-ChildItem -LiteralPath $success.Frontend, $success.Backend -Recurse -File -Filter '*.tmp').Count -eq 0) 'Adjacent target temp file exists.'
-    $transactionBeforeRerun = Get-TreeCanonical $success.Transactions
-    $already = Invoke-PrepareProcess -Case $success
-    Assert-True ($already.ExitCode -eq 0 -and $already.Json.result -eq 'already_prepared') 'Identical rerun was not already_prepared.'
-    Assert-True ((Get-TreeCanonical $success.Transactions) -ceq $transactionBeforeRerun) 'already_prepared changed transaction evidence.'
-
-    Assert-RejectedBeforeTransaction 'active-lock' { param($c, $o) $o.lock_exists = $true }
-    Assert-RejectedBeforeTransaction 'owned-ui' { param($c, $o) $o.ui = @([pscustomobject]@{ pid = 1; owned = $true; ambiguous = $false }) }
-    Assert-RejectedBeforeTransaction 'owned-daemon' { param($c, $o) $o.daemon = @([pscustomobject]@{ pid = 2; owned = $true; ambiguous = $false }) }
-    Assert-RejectedBeforeTransaction 'owned-worker' { param($c, $o) $o.workers = @([pscustomobject]@{ pid = 3; owned = $true; registered = $true; ambiguous = $false }) }
-    Assert-RejectedBeforeTransaction 'ambiguous-runtime' { param($c, $o) $o.registry = @([pscustomobject]@{ pid = 4; proc_exists = $true; owned = $false; uuid_matches = $false; ambiguous = $true }) }
-    Assert-RejectedBeforeTransaction 'acl-reject' { param($c, $o) $o.transaction_acl_ok = $false }
-    Assert-RejectedBeforeTransaction 'owner-reject' { param($c, $o) $o.transaction_owner_ok = $false }
-    Assert-RejectedBeforeTransaction 'space-reject' { param($c, $o) $o.free_bytes = 1 }
-    Assert-RejectedBeforeTransaction 'adapter-drift' { param($c, $o) 'drift' | Add-Content -LiteralPath $c.Adapter -Encoding UTF8 }
-    Assert-RejectedBeforeTransaction 'tray-drift' { param($c, $o) 'drift' | Add-Content -LiteralPath $c.Tray -Encoding UTF8 }
-    Assert-RejectedBeforeTransaction 'marker-drift' { param($c, $o) 'wrong' | Set-Content -LiteralPath $c.BackendMarker -Encoding ASCII -NoNewline }
-
-    $overlap = New-PrepareCase 'transaction-overlap'
-    $overlapResult = Invoke-PrepareProcess -Case $overlap -Transactions (Join-Path $overlap.Frontend 'transactions')
-    Assert-True ($overlapResult.ExitCode -eq 6) 'Target/transaction overlap was not rejected.'
-    Assert-NoTransactionDirectory $overlap
-    $unc = New-PrepareCase 'transaction-unc'
-    $uncResult = Invoke-PrepareProcess -Case $unc -Transactions '\\invalid-host\share\transactions'
-    Assert-True ($uncResult.ExitCode -eq 6) 'UNC transaction root was not rejected.'
-    Assert-NoTransactionDirectory $unc
-
-    $reparse = New-PrepareCase 'transaction-reparse'
-    $JunctionPath = Join-Path $reparse.Root 'transactions-junction'
-    New-Item -ItemType Junction -Path $JunctionPath -Target $OutsideRoot | Out-Null
-    $reparseResult = Invoke-PrepareProcess -Case $reparse -Transactions $JunctionPath
-    Assert-True ($reparseResult.ExitCode -eq 6) 'Reparse transaction root was not rejected.'
-    Assert-True (@(Get-ChildItem -LiteralPath $OutsideRoot -Force).Count -eq 0) 'Reparse rejection wrote through the junction.'
-
-    foreach ($injection in @('Preimage', 'Package', 'Prepare', 'Journal', 'SecondSnapshot', 'EvidenceTamper')) {
-        Assert-InvalidatedZeroWrites -Name ('inject-' + $injection.ToLowerInvariant()) -Injection $injection
+    if (Test-SmokeGroup 'formal-boundary') {
+        $script:FormalBefore = @(Get-FormalBoundaryCanonical) -join "`n"
     }
 
-    $incomplete = New-PrepareCase 'incomplete-rerun'
-    $firstIncomplete = Invoke-PrepareProcess -Case $incomplete -Injection Prepare
-    Assert-True ($firstIncomplete.ExitCode -eq 6) 'Injected incomplete prepare did not fail.'
-    $countBeforeIncompleteRerun = @(Get-ChildItem -LiteralPath $incomplete.Transactions -Directory -Force).Count
-    $secondIncomplete = Invoke-PrepareProcess -Case $incomplete
-    Assert-True ($secondIncomplete.ExitCode -eq 6 -and $secondIncomplete.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Incomplete transaction did not hard-block reentry.'
-    Assert-True (@(Get-ChildItem -LiteralPath $incomplete.Transactions -Directory -Force).Count -eq $countBeforeIncompleteRerun) 'Incomplete reentry created another transaction.'
+    Invoke-SmokeGroup 'success' {
+        Invoke-SmokeCase 'success-and-rerun' {
+            $success = New-PrepareCase 'success-and-rerun'
+            $targetBefore = Get-CaseTargetCanonical $success
+            $prepared = Invoke-PrepareProcess -Case $success
+            Assert-True ($prepared.ExitCode -eq 0 -and $prepared.Json.result -eq 'prepared') "Success prepare failed. stderr=$($prepared.Stderr)"
+            Assert-True ($prepared.Json.state -eq 'prepared_pending_apply' -and [int]$prepared.Json.formal_target_write_count -eq 0) 'Success state/write count mismatch.'
+            Assert-True ((Get-CaseTargetCanonical $success) -ceq $targetBefore) 'Success prepare changed fixture targets.'
+            $transactionDirs = @(Get-ChildItem -LiteralPath $success.Transactions -Directory -Force)
+            Assert-True ($transactionDirs.Count -eq 1) 'Success did not create exactly one transaction.'
+            $journal = Get-Content -LiteralPath (Join-Path $transactionDirs[0].FullName 'transaction-journal.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            $sourceManifest = Get-Content -LiteralPath $journal.manifests.source.path -Raw -Encoding UTF8 | ConvertFrom-Json
+            $preimageManifest = Get-Content -LiteralPath $journal.manifests.preimage.path -Raw -Encoding UTF8 | ConvertFrom-Json
+            $packageManifest = Get-Content -LiteralPath $journal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-True ($journal.schema -eq 'laplace-formal-prepare-v1') 'Journal schema mismatch.'
+            Assert-True ($journal.target_commit -eq $TargetCommit) 'Prepare journal target_commit did not use the shared formal target.'
+            $packageMarkers = @($packageManifest.records | Where-Object { $_.key -in @('Backend/version.txt', 'Frontend/version.txt') })
+            Assert-True ($packageMarkers.Count -eq 2) 'Package manifest must contain both version marker records.'
+            foreach ($marker in $packageMarkers) {
+                Assert-True (((Get-Content -LiteralPath $marker.artifact_path -Raw -Encoding UTF8).Trim()) -ceq $TargetShort) "Package marker $($marker.key) did not use the shared formal target short hash."
+            }
+            Assert-True (@($sourceManifest.records).Count -eq 31) 'Source manifest must contain 30 target records plus runtime observation.'
+            Assert-True (@($preimageManifest.records).Count -eq 30) 'Preimage manifest must contain 30 records.'
+            Assert-True (@($packageManifest.records).Count -eq 28) 'Package manifest must contain 26 files and two markers.'
+            $frontendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Frontend/src/tray/tray_app.py' })[0]
+            $backendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Backend/src/core/daemon.py' })[0]
+            Assert-True ($frontendMetadata.attributes -and $frontendMetadata.sddl) 'Frontend attributes/SDDL were not sealed.'
+            Assert-True ($backendMetadata.posix_mode -eq '755' -and $backendMetadata.uid -eq 1000 -and $backendMetadata.gid -eq 1000) 'Backend POSIX metadata was not sealed.'
+            $runtimeEvidence = @($sourceManifest.records | Where-Object { $_.key -eq 'Runtime/observation.json' })[0]
+            Assert-True ($runtimeEvidence.sha256 -and $runtimeEvidence.observation.registry.Count -eq 1) 'Runtime/registry observation was not sealed.'
+            Assert-True (@($journal.warnings | Where-Object { $_.tag -eq '[UPGRADE_REGISTRY_STALE]' }).Count -eq 1) 'Stale registry warning was not preserved.'
+            Assert-True (@(Get-ChildItem -LiteralPath $success.Frontend, $success.Backend -Recurse -File -Filter '*.tmp').Count -eq 0) 'Adjacent target temp file exists.'
+            $transactionBeforeRerun = Get-TreeCanonical $success.Transactions
+            $already = Invoke-PrepareProcess -Case $success
+            Assert-True ($already.ExitCode -eq 0 -and $already.Json.result -eq 'already_prepared') 'Identical rerun was not already_prepared.'
+            Assert-True ((Get-TreeCanonical $success.Transactions) -ceq $transactionBeforeRerun) 'already_prepared changed transaction evidence.'
+        }
+    }
 
-    $tamper = New-PrepareCase 'evidence-tamper-rerun'
-    $tamperPrepared = Invoke-PrepareProcess -Case $tamper
-    Assert-True ($tamperPrepared.ExitCode -eq 0) 'Tamper setup prepare failed.'
-    $tamperJournal = Get-Content -LiteralPath (Get-ChildItem -LiteralPath $tamper.Transactions -Recurse -File -Filter transaction-journal.json).FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-    $tamperPackage = Get-Content -LiteralPath $tamperJournal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
-    'external-tamper' | Add-Content -LiteralPath $tamperPackage.records[0].artifact_path -Encoding UTF8
-    $tamperCount = @(Get-ChildItem -LiteralPath $tamper.Transactions -Directory -Force).Count
-    $tamperRerun = Invoke-PrepareProcess -Case $tamper
-    Assert-True ($tamperRerun.ExitCode -eq 6 -and $tamperRerun.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Tampered evidence did not block reentry.'
-    Assert-True (@(Get-ChildItem -LiteralPath $tamper.Transactions -Directory -Force).Count -eq $tamperCount) 'Tampered reentry created another transaction.'
+    Invoke-SmokeGroup 'runtime-rejection' {
+        Assert-RejectedBeforeTransaction 'active-lock' { param($c, $o) $o.lock_exists = $true }
+        Assert-RejectedBeforeTransaction 'owned-ui' { param($c, $o) $o.ui = @([pscustomobject]@{ pid = 1; owned = $true; ambiguous = $false }) }
+        Assert-RejectedBeforeTransaction 'owned-daemon' { param($c, $o) $o.daemon = @([pscustomobject]@{ pid = 2; owned = $true; ambiguous = $false }) }
+        Assert-RejectedBeforeTransaction 'owned-worker' { param($c, $o) $o.workers = @([pscustomobject]@{ pid = 3; owned = $true; registered = $true; ambiguous = $false }) }
+        Assert-RejectedBeforeTransaction 'ambiguous-runtime' { param($c, $o) $o.registry = @([pscustomobject]@{ pid = 4; proc_exists = $true; owned = $false; uuid_matches = $false; ambiguous = $true }) }
+    }
 
-    $multiple = New-PrepareCase 'multiple-transactions'
-    $multiplePrepared = Invoke-PrepareProcess -Case $multiple
-    Assert-True ($multiplePrepared.ExitCode -eq 0) 'Multiple setup prepare failed.'
-    $originalTransaction = @(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force)[0]
-    Copy-Item -LiteralPath $originalTransaction.FullName -Destination (Join-Path $multiple.Transactions 'duplicate-prepared') -Recurse
-    $multipleCount = @(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force).Count
-    $multipleRerun = Invoke-PrepareProcess -Case $multiple
-    Assert-True ($multipleRerun.ExitCode -eq 6 -and $multipleRerun.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Multiple/corrupt prepared transactions did not block reentry.'
-    Assert-True (@(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force).Count -eq $multipleCount) 'Multiple reentry created another transaction.'
+    Invoke-SmokeGroup 'acl-rejection' {
+        Assert-RejectedBeforeTransaction 'acl-reject' { param($c, $o) $o.transaction_acl_ok = $false }
+        Assert-RejectedBeforeTransaction 'owner-reject' { param($c, $o) $o.transaction_owner_ok = $false }
+        Assert-RejectedBeforeTransaction 'space-reject' { param($c, $o) $o.free_bytes = 1 }
+    }
 
-    $upgradeBatText = Get-Content -LiteralPath $UpgradeBat -Raw -Encoding UTF8
-    Assert-True ($upgradeBatText -notmatch 'PrepareFormal|prepare') 'upgrade.bat publicly exposes PrepareFormal.'
-    $formalAfter = @(Get-FormalBoundaryCanonical) -join "`n"
-    Assert-True ($formalAfter -ceq $formalBefore) 'Formal Windows/WSL targets or formal transaction root changed.'
+    Invoke-SmokeGroup 'source-rejection' {
+        Assert-RejectedBeforeTransaction 'adapter-drift' { param($c, $o) 'drift' | Add-Content -LiteralPath $c.Adapter -Encoding UTF8 }
+        Assert-RejectedBeforeTransaction 'tray-drift' { param($c, $o) 'drift' | Add-Content -LiteralPath $c.Tray -Encoding UTF8 }
+        Assert-RejectedBeforeTransaction 'marker-drift' { param($c, $o) 'wrong' | Set-Content -LiteralPath $c.BackendMarker -Encoding ASCII -NoNewline }
+    }
+
+    Invoke-SmokeGroup 'transaction-boundary' {
+        Invoke-SmokeCase 'transaction-overlap' {
+            $overlap = New-PrepareCase 'transaction-overlap'
+            $overlapResult = Invoke-PrepareProcess -Case $overlap -Transactions (Join-Path $overlap.Frontend 'transactions')
+            Assert-True ($overlapResult.ExitCode -eq 6) 'Target/transaction overlap was not rejected.'
+            Assert-NoTransactionDirectory $overlap
+        }
+
+        Invoke-SmokeCase 'transaction-unc' {
+            $unc = New-PrepareCase 'transaction-unc'
+            $uncResult = Invoke-PrepareProcess -Case $unc -Transactions '\\invalid-host\share\transactions'
+            Assert-True ($uncResult.ExitCode -eq 6) 'UNC transaction root was not rejected.'
+            Assert-NoTransactionDirectory $unc
+        }
+
+        Invoke-SmokeCase 'transaction-reparse' {
+            $reparse = New-PrepareCase 'transaction-reparse'
+            $script:JunctionPath = Join-Path $reparse.Root 'transactions-junction'
+            New-Item -ItemType Junction -Path $script:JunctionPath -Target $OutsideRoot | Out-Null
+            $reparseResult = Invoke-PrepareProcess -Case $reparse -Transactions $script:JunctionPath
+            Assert-True ($reparseResult.ExitCode -eq 6) 'Reparse transaction root was not rejected.'
+            Assert-True (@(Get-ChildItem -LiteralPath $OutsideRoot -Force).Count -eq 0) 'Reparse rejection wrote through the junction.'
+        }
+    }
+
+    Invoke-SmokeGroup 'failure-injection' {
+        foreach ($injection in @('Preimage', 'Package', 'Prepare', 'Journal', 'SecondSnapshot', 'EvidenceTamper')) {
+            Assert-InvalidatedZeroWrites -Name ('inject-' + $injection.ToLowerInvariant()) -Injection $injection
+        }
+    }
+
+    Invoke-SmokeGroup 'reentry-cleanup' {
+        Invoke-SmokeCase 'incomplete-rerun' {
+            $incomplete = New-PrepareCase 'incomplete-rerun'
+            $firstIncomplete = Invoke-PrepareProcess -Case $incomplete -Injection Prepare
+            Assert-True ($firstIncomplete.ExitCode -eq 6) 'Injected incomplete prepare did not fail.'
+            $countBeforeIncompleteRerun = @(Get-ChildItem -LiteralPath $incomplete.Transactions -Directory -Force).Count
+            $secondIncomplete = Invoke-PrepareProcess -Case $incomplete
+            Assert-True ($secondIncomplete.ExitCode -eq 6 -and $secondIncomplete.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Incomplete transaction did not hard-block reentry.'
+            Assert-True (@(Get-ChildItem -LiteralPath $incomplete.Transactions -Directory -Force).Count -eq $countBeforeIncompleteRerun) 'Incomplete reentry created another transaction.'
+        }
+
+        Invoke-SmokeCase 'evidence-tamper-rerun' {
+            $tamper = New-PrepareCase 'evidence-tamper-rerun'
+            $tamperPrepared = Invoke-PrepareProcess -Case $tamper
+            Assert-True ($tamperPrepared.ExitCode -eq 0) 'Tamper setup prepare failed.'
+            $tamperJournal = Get-Content -LiteralPath (Get-ChildItem -LiteralPath $tamper.Transactions -Recurse -File -Filter transaction-journal.json).FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $tamperPackage = Get-Content -LiteralPath $tamperJournal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
+            'external-tamper' | Add-Content -LiteralPath $tamperPackage.records[0].artifact_path -Encoding UTF8
+            $tamperCount = @(Get-ChildItem -LiteralPath $tamper.Transactions -Directory -Force).Count
+            $tamperRerun = Invoke-PrepareProcess -Case $tamper
+            Assert-True ($tamperRerun.ExitCode -eq 6 -and $tamperRerun.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Tampered evidence did not block reentry.'
+            Assert-True (@(Get-ChildItem -LiteralPath $tamper.Transactions -Directory -Force).Count -eq $tamperCount) 'Tampered reentry created another transaction.'
+        }
+
+        Invoke-SmokeCase 'multiple-transactions' {
+            $multiple = New-PrepareCase 'multiple-transactions'
+            $multiplePrepared = Invoke-PrepareProcess -Case $multiple
+            Assert-True ($multiplePrepared.ExitCode -eq 0) 'Multiple setup prepare failed.'
+            $originalTransaction = @(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force)[0]
+            Copy-Item -LiteralPath $originalTransaction.FullName -Destination (Join-Path $multiple.Transactions 'duplicate-prepared') -Recurse
+            $multipleCount = @(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force).Count
+            $multipleRerun = Invoke-PrepareProcess -Case $multiple
+            Assert-True ($multipleRerun.ExitCode -eq 6 -and $multipleRerun.Stderr -match 'UPGRADE_PREPARE_RECOVERY_REQUIRED') 'Multiple/corrupt prepared transactions did not block reentry.'
+            Assert-True (@(Get-ChildItem -LiteralPath $multiple.Transactions -Directory -Force).Count -eq $multipleCount) 'Multiple reentry created another transaction.'
+        }
+    }
+
+    Invoke-SmokeGroup 'formal-boundary' {
+        $upgradeBatText = Get-Content -LiteralPath $UpgradeBat -Raw -Encoding UTF8
+        Assert-True ($upgradeBatText -notmatch 'PrepareFormal|prepare') 'upgrade.bat publicly exposes PrepareFormal.'
+        $formalAfter = @(Get-FormalBoundaryCanonical) -join "`n"
+        Assert-True ($formalAfter -ceq $script:FormalBefore) 'Formal Windows/WSL targets or formal transaction root changed.'
+    }
 
     Remove-TestTree $SuiteRoot
     if ($JunctionPath -and (Test-Path -LiteralPath $JunctionPath)) { Remove-Item -LiteralPath $JunctionPath -Force }
@@ -536,8 +764,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $OutsideRoot)) 'Outside TEMP residue remains.'
     Write-Output 'upgrade formal prepare smoke: PASS'
     exit 0
-}
-catch {
+}catch {
     [Console]::Error.WriteLine("upgrade formal prepare smoke: FAIL: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))")
     try {
         if ($JunctionPath -and (Test-Path -LiteralPath $JunctionPath)) { Remove-Item -LiteralPath $JunctionPath -Force }
