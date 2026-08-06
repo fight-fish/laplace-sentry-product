@@ -28,6 +28,8 @@ $FormalPrepareApplyCheckpointHead = '175dc2f1000e17e3977e856fd2501e7afa40690b'
 $FormalPrepareInvalidatedCheckpointHead = '0dfd996d11d72b188e1ae4c2407eb138140dbafb'
 # 決策 227 核准的五檔測試基線；只接受此精確 commit，不接受任意後續 descendant。
 $FormalPrepareTestBaselineHead = 'ff66dafb2e89491ec53976198231bee95e5b0dc7'
+# 決策 242 核准的升級核心錨點；只允許精確五檔的單一直接子提交，不接受更深後代。
+$FormalPrepareUpgradeCoreCheckpointHead = '39c6378ed984b4caa08357b45ed1fe3acfd98e28'
 $FormalPrepareOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $FormalPrepareCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
@@ -44,6 +46,26 @@ $FormalPrepareInvalidatedCheckpointPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1'
 )
+$FormalPrepareUpgradeCoreCheckpointPaths = @(
+    'scripts/upgrade.ps1',
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/upgrade_formal_apply_smoke.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1',
+    'tests/upgrade_mixed_repair_smoke.ps1'
+)
+$FormalPrepareApprovedCheckpointHeads = @(
+    $FormalPrepareRepoHead,
+    $FormalPrepareCheckpointHead,
+    $FormalPrepareApplyCheckpointHead,
+    $FormalPrepareInvalidatedCheckpointHead,
+    $FormalPrepareTestBaselineHead,
+    $FormalPrepareUpgradeCoreCheckpointHead
+)
+$FormalPrepareAuthorizedChildPathsByParent = @{}
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareCheckpointHead] = @($FormalPrepareCheckpointPaths)
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareApplyCheckpointHead] = @($FormalPrepareApplyCheckpointPaths)
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareInvalidatedCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareUpgradeCoreCheckpointHead] = @($FormalPrepareUpgradeCoreCheckpointPaths)
 $FormalPrepareFixtureDirtyPaths = @($FormalPrepareApplyCheckpointPaths + 'tests/upgrade_mixed_repair_smoke.ps1')
 $FormalUpgradeTargetCommit = 'd9bd8b21fb47a07154d0c730f90dab9ec69b85f1'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
@@ -152,33 +174,17 @@ function Assert-FormalPrepareBoundary {
 # 前置檢查與 canonical 證據
 # =========================
 
-# checkpoint 相容只接受五個已驗收錨點，以及各自核准的單一精確直接子提交；不接受任意 descendant。
+# checkpoint 相容只接受已驗收錨點，以及 parent→paths 表中核准的單一精確直接子提交；不接受任意 descendant。
 function Test-FormalPrepareCheckpointShape {
     param(
         [Parameter(Mandatory = $true)][string]$CurrentHead,
-        [Parameter(Mandatory = $true)][string]$ParentHead,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ParentHead,
         [Parameter(Mandatory = $true)][string[]]$ChangedPaths
     )
-    if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareTestBaselineHead, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($FormalPrepareApprovedCheckpointHeads -contains $CurrentHead) { return $true }
     $actual = @($ChangedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Sort-Object -Unique)
-    $isPrepareCheckpointChild = $ParentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
-    $isApplyCheckpointChild = $ParentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
-    $isInvalidatedCheckpointChild = $ParentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)
-    if ($isPrepareCheckpointChild) {
-        $expected = @($FormalPrepareCheckpointPaths)
-    }
-    elseif ($isApplyCheckpointChild) {
-        $expected = @($FormalPrepareApplyCheckpointPaths)
-    }
-    elseif ($isInvalidatedCheckpointChild) {
-        $expected = @($FormalPrepareInvalidatedCheckpointPaths)
-    }
-    else { return $false }
-    $expected = @($expected | Sort-Object -Unique)
+    if (-not $FormalPrepareAuthorizedChildPathsByParent.ContainsKey($ParentHead)) { return $false }
+    $expected = @($FormalPrepareAuthorizedChildPathsByParent[$ParentHead] | Sort-Object -Unique)
     return $actual.Count -eq $expected.Count -and @(Compare-Object -ReferenceObject $expected -DifferenceObject $actual).Count -eq 0
 }
 
@@ -190,10 +196,7 @@ function Assert-FormalPrepareCheckpointBasis {
         [string[]]$ChangedPaths
     )
     if ($CurrentHead.Equals($FormalPrepareRepoHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'working_tree' }
-    if ($CurrentHead.Equals($FormalPrepareCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareApplyCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareInvalidatedCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase) -or
-        $CurrentHead.Equals($FormalPrepareTestBaselineHead, [System.StringComparison]::OrdinalIgnoreCase)) { return 'checkpoint' }
+    if ($FormalPrepareApprovedCheckpointHeads -contains $CurrentHead) { return 'checkpoint' }
     if (-not $PSBoundParameters.ContainsKey('ParentHead') -or -not $PSBoundParameters.ContainsKey('ChangedPaths')) {
         $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $CurrentHead) | Select-Object -First 1).Trim()) -split '\s+'
         $ParentHead = if ($identity.Count -eq 2) { $identity[1] } else { '' }

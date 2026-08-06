@@ -1,9 +1,9 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 <#
 .SYNOPSIS
-Proves the 971ba49 mixed-version repair and exact rollback contract under TEMP.
+Proves the ruled formal-target mixed-version repair and exact rollback contract under TEMP.
 
 .DESCRIPTION
 Purpose: build deterministic mixed targets from Git objects, exercise prepare/apply/crash reconciliation/rollback, and prove every external boundary stays untouched.
@@ -17,7 +17,7 @@ Order-sensitive checks: immutable source snapshots are captured before invoking 
 Side effects: creates and removes only verified strict children of system TEMP; never invokes upgrade.bat or touches formal runtime/Git state.
 #>
 
-# 這支腳本在做什麼：用固定 Git object 建立 25+1+舊 marker 的混合假目標，證明只換 adapter、marker-last 與完整回退。
+# 這支腳本在做什麼：用共用正式目標 Git object 建立 25+1+舊 marker 的混合假目標，證明只換 adapter、marker-last 與完整回退。
 # 這支腳本不做什麼：不讀寫正式副本、不操作真實程序／registry、不 stage／commit，也不把隔離通過當成正式修復。
 # 常改區塊：故障注入案例、來源 state ID、reconciliation 與 rollback 斷言。
 # 不要亂動的區塊：system TEMP 邊界、正式路徑拒絕、完整 path/existence/length/SHA-256/mtime 比對與最終零殘留。
@@ -30,7 +30,9 @@ $UpgradeScript = Join-Path $RepoRoot 'scripts\upgrade.ps1'
 $TempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $SuiteRoot = Join-Path $TempBase ('LaplaceSentryMixedRepairSmoke-' + [Guid]::NewGuid().ToString('N'))
 $OutsideRoot = Join-Path $TempBase ('LaplaceSentryMixedRepairOutside-' + [Guid]::NewGuid().ToString('N'))
-$TargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+# 在受限 scope 直接讀 PrepareFormal 的正式目標來源，避免 mixed repair smoke 自帶第二份 target 或污染測試 scope。
+$TargetCommit = & { . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1'); $FormalUpgradeTargetCommit }
+$TargetShort = $TargetCommit.Substring(0, 7)
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
 $SourceMarker = '1e7bc2b'
 $Schema = 'laplace-mixed-source-v1'
@@ -378,9 +380,9 @@ try {
     }
     $targetAdapterBlob = (& git -C $RepoRoot hash-object -- $success.Adapter).Trim()
     $expectedAdapterBlob = (& git -C $RepoRoot rev-parse "$TargetCommit`:Frontend/src/backend/adapter.py").Trim()
-    Assert-True ($targetAdapterBlob -eq $expectedAdapterBlob) 'Success adapter did not become the 971ba49 package blob.'
-    Assert-True ((Get-Content -LiteralPath $success.BackendMarker -Raw).Trim() -eq '971ba49') 'Backend marker was not updated to 971ba49.'
-    Assert-True ((Get-Content -LiteralPath $success.FrontendMarker -Raw).Trim() -eq '971ba49') 'Frontend marker was not updated to 971ba49.'
+    Assert-True ($targetAdapterBlob -eq $expectedAdapterBlob) 'Success adapter did not become the shared formal target package blob.'
+    Assert-True ((Get-Content -LiteralPath $success.BackendMarker -Raw).Trim() -eq $TargetShort) 'Backend marker was not updated to the shared formal target short hash.'
+    Assert-True ((Get-Content -LiteralPath $success.FrontendMarker -Raw).Trim() -eq $TargetShort) 'Frontend marker was not updated to the shared formal target short hash.'
     Assert-True ((Get-GuardCanonical $success) -ceq $beforeGuards) 'Success changed protected/unmanaged/registry evidence.'
     $successRollback = Invoke-MixedProcess -Case $success -Action Rollback
     Assert-True ($successRollback.ExitCode -eq 0 -and $successRollback.Json.state -eq 'rolled_back') "Pending-acceptance rollback failed. stderr=$($successRollback.Stderr)"

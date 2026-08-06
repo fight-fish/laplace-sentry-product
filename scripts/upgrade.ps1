@@ -64,6 +64,10 @@ $FormalFrontendTarget = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
 $MixedRepairOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 
+# 同一 immutable commit 的 Git object metadata 不會在同一 prepare process 內改變；只快取這類查詢，絕不快取 working-tree hash。
+$global:LaplaceSentryImmutableGitOutputCache = @{}
+$global:LaplaceSentryExpectedManagedGitPathsCache = @{}
+
 $MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
 $MixedRepairMarker = '1e7bc2b'
 $MixedRepairSchema = 'laplace-mixed-source-v1'
@@ -166,8 +170,52 @@ function Get-FileSha256 {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
 }
 
+function Get-ImmutableGitOutputCacheKey {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'cat-file' -and $Arguments[1] -eq '-s' -and $Arguments[2] -match '^[0-9a-f]{40}:.+$') {
+        return $Arguments -join [char]0
+    }
+    if ($Arguments.Count -ge 2 -and $Arguments[0] -eq 'rev-parse' -and @($Arguments[1..($Arguments.Count - 1)] | Where-Object { $_ -notmatch '^[0-9a-f]{40}:.+$' }).Count -eq 0) {
+        return $Arguments -join [char]0
+    }
+    return $null
+}
+
+function Initialize-ImmutableGitObjectCache {
+    param(
+        [Parameter(Mandatory = $true)][string]$Commit,
+        [Parameter(Mandatory = $true)][string[]]$Paths
+    )
+    $uniquePaths = @($Paths | Sort-Object -Unique)
+    if ($uniquePaths.Count -eq 0) { return }
+    $rows = @(Get-GitOutput -Arguments (@('ls-tree', '-r', '-l', $Commit, '--') + $uniquePaths))
+    $seen = @{}
+    foreach ($row in $rows) {
+        $parts = ([string]$row) -split "`t", 2
+        $metadata = @($parts[0] -split '\s+' | Where-Object { $_ })
+        if ($parts.Count -ne 2 -or $metadata.Count -ne 4 -or $metadata[1] -ne 'blob' -or $metadata[2] -notmatch '^[0-9a-f]{40}$' -or $metadata[3] -notmatch '^\d+$') {
+            throw '[UPGRADE_GIT_FAIL] Immutable Git tree batch returned an invalid blob record.'
+        }
+        $path = $parts[1]
+        if ($path -notin $uniquePaths -or $seen.ContainsKey($path)) {
+            throw '[UPGRADE_GIT_FAIL] Immutable Git tree batch returned an unexpected path.'
+        }
+        $seen[$path] = $true
+        $global:LaplaceSentryImmutableGitOutputCache[(Get-ImmutableGitOutputCacheKey -Arguments @('cat-file', '-s', "$Commit`:$path"))] = @($metadata[3])
+        $global:LaplaceSentryImmutableGitOutputCache[(Get-ImmutableGitOutputCacheKey -Arguments @('rev-parse', "$Commit`:$path"))] = @($metadata[2])
+    }
+    if ($seen.Count -ne $uniquePaths.Count) {
+        throw '[UPGRADE_GIT_FAIL] Immutable Git tree batch returned an incomplete path set.'
+    }
+}
 function Get-GitOutput {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    if ($null -eq (Get-Variable -Name LaplaceSentryImmutableGitOutputCache -Scope Global -ErrorAction SilentlyContinue)) { $global:LaplaceSentryImmutableGitOutputCache = @{} }
+    $cacheKey = Get-ImmutableGitOutputCacheKey -Arguments $Arguments
+    if ($cacheKey -and $global:LaplaceSentryImmutableGitOutputCache.ContainsKey($cacheKey)) {
+        return @($global:LaplaceSentryImmutableGitOutputCache[$cacheKey])
+    }
+    $gitExitCode = $null
     $priorPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -177,6 +225,7 @@ function Get-GitOutput {
     finally {
         $ErrorActionPreference = $priorPreference
     }
+    if ($cacheKey) { $global:LaplaceSentryImmutableGitOutputCache[$cacheKey] = @($output) }
     if ($gitExitCode -ne 0) {
         throw "[UPGRADE_GIT_FAIL] git $($Arguments -join ' ') failed."
     }
@@ -585,16 +634,34 @@ function Invoke-IsolatedStage {
 function Assert-ManagedSourcesMatchHead {
     param([Parameter(Mandatory = $true)]$Plan)
 
+    # 每個受管來源仍必須逐一通過 tracked、HEAD blob 與 working blob 三項比對；
+    # 只把三組獨立 Git process 收斂成批次，避免 Windows process startup 壓垮 formal prepare timeout。
+    $managedFiles = @()
     foreach ($side in @('frontend', 'backend')) {
         $prefix = if ($side -eq 'frontend') { 'Frontend' } else { 'Backend' }
         foreach ($file in $Plan.files[$side]) {
-            $gitPath = ($prefix + '/' + $file.RelativePath.Replace('\', '/'))
-            [void](Get-GitOutput -Arguments @('ls-files', '--error-unmatch', '--', $gitPath))
-            $headBlob = (Get-GitOutput -Arguments @('rev-parse', "HEAD:$gitPath") | Select-Object -First 1).Trim()
-            $workingBlob = (Get-GitOutput -Arguments @('hash-object', '--', $file.FullName) | Select-Object -First 1).Trim()
-            if (-not $headBlob.Equals($workingBlob, [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "[UPGRADE_SOURCE_DIRTY] Managed source differs from HEAD: $gitPath"
+            $managedFiles += [pscustomobject]@{
+                git_path = ($prefix + '/' + $file.RelativePath.Replace('\', '/'))
+                full_name = $file.FullName
             }
+        }
+    }
+    $gitPaths = @($managedFiles | ForEach-Object { $_.git_path })
+    $trackedPaths = @(Get-GitOutput -Arguments (@('ls-files', '--error-unmatch', '--') + $gitPaths))
+    if ($trackedPaths.Count -ne $gitPaths.Count -or ((@($trackedPaths | Sort-Object) -join "`n") -cne (@($gitPaths | Sort-Object) -join "`n"))) {
+        throw '[UPGRADE_GIT_FAIL] Managed source tracking batch returned an unexpected path set.'
+    }
+    $headBlobs = @(Get-GitOutput -Arguments (@('rev-parse') + @($gitPaths | ForEach-Object { "HEAD:$_" })))
+    $workingBlobs = @(Get-GitOutput -Arguments (@('hash-object', '--') + @($managedFiles | ForEach-Object { $_.full_name })))
+    if ($headBlobs.Count -ne $managedFiles.Count -or $workingBlobs.Count -ne $managedFiles.Count) {
+        throw '[UPGRADE_GIT_FAIL] Managed source blob batch returned an unexpected record count.'
+    }
+    for ($index = 0; $index -lt $managedFiles.Count; $index += 1) {
+        $gitPath = $managedFiles[$index].git_path
+        $headBlob = ([string]$headBlobs[$index]).Trim()
+        $workingBlob = ([string]$workingBlobs[$index]).Trim()
+        if (-not $headBlob.Equals($workingBlob, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "[UPGRADE_SOURCE_DIRTY] Managed source differs from HEAD: $gitPath"
         }
     }
 
@@ -780,13 +847,19 @@ function Get-ManagedTargetFiles {
 
 function Get-ExpectedManagedGitPaths {
     param([Parameter(Mandatory = $true)][string]$Commit)
+    if ($null -eq (Get-Variable -Name LaplaceSentryExpectedManagedGitPathsCache -Scope Global -ErrorAction SilentlyContinue)) { $global:LaplaceSentryExpectedManagedGitPathsCache = @{} }
+    if ($global:LaplaceSentryExpectedManagedGitPathsCache.ContainsKey($Commit)) {
+        return @($global:LaplaceSentryExpectedManagedGitPathsCache[$Commit])
+    }
     $pathSpecs = @()
     $pathSpecs += @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_.Replace('\', '/') })
     $pathSpecs += @($BackendAllowlist | ForEach-Object { 'Backend/' + $_.Replace('\', '/') })
-    $paths = @(Get-GitOutput -Arguments (@('ls-tree', '-r', '--name-only', $Commit, '--') + $pathSpecs))
-    return @($paths | Where-Object {
+    $paths = @(Get-GitOutput -Arguments (@('ls-tree', '-r', '--name-only', $Commit, '--') + $pathSpecs) | Where-Object {
         $_ -and $_ -notmatch '(^|/)(__pycache__|\.venv)(/|$)' -and $_ -notmatch '\.pyc$'
     } | Sort-Object -Unique)
+    Initialize-ImmutableGitObjectCache -Commit $Commit -Paths $paths
+    $global:LaplaceSentryExpectedManagedGitPathsCache[$Commit] = @($paths)
+    return @($paths)
 }
 
 function Get-FormalTargetCoherence {
@@ -1276,6 +1349,17 @@ function Resolve-MixedRepairLayout {
     $actualByPath = @{}
     foreach ($record in $actual) { $actualByPath[$record.git_path] = $record.full_name }
 
+    $existingPaths = @($expectedPaths | Where-Object { $actualByPath.ContainsKey($_) })
+    $existingTargets = @($existingPaths | ForEach-Object { $actualByPath[$_] })
+    $existingBlobs = @(if ($existingTargets.Count -gt 0) { Get-GitOutput -Arguments (@('hash-object', '--') + $existingTargets) } else { @() })
+    if ($existingBlobs.Count -ne $existingPaths.Count) {
+        throw '[UPGRADE_GIT_FAIL] Managed source hash batch returned an unexpected record count.'
+    }
+    $actualBlobByPath = @{}
+    for ($index = 0; $index -lt $existingPaths.Count; $index += 1) {
+        $actualBlobByPath[$existingPaths[$index]] = ([string]$existingBlobs[$index]).Trim()
+    }
+
     $layout = @()
     foreach ($gitPath in $expectedPaths) {
         $side = if ($gitPath.StartsWith('Frontend/', [System.StringComparison]::Ordinal)) { 'Frontend' } else { 'Backend' }
@@ -1294,7 +1378,7 @@ function Resolve-MixedRepairLayout {
             }
         }
         else {
-            $actualBlob = (Get-GitOutput -Arguments @('hash-object', '--', $targetPath) | Select-Object -First 1).Trim()
+            $actualBlob = $actualBlobByPath[$gitPath]
             if (-not $actualBlob.Equals($expectedSourceBlob, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "[UPGRADE_MIXED_SOURCE_FAIL] Unexpected source blob for $gitPath`: $actualBlob"
             }

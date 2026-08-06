@@ -36,7 +36,8 @@ $TemplateRoot = Join-Path $SuiteRoot '_template'
 $FormalFrontend = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendLinux = '/home/serpal/.laplace_sentry_backend'
 $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
-$TargetCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+# 在受限 scope 直接讀 PrepareFormal 的正式目標來源，避免 apply smoke 自帶第二份 target 或污染測試 scope。
+$TargetCommit = & { . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1'); $FormalUpgradeTargetCommit }
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
 $SourceMarker = '1e7bc2b'
 $FixedTime = [DateTime]::Parse('2024-01-02T03:04:05.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)

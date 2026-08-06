@@ -42,6 +42,28 @@ $FormalFrontend = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackend = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
 $FormalBackendLinux = '/home/serpal/.laplace_sentry_backend'
 $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade'
+
+# 測試橋接：prepare helper 只依賴 Git 輸出契約；smoke 不載入會進入 dispatch 的完整 upgrade.ps1。
+function Get-GitOutput {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $gitExitCode = $null
+    $priorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& git -C $RepoRoot @Arguments 2>&1)
+        $gitExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $priorPreference
+    }
+    if ($gitExitCode -ne 0) {
+        $detail = @($output | ForEach-Object { [string]$_ }) -join ' '
+        throw ('[UPGRADE_GIT_FAIL] git {0} failed exit={1} detail={2}' -f ($Arguments -join ' '), $gitExitCode, $detail)
+    }
+    return @($output)
+}
+
 # 直接載入正式目標與純 basis 判定，避免 smoke test 自帶第二份 formal target。
 . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1')
 
@@ -184,6 +206,7 @@ function Assert-ProductionWslMetadataSeam {
 
 function Assert-CheckpointBasisContract {
     $syntheticPrepareHead = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $syntheticUpgradeCoreHead = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     $syntheticApplyHead = 'dddddddddddddddddddddddddddddddddddddddd'
     $syntheticInvalidatedHead = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
     $syntheticGrandchild = 'cccccccccccccccccccccccccccccccccccccccc'
@@ -191,18 +214,22 @@ function Assert-CheckpointBasisContract {
     $preparePaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
     $applyPaths = @('scripts/upgrade.ps1', 'scripts/upgrade_formal_apply.ps1', 'tests/upgrade_formal_apply_smoke.ps1', 'scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
     $invalidatedPaths = @('scripts/upgrade_formal_prepare.ps1', 'tests/upgrade_formal_prepare_smoke.ps1')
-    $fixtureDirtyPaths = $applyPaths + 'tests/upgrade_mixed_repair_smoke.ps1'
+    $upgradeCorePaths = @($FormalPrepareUpgradeCoreCheckpointPaths)
+    $fixtureDirtyPaths = $upgradeCorePaths
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareRepoHead -ParentHead '' -ChangedPaths @()) -eq 'working_tree') 'Original working-tree basis was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved first checkpoint was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareApplyCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved apply checkpoint anchor was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareInvalidatedCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Approved invalidated checkpoint anchor was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareTestBaselineHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Decision 227 approved test baseline was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareUpgradeCoreCheckpointHead -ParentHead '' -ChangedPaths @()) -eq 'checkpoint') 'Decision 242 approved upgrade-core anchor was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticPrepareHead -ParentHead $FormalPrepareCheckpointHead -ChangedPaths $preparePaths) -eq 'checkpoint') 'Legal direct two-file PrepareFormal checkpoint was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths $applyPaths) -eq 'checkpoint') 'Legal direct five-file ValidateFormalApply checkpoint was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths $invalidatedPaths) -eq 'checkpoint') 'Legal direct checkpoint-lineage repair was rejected.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $syntheticUpgradeCoreHead -ParentHead $FormalPrepareUpgradeCoreCheckpointHead -ChangedPaths $upgradeCorePaths) -eq 'checkpoint') 'Legal direct five-file upgrade-core checkpoint was rejected.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticPrepareHead -ParentHead $FormalPrepareRepoHead -ChangedPaths $preparePaths)) 'A sibling checkpoint from the original basis was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticApplyHead -ChangedPaths $applyPaths)) 'An arbitrary checkpoint descendant was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticInvalidatedHead -ChangedPaths $invalidatedPaths)) 'An arbitrary invalidated-checkpoint descendant was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticGrandchild -ParentHead $syntheticUpgradeCoreHead -ChangedPaths $upgradeCorePaths)) 'An arbitrary upgrade-core grandchild was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticPrepareHead -ParentHead $priorRepoHead -ChangedPaths (@('scripts/upgrade.ps1') + $preparePaths))) 'Prior three-file checkpoint lineage was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead ('b' * 40) -ChangedPaths $applyPaths)) 'Wrong checkpoint parent was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticApplyHead -ParentHead $FormalPrepareApplyCheckpointHead -ChangedPaths @('scripts/upgrade.ps1'))) 'Partial apply checkpoint was accepted.'
@@ -211,6 +238,11 @@ function Assert-CheckpointBasisContract {
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead ('b' * 40) -ChangedPaths $invalidatedPaths)) 'Checkpoint-lineage repair with a wrong parent was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths @('scripts/upgrade_formal_prepare.ps1'))) 'Checkpoint-lineage repair with a missing path was accepted.'
     Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticInvalidatedHead -ParentHead $FormalPrepareInvalidatedCheckpointHead -ChangedPaths ($invalidatedPaths + 'third-file.txt'))) 'Checkpoint-lineage repair with an extra file was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticUpgradeCoreHead -ParentHead ('f' * 40) -ChangedPaths $upgradeCorePaths)) 'Upgrade-core checkpoint with a wrong parent was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticUpgradeCoreHead -ParentHead '' -ChangedPaths $upgradeCorePaths)) 'Upgrade-core merge-shaped checkpoint was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticUpgradeCoreHead -ParentHead $FormalPrepareUpgradeCoreCheckpointHead -ChangedPaths ($upgradeCorePaths | Select-Object -Skip 1))) 'Upgrade-core checkpoint with a missing path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticUpgradeCoreHead -ParentHead $FormalPrepareUpgradeCoreCheckpointHead -ChangedPaths ($upgradeCorePaths + 'sixth-file.txt'))) 'Upgrade-core checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead $syntheticUpgradeCoreHead -ParentHead $FormalPrepareUpgradeCoreCheckpointHead -ChangedPaths (($upgradeCorePaths | Select-Object -Skip 1) + 'README.md'))) 'Upgrade-core checkpoint with a substituted path was accepted.'
 
     Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false
     Assert-FormalPrepareRepoState -OriginMain $FormalPrepareOriginMain -Staged @() -Dirty ($fixtureDirtyPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
@@ -223,6 +255,17 @@ function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main') -eq 'main') 'The main branch was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'A non-main branch was accepted.'
+}
+
+function Assert-CurrentHeadCheckpointBasis {
+    $actualHead = (git rev-parse HEAD).Trim()
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead) -eq 'checkpoint') 'Current HEAD was not accepted as an approved checkpoint.'
+    Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
+    Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead ('f' * 40) -ParentHead $actualHead -ChangedPaths @('README.md'))) 'An arbitrary direct descendant of the current HEAD was accepted.'
+    if (-not $actualHead.Equals($FormalPrepareUpgradeCoreCheckpointHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead ('f' * 40) -ParentHead $actualHead -ChangedPaths $FormalPrepareUpgradeCoreCheckpointPaths)) 'A deeper five-file descendant of the upgrade-core checkpoint was accepted.'
+    }
+    Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' checked=true')
 }
 
 function Assert-StrictTempPath {
@@ -603,11 +646,11 @@ try {
     Write-Output "upgrade formal prepare smoke: SELECTED groups=$($SelectedGroups -join ',')"
     Assert-CheckpointBasisContract
     Assert-BranchGuardContract
+    # 真實 HEAD 是所有 selector 的共同安全前置；不得只在 basis-only 的提前退出分支中執行。
+    Assert-CurrentHeadCheckpointBasis
     # `all` 會讓 Test-SmokeGroup 對每組回傳 true；只有明確單選 basis-only 才可提前退出。
     if ($SelectedGroups.Count -eq 1 -and $SelectedGroups -contains 'basis-only') {
         $actualHead = (git rev-parse HEAD).Trim()
-        Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead) -eq 'checkpoint') 'Current HEAD was not accepted as an approved checkpoint.'
-        Assert-True (-not (Test-FormalPrepareCheckpointShape -CurrentHead ('f' * 40) -ParentHead $actualHead -ChangedPaths @('README.md'))) 'An arbitrary direct descendant of the approved test baseline was accepted.'
         Write-Output "prepare basis-only: PASS head=$actualHead temp_fixture=false wsl_metadata=false"
         exit 0
     }
