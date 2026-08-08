@@ -33,7 +33,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run_upgrade_quick_
 | ------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | Python 合約測試         | `python -m unittest discover -s tests -p 'test_*.py' -v`                                    | 確保目前 Python Tree Query API 不會因修改而退化。                                                            |
 | PowerShell 語法解析     | 檢查 `scripts\upgrade*.ps1` 是否可正常解析，並執行升級 Smoke Test                                          | 避免升級腳本因語法錯誤而被默默跳過。                                                                              |
-| 靜態升級契約檢查            | 檢查正式 Target Commit 是否只有單一來源、公開 `upgrade.bat` 是否正確分派、Prepare Smoke Selector 是否存在             | 防止已知的 **151／162 假綠燈（False Green）** 問題，例如 Target Commit 被複製、正式模式入口消失或 Selector 消失。               |
+| 靜態升級契約檢查            | 檢查正式 Target Commit 是否只有單一來源、公開 `upgrade.bat` 是否正確分派、Prepare Smoke Selector 是否存在             | 防止 Target Commit 被複製、正式模式入口消失或 Selector 消失所造成的假綠燈（False Green）。                                  |
 | Preflight Helper 契約 | `tests\upgrade_formal_preflight_contract.ps1`                                               | 在不執行大型測試矩陣的情況下，確認 PreflightFormal 的 Selector／Tag 對 Source、Target、Runtime、受保護資料及非同步子程序輸出的連線仍然存在。 |
 | TEMP 整合測試           | `tests\upgrade_isolated_smoke.ps1`                                                          | 驗證公開的 `upgrade.bat --stage` 能正確進入嚴格 TEMP 演練流程，並保護正式資料。                                          |
 | TEMP Preflight 代表案例 | `tests\upgrade_formal_preflight_smoke.ps1 -Group path-boundary -Case outside-temp-boundary` | 驗證 Preflight 能拒絕 Repository 或 TEMP 外部的測試路徑，且不會碰觸正式資料。                                           |
@@ -49,6 +49,20 @@ Python Tree Query 合約測試使用 `tests\_tree_query_contract_bootstrap.py` �
 它的目的只是證明：
 
 > PowerShell 升級防護並沒有完全缺席，而且已經納入平時交接流程的快速檢查中，同時仍能保持足夠快速、可經常執行。
+
+---
+
+## 升級基準與版本錨點門檻
+
+正式準備測試會先核對目前程式庫基準，至少包含：
+
+- 不接受 staged changes（Git 暫存區非空）。
+- 不接受錯誤分支或與正式契約不一致的遠端主線。
+- 只允許正式 helper 明列的既有修改；未列入允許範圍的 dirty 或 untracked 路徑一律拒絕。
+- 版本錨點必須是明示核准的錨點，或符合明示 parent lineage 與精確 changed-path shape 的單一直接子版本。
+- 少檔、多檔、替換檔、錯誤父版本、合併形狀或更深後代均不得靠名稱相似而通過。
+
+這些門檻保護的是測試輸入基準，不代表正式環境已被檢查或可以套用升級。
 
 ---
 
@@ -117,3 +131,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run_upgrade_quick_
 * 正式環境（Formal Runtime）的資料已被檢查。
 * 已實際執行 `PrepareFormal`、`ValidateFormalApply` 或 `ApplyFormal`。
 * 已證明 Transaction Cleanup、Runtime 同步、Git 狀態或產品已達可發布（Release Ready）狀態。
+
+因此 Quick Gate 全綠不得外推為 heavy matrix、formal read-only、live apply 或 release ready 已成立；每一層都必須有自己的實際執行證據。
