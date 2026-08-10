@@ -6,6 +6,9 @@
 import sys
 import json
 import os
+import tempfile
+import threading
+import time
 from typing import List, Dict, Any, Callable
 import math
 import ctypes
@@ -1362,11 +1365,155 @@ class LogViewerWidget(QTextEdit):
         return f'<font color="#AAAAAA">{raw_line}</font>'
 
 
+S0206_INSTRUMENTATION_ENV = "LAPLACE_SENTRY_INSTRUMENTATION"
+S0206_INSTRUMENTATION_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _s0206_monotonic_ms() -> float:
+    """回傳單調遞增毫秒；只用來排序診斷事件，不代表牆上時鐘時間。"""
+    return time.perf_counter() * 1000.0
+
+
+def _s0206_instrumentation_enabled() -> bool:
+    value = os.environ.get(S0206_INSTRUMENTATION_ENV, "")
+    return value.strip().lower() in S0206_INSTRUMENTATION_TRUE_VALUES
+
+
+def _s0206_trace_path() -> Path:
+    return (
+        Path(tempfile.gettempdir())
+        / "LaplaceSentry"
+        / f"s0206_instrumentation_{os.getpid()}.jsonl"
+    )
+
+
+def _s0206_safe_path_key(value: object) -> str:
+    """只保留 project-relative path key；絕對路徑或可疑路徑不寫入 trace。"""
+    text = str(value or "")
+    if not text:
+        return ""
+    normalized = text.replace("\\", "/")
+    if (
+        normalized.startswith("/")
+        or normalized.startswith("~")
+        or ":" in normalized
+        or ".." in normalized.split("/")
+    ):
+        return "[redacted]"
+    return normalized[:240]
+
+
+def _s0206_safe_query_kind(value: object) -> str:
+    text = str(value or "")
+    if text.startswith("tree_children:"):
+        return f"tree_children:{_s0206_safe_path_key(text.split(':', 1)[1])}"
+    if text in {"log", "tree"}:
+        return text
+    return "other"
+
+
+def _s0206_result_kind(value: object) -> str:
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, str):
+        return "str"
+    if value is None:
+        return "none"
+    return "other"
+
+
+def _s0206_short_text(value: object) -> str:
+    text = str(value or "")
+    allowed = {
+        "accepted",
+        "already_loaded",
+        "already_loading",
+        "exception",
+        "guard_rejected",
+        "invalid_payload",
+        "missing_project",
+        "missing_tree_item",
+        "no_children",
+        "not_dir",
+        "placeholder",
+        "preview",
+        "project_mismatch",
+        "response_path_mismatch",
+        "response_project_mismatch",
+        "stale_children_request",
+        "stale_log_request",
+        "stale_tree_request",
+        "start_query",
+        "unsupported_query_kind",
+    }
+    return text if text in allowed else "other"
+
+
+class S0206InstrumentationTracer:
+    """047 診斷用 JSONL 寫入器；預設關閉，寫失敗也不得影響產品流程。"""
+
+    def __init__(self) -> None:
+        self.enabled = _s0206_instrumentation_enabled()
+        self.path = _s0206_trace_path() if self.enabled else None
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+    def record(self, event: str, **fields: object) -> None:
+        if not self.enabled or self.path is None:
+            return
+
+        try:
+            with self._lock:
+                self._sequence += 1
+                payload: dict[str, object] = {
+                    "event": event,
+                    "sequence": self._sequence,
+                    "monotonic_ms": round(_s0206_monotonic_ms(), 3),
+                }
+                self._add_safe_fields(payload, fields)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            return
+
+    def _add_safe_fields(self, payload: dict[str, object], fields: dict[str, object]) -> None:
+        if "query_kind" in fields:
+            payload["query_kind"] = _s0206_safe_query_kind(fields["query_kind"])
+        if "path_key" in fields:
+            payload["path_key"] = _s0206_safe_path_key(fields["path_key"])
+        for key in ("request_id", "active_count", "child_count"):
+            if key in fields:
+                try:
+                    payload[key] = int(fields[key])
+                except (TypeError, ValueError):
+                    payload[key] = 0
+        for key in ("query_elapsed_ms", "merge_elapsed_ms"):
+            if key in fields:
+                try:
+                    payload[key] = max(0.0, round(float(fields[key]), 3))
+                except (TypeError, ValueError):
+                    payload[key] = 0.0
+        for key in ("loaded", "loading", "has_children"):
+            if key in fields:
+                payload[key] = bool(fields[key])
+        if "decision" in fields:
+            payload["decision"] = _s0206_short_text(fields["decision"])
+        if "reason" in fields:
+            payload["reason"] = _s0206_short_text(fields["reason"])
+        if "outcome" in fields:
+            payload["outcome"] = _s0206_short_text(fields["outcome"])
+        if "result_kind" in fields:
+            payload["result_kind"] = _s0206_result_kind(fields["result_kind"])
+
+
 class ProjectQueryWorker(QObject):
     """背景查詢 worker：只承接純查詢，不處理 start/stop 或寫入流程。"""
 
-    finished = Signal(str, str, int, object)
-    failed = Signal(str, str, int, str)
+    finished = Signal(str, str, int, object, float)
+    failed = Signal(str, str, int, str, float)
 
     def __init__(
         self,
@@ -1382,22 +1529,27 @@ class ProjectQueryWorker(QObject):
         self.query_func = query_func
 
     def run(self) -> None:
+        started_at = time.perf_counter()
         try:
             result = self.query_func(self.project_uuid)
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             self.failed.emit(
                 self.query_kind,
                 self.project_uuid,
                 self.request_id,
                 str(e),
+                elapsed_ms,
             )
             return
 
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         self.finished.emit(
             self.query_kind,
             self.project_uuid,
             self.request_id,
             result,
+            elapsed_ms,
         )
 
 
@@ -1467,6 +1619,7 @@ class DashboardWidget(QWidget):
         self._latest_children_request_ids: dict[tuple[str, str], int] = {}
         self._active_query_threads: list[QThread] = []
         self._active_query_workers: list[ProjectQueryWorker] = []
+        self._s0206_tracer = S0206InstrumentationTracer()
 
         # 呼叫各類函式來 建立介面 和 載入初始資料。        
         self._build_ui()
@@ -1609,6 +1762,7 @@ class DashboardWidget(QWidget):
         )
         self.tree_viewer.currentItemChanged.connect(self._on_tree_item_changed)
         self.tree_viewer.itemExpanded.connect(self._on_tree_item_expanded)
+        self.tree_viewer.itemCollapsed.connect(self._on_tree_item_collapsed)
         self.tree_comment_editor.textChanged.connect(self._on_tree_comment_text_changed)
         # 當表格的項目被雙擊時（itemDoubleClicked），連結（connect）到處理函式。
         self.project_table.itemDoubleClicked.connect(
@@ -2215,6 +2369,13 @@ class DashboardWidget(QWidget):
             return None
         return query_kind[len(prefix):]
 
+    def _s0206_record_event(self, event: str, **fields: object) -> None:
+        tracer = self.__dict__.get("_s0206_tracer")
+        if not isinstance(tracer, S0206InstrumentationTracer):
+            tracer = S0206InstrumentationTracer()
+            self._s0206_tracer = tracer
+        tracer.record(event, **fields)
+
     def _next_project_query_request_id(self, query_kind: str, project_uuid: str) -> int:
         self._query_request_seq += 1
         request_id = self._query_request_seq
@@ -2247,6 +2408,13 @@ class DashboardWidget(QWidget):
         worker.moveToThread(thread)
         self._active_query_threads.append(thread)
         self._active_query_workers.append(worker)
+        self._s0206_record_event(
+            "query_start",
+            query_kind=query_kind,
+            path_key=self._children_query_path_key(query_kind) or "",
+            request_id=request_id,
+            active_count=len(self._active_query_workers),
+        )
 
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_project_query_finished)
@@ -2264,40 +2432,61 @@ class DashboardWidget(QWidget):
         if worker in self._active_query_workers:
             self._active_query_workers.remove(worker)
 
+        self._s0206_record_event(
+            "query_cleanup",
+            query_kind=getattr(worker, "query_kind", ""),
+            path_key=self._children_query_path_key(getattr(worker, "query_kind", "")) or "",
+            request_id=getattr(worker, "request_id", 0),
+            active_count=len(self._active_query_workers),
+        )
         thread.deleteLater()
 
-    def _is_current_project_query(self, query_kind: str, project_uuid: str, request_id: int) -> bool:
+    def _project_query_guard_decision(
+        self,
+        query_kind: str,
+        project_uuid: str,
+        request_id: int,
+    ) -> tuple[bool, str]:
         current_uuid = self._current_selected_project_uuid()
         if current_uuid != project_uuid:
-            return False
+            return False, "project_mismatch"
 
         if query_kind == "log":
-            return request_id == self._latest_log_request_id
+            if request_id == self._latest_log_request_id:
+                return True, "accepted"
+            return False, "stale_log_request"
 
         if query_kind == "tree":
-            return (
-                request_id == self._latest_tree_request_id
-                and not getattr(self, "_is_preview_tree_mode", False)
-            )
+            if getattr(self, "_is_preview_tree_mode", False):
+                return False, "preview"
+            if request_id == self._latest_tree_request_id:
+                return True, "accepted"
+            return False, "stale_tree_request"
 
         path_key = self._children_query_path_key(query_kind)
         if path_key is not None:
             if getattr(self, "_is_preview_tree_mode", False):
-                return False
+                return False, "preview"
             if request_id != self._latest_children_request_ids.get((project_uuid, path_key)):
-                return False
+                return False, "stale_children_request"
 
             item = self._find_tree_item_by_path_key(path_key)
             if item is None:
-                return False
+                return False, "missing_tree_item"
             payload = item.data(0, Qt.ItemDataRole.UserRole)
-            return (
+            if (
                 isinstance(payload, dict)
                 and str(payload.get("project_uuid", "") or "").strip() == project_uuid
                 and str(payload.get("path_key", "") or "") == path_key
-            )
+            ):
+                return True, "accepted"
+            return False, "guard_rejected"
 
-        return False
+        return False, "unsupported_query_kind"
+
+    def _is_current_project_query(self, query_kind: str, project_uuid: str, request_id: int) -> bool:
+        accepted, _reason = self._project_query_guard_decision(query_kind, project_uuid, request_id)
+        return accepted
 
     def _on_project_query_finished(
         self,
@@ -2305,8 +2494,28 @@ class DashboardWidget(QWidget):
         project_uuid: str,
         request_id: int,
         result: object,
+        query_elapsed_ms: float = 0.0,
     ) -> None:
-        if not self._is_current_project_query(query_kind, project_uuid, request_id):
+        path_key = self._children_query_path_key(query_kind) or ""
+        self._s0206_record_event(
+            "query_finish",
+            query_kind=query_kind,
+            path_key=path_key,
+            request_id=request_id,
+            query_elapsed_ms=query_elapsed_ms,
+            result_kind=result,
+            outcome="accepted",
+        )
+        accepted, reason = self._project_query_guard_decision(query_kind, project_uuid, request_id)
+        self._s0206_record_event(
+            "query_result_decision",
+            query_kind=query_kind,
+            path_key=path_key,
+            request_id=request_id,
+            decision="accepted" if accepted else "guard_rejected",
+            reason=reason,
+        )
+        if not accepted:
             return
 
         if query_kind == "log":
@@ -2323,8 +2532,7 @@ class DashboardWidget(QWidget):
             self._apply_project_tree_payload(project_uuid, result)
             return
 
-        path_key = self._children_query_path_key(query_kind)
-        if path_key is not None:
+        if path_key:
             self._apply_tree_children_payload(project_uuid, path_key, request_id, result)
 
     def _on_project_query_failed(
@@ -2333,8 +2541,27 @@ class DashboardWidget(QWidget):
         project_uuid: str,
         request_id: int,
         error_message: str,
+        query_elapsed_ms: float = 0.0,
     ) -> None:
-        if not self._is_current_project_query(query_kind, project_uuid, request_id):
+        path_key = self._children_query_path_key(query_kind) or ""
+        self._s0206_record_event(
+            "query_fail",
+            query_kind=query_kind,
+            path_key=path_key,
+            request_id=request_id,
+            query_elapsed_ms=query_elapsed_ms,
+            outcome="exception",
+        )
+        accepted, reason = self._project_query_guard_decision(query_kind, project_uuid, request_id)
+        self._s0206_record_event(
+            "query_result_decision",
+            query_kind=query_kind,
+            path_key=path_key,
+            request_id=request_id,
+            decision="accepted" if accepted else "guard_rejected",
+            reason=reason,
+        )
+        if not accepted:
             return
 
         if query_kind == "log":
@@ -2343,8 +2570,7 @@ class DashboardWidget(QWidget):
         elif query_kind == "tree":
             self._show_tree_placeholder()
 
-        path_key = self._children_query_path_key(query_kind)
-        if path_key is not None:
+        if path_key:
             self._show_tree_children_failure(project_uuid, path_key, request_id, error_message)
             return
 
@@ -2369,6 +2595,14 @@ class DashboardWidget(QWidget):
 
         response_uuid = str(result.get("uuid", "") or "").strip()
         if response_uuid != project_uuid:
+            self._s0206_record_event(
+                "query_result_decision",
+                query_kind=f"tree_children:{path_key}",
+                path_key=path_key,
+                request_id=request_id,
+                decision="guard_rejected",
+                reason="response_project_mismatch",
+            )
             self._show_tree_children_failure(
                 project_uuid,
                 path_key,
@@ -2379,6 +2613,14 @@ class DashboardWidget(QWidget):
 
         response_path_key = str(result.get("parent_path_key", "") or "")
         if response_path_key != path_key:
+            self._s0206_record_event(
+                "query_result_decision",
+                query_kind=f"tree_children:{path_key}",
+                path_key=path_key,
+                request_id=request_id,
+                decision="guard_rejected",
+                reason="response_path_mismatch",
+            )
             self._show_tree_children_failure(
                 project_uuid,
                 path_key,
@@ -2404,6 +2646,14 @@ class DashboardWidget(QWidget):
             )
             return
 
+        self._s0206_record_event(
+            "children_merge_start",
+            query_kind=f"tree_children:{path_key}",
+            path_key=path_key,
+            request_id=request_id,
+            child_count=len(children),
+        )
+        merge_started_at = time.perf_counter()
         item.takeChildren()
         for child in children:
             if isinstance(child, dict):
@@ -2424,6 +2674,14 @@ class DashboardWidget(QWidget):
         item.setData(0, Qt.ItemDataRole.UserRole, payload)
         self._latest_children_request_ids.pop((project_uuid, path_key), None)
         self._set_status_message(f"✓ 已載入子節點：{path_key or '(root)'}", level="success")
+        self._s0206_record_event(
+            "children_merge_finish",
+            query_kind=f"tree_children:{path_key}",
+            path_key=path_key,
+            request_id=request_id,
+            child_count=len(children),
+            merge_elapsed_ms=(time.perf_counter() - merge_started_at) * 1000.0,
+        )
 
     def _show_tree_children_failure(
         self,
@@ -2979,24 +3237,66 @@ class DashboardWidget(QWidget):
             })
             item.addChild(placeholder_item)
 
+    def _tree_item_trace_payload(self, item: QTreeWidgetItem) -> dict[str, object]:
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return {"path_key": "", "loaded": False, "loading": False, "has_children": False}
+        return {
+            "path_key": str(payload.get("path_key", "") or ""),
+            "loaded": bool(payload.get("children_loaded", False)),
+            "loading": bool(payload.get("children_loading", False)),
+            "has_children": bool(payload.get("has_children", False)),
+        }
+
+    def _record_tree_expand_decision(
+        self,
+        reason: str,
+        path_key: str = "",
+        loaded: bool = False,
+        loading: bool = False,
+        has_children: bool = False,
+    ) -> None:
+        self._s0206_record_event(
+            "tree_expand_decision",
+            path_key=path_key,
+            decision=reason,
+            loaded=loaded,
+            loading=loading,
+            has_children=has_children,
+        )
+
     def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
         """資料夾首次展開時，以背景 worker 查詢 bounded children。"""
+        trace_payload = self._tree_item_trace_payload(item)
+        self._s0206_record_event("tree_expand", **trace_payload)
         if getattr(self, "_is_preview_tree_mode", False):
+            self._record_tree_expand_decision("preview", **trace_payload)
             return
 
         payload = item.data(0, Qt.ItemDataRole.UserRole)
-        if not isinstance(payload, dict) or payload.get("is_tree_children_placeholder"):
+        if not isinstance(payload, dict):
+            self._record_tree_expand_decision("invalid_payload", **trace_payload)
+            return
+        if payload.get("is_tree_children_placeholder"):
+            self._record_tree_expand_decision("placeholder", **trace_payload)
             return
         if not bool(payload.get("is_dir", False)):
+            self._record_tree_expand_decision("not_dir", **trace_payload)
             return
         if not bool(payload.get("has_children", False)):
+            self._record_tree_expand_decision("no_children", **trace_payload)
             return
-        if bool(payload.get("children_loaded", True)) or bool(payload.get("children_loading", False)):
+        if bool(payload.get("children_loaded", True)):
+            self._record_tree_expand_decision("already_loaded", **trace_payload)
+            return
+        if bool(payload.get("children_loading", False)):
+            self._record_tree_expand_decision("already_loading", **trace_payload)
             return
 
         project_uuid = str(payload.get("project_uuid", "") or "").strip()
         path_key = str(payload.get("path_key", "") or "")
         if not project_uuid:
+            self._record_tree_expand_decision("missing_project", **trace_payload)
             return
 
         payload["children_loading"] = True
@@ -3009,12 +3309,23 @@ class DashboardWidget(QWidget):
         })
         item.addChild(loading_item)
 
+        self._record_tree_expand_decision(
+            "start_query",
+            path_key=path_key,
+            loaded=False,
+            loading=True,
+            has_children=bool(payload.get("has_children", False)),
+        )
         query_kind = f"tree_children:{path_key}"
         self._start_project_query(
             query_kind,
             project_uuid,
             lambda uuid, key=path_key: adapter.get_tree_children(uuid, key, depth=1),
         )
+
+    def _on_tree_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        trace_payload = self._tree_item_trace_payload(item)
+        self._s0206_record_event("tree_collapse", **trace_payload)
 
     def _show_tree_placeholder(self) -> None:
         """恢復目錄樹工作區的預設提示。"""

@@ -1,5 +1,8 @@
 import importlib.util
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -106,6 +109,73 @@ class FakeItem:
             self.labels.append("")
         self.labels[column] = value
 
+
+
+class ConnectableSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+        return None
+
+    def emit(self, *args, **kwargs):
+        for callback in list(self.callbacks):
+            callback(*args, **kwargs)
+
+
+class CaptureSignal:
+    def __init__(self):
+        self.emitted = []
+
+    def emit(self, *args):
+        self.emitted.append(args)
+
+
+class FakeThread:
+    def __init__(self, *args, **kwargs):
+        self.started = ConnectableSignal()
+        self.finished = ConnectableSignal()
+
+    def start(self):
+        return None
+
+    def quit(self):
+        self.finished.emit()
+
+    def deleteLater(self):
+        return None
+
+
+class TemporaryInstrumentationEnvironment:
+    """用受控 TEMP 驗證 trace；離開時還原 tempfile 快取與環境變數。"""
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_tempdir = tempfile.tempdir
+        self.patcher = None
+
+    def __enter__(self):
+        env = {
+            "TEMP": self.tmp.name,
+            "TMP": self.tmp.name,
+        }
+        if self.enabled:
+            env["LAPLACE_SENTRY_INSTRUMENTATION"] = "1"
+        else:
+            env["LAPLACE_SENTRY_INSTRUMENTATION"] = ""
+        self.patcher = patch.dict(os.environ, env, clear=False)
+        self.patcher.__enter__()
+        tempfile.tempdir = None
+        return Path(self.tmp.name)
+
+    def __exit__(self, exc_type, exc, tb):
+        tempfile.tempdir = self.original_tempdir
+        if self.patcher is not None:
+            self.patcher.__exit__(exc_type, exc, tb)
+        self.tmp.cleanup()
+        return False
 
 class ScopedTrayAppLoader:
     """在單一測項內載入前端模組，離開時還原被碰過的全域狀態。"""
@@ -335,6 +405,141 @@ class FrontendLazyTreeContractTests(unittest.TestCase):
         self.assertEqual(tree_node["children"], result["children"])
         self.assertNotIn(("project-1", "src/"), dashboard._latest_children_request_ids)
 
+
+
+    def read_trace_records(self, tray_app):
+        trace_path = tray_app._s0206_trace_path()
+        self.assertTrue(trace_path.exists(), f"expected trace file at {trace_path}")
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(lines), 1)
+        return [json.loads(line) for line in lines]
+
+    def test_instrumentation_off_does_not_create_trace_file_or_directory(self):
+        with TemporaryInstrumentationEnvironment(enabled=False) as tmp_root:
+            tray_app = self.load_tray_app_for_test()
+            dashboard = self.make_dashboard(tray_app)
+            item = FakeItem(["src/"])
+            item.setData(
+                0,
+                FakeQt.ItemDataRole.UserRole,
+                {
+                    "is_dir": True,
+                    "has_children": True,
+                    "children_loaded": True,
+                    "children_loading": False,
+                    "project_uuid": "project-1",
+                    "path_key": "src/",
+                },
+            )
+
+            dashboard._on_tree_item_expanded(item)
+            dashboard._on_tree_item_collapsed(item)
+
+            self.assertFalse((tmp_root / "LaplaceSentry").exists())
+
+    def test_instrumentation_on_records_expand_collapse_without_sensitive_values(self):
+        fake_uuid = "project-secret-uuid-1234567890"
+        sensitive_path = "C:/Users/User/secret-project/top.txt"
+        with TemporaryInstrumentationEnvironment(enabled=True):
+            tray_app = self.load_tray_app_for_test()
+            dashboard = self.make_dashboard(tray_app)
+            item = FakeItem(["secret"])
+            item.setData(
+                0,
+                FakeQt.ItemDataRole.UserRole,
+                {
+                    "is_dir": True,
+                    "has_children": True,
+                    "children_loaded": True,
+                    "children_loading": False,
+                    "project_uuid": fake_uuid,
+                    "path_key": sensitive_path,
+                },
+            )
+
+            dashboard._on_tree_item_expanded(item)
+            dashboard._on_tree_item_collapsed(item)
+            dashboard._s0206_record_event(
+                "query_fail",
+                query_kind="tree_children:src/",
+                path_key="src/",
+                request_id=5,
+                outcome="exception",
+                command="wsl --secret-arg TOPSECRET",
+                stdout="stdout TOPSECRET",
+                stderr="stderr TOPSECRET",
+                env="TOKEN=TOPSECRET",
+            )
+
+            trace_bytes = tray_app._s0206_trace_path().read_bytes()
+            self.assertNotIn(fake_uuid.encode("utf-8"), trace_bytes)
+            self.assertNotIn(b"C:/Users/User", trace_bytes)
+            self.assertNotIn(b"TOPSECRET", trace_bytes)
+            records = self.read_trace_records(tray_app)
+
+        events = [record["event"] for record in records]
+        self.assertIn("tree_expand", events)
+        self.assertIn("tree_expand_decision", events)
+        self.assertIn("tree_collapse", events)
+        decision = next(record for record in records if record["event"] == "tree_expand_decision")
+        self.assertEqual(decision["decision"], "already_loaded")
+        self.assertEqual(decision["path_key"], "[redacted]")
+
+    def test_instrumentation_records_query_timing_identity_and_rejected_decision(self):
+        with TemporaryInstrumentationEnvironment(enabled=True):
+            tray_app = self.load_tray_app_for_test()
+            dashboard = self.make_dashboard(tray_app)
+            dashboard._current_selected_project_uuid = lambda: "project-1"
+            dashboard._latest_children_request_ids = {("project-1", "src/"): 99}
+            tray_app.QThread = FakeThread
+
+            dashboard._start_project_query(
+                "tree_children:src/",
+                "project-1",
+                lambda uuid: {"uuid": uuid},
+            )
+            dashboard._on_project_query_finished(
+                "tree_children:src/",
+                "project-1",
+                7,
+                {"uuid": "project-1"},
+                12.5,
+            )
+            records = self.read_trace_records(tray_app)
+
+        events = [record["event"] for record in records]
+        self.assertIn("query_start", events)
+        self.assertIn("query_finish", events)
+        self.assertIn("query_result_decision", events)
+        finish = next(record for record in records if record["event"] == "query_finish")
+        self.assertEqual(finish["request_id"], 7)
+        self.assertEqual(finish["query_kind"], "tree_children:src/")
+        self.assertGreaterEqual(finish["query_elapsed_ms"], 0.0)
+        decision = next(record for record in records if record["event"] == "query_result_decision")
+        self.assertEqual(decision["decision"], "guard_rejected")
+        self.assertEqual(decision["reason"], "stale_children_request")
+
+    def test_project_query_worker_emits_callable_elapsed_without_changing_result(self):
+        tray_app = self.load_tray_app_for_test()
+        worker = tray_app.ProjectQueryWorker(
+            "tree_children:src/",
+            "project-1",
+            3,
+            lambda uuid: {"uuid": uuid, "children": []},
+        )
+        worker.finished = CaptureSignal()
+        worker.failed = CaptureSignal()
+
+        worker.run()
+
+        self.assertEqual(worker.failed.emitted, [])
+        self.assertEqual(len(worker.finished.emitted), 1)
+        query_kind, project_uuid, request_id, result, elapsed_ms = worker.finished.emitted[0]
+        self.assertEqual(query_kind, "tree_children:src/")
+        self.assertEqual(project_uuid, "project-1")
+        self.assertEqual(request_id, 3)
+        self.assertEqual(result, {"uuid": "project-1", "children": []})
+        self.assertGreaterEqual(elapsed_ms, 0.0)
 
 if __name__ == "__main__":
     unittest.main()
