@@ -134,6 +134,23 @@ Laplace Sentry 的核心使命為：
 
 ---
 
+### 3.4 Upgrade and Verification Topology 升級與驗證拓撲
+
+升級鏈採公開入口、政策主程序、專責 helper 與分層測試分離：
+
+| 層級 | 現役入口 | 責任 |
+| --- | --- | --- |
+| 公開升級入口 | `upgrade.bat` | 只轉接安全 dry-run 與指定 TEMP staging，不公開正式內部模式 |
+| 升級政策與調度 | `scripts/upgrade.ps1` | 統一升級計畫、邊界、模式調度與結束碼；正式寫入能力保持非公開且需裁決 |
+| 正式升級 helpers | `scripts/upgrade_formal_prepare.ps1`、`scripts/upgrade_formal_apply.ps1`、`scripts/upgrade_formal_invalidate.ps1` | 分別承接準備、套用／回復及失效處理的正式契約 |
+| 日常快速防線 | `tests/run_upgrade_quick_gate.ps1` | 執行語法、靜態契約、Python contract、TEMP 代表案例並揭露未跑層級 |
+| 完整升級 smoke | `tests/upgrade_formal_preflight_smoke.ps1`、`tests/upgrade_formal_prepare_smoke.ps1`、`tests/upgrade_formal_apply_smoke.ps1`、`tests/upgrade_formal_invalidate_smoke.ps1`、`tests/upgrade_mixed_repair_smoke.ps1`、`tests/upgrade_isolated_apply_smoke.ps1`、`tests/upgrade_isolated_smoke.ps1` | 依風險分別驗證預檢、準備、套用、失效、混合修復與隔離回復，不以快速綠燈取代完整矩陣 |
+| 測試閱讀入口 | `tests/README.md` | 說明各測試入口、涵蓋範圍、未驗證範圍與回報口徑 |
+
+這些入口只描述架構責任。原始碼中存在正式內部能力，不等於一般使用者可直接操作，也不構成正式環境升級授權。
+
+---
+
 ## 4. Subsystem Responsibilities 子系統責任定義
 
 ### 4.1 UI Subsystem

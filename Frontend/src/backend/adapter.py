@@ -55,6 +55,7 @@ WSL_PYTHON = f"{WSL_PROJECT_ROOT}/.venv/bin/python"
 
 # 3. 最後定義主腳本路徑
 WSL_MAIN_SCRIPT = "src.core.daemon"
+WSL_COMMAND_TIMEOUT_SECONDS = 30
 
 # 這裡，我們用「@dataclass」標記（mark）這是一個資料類別（只有數據）。
 @dataclass
@@ -198,6 +199,7 @@ class BackendAdapter:
                 encoding="utf-8",
                 creationflags=0x08000000,
                 check=True,
+                timeout=WSL_COMMAND_TIMEOUT_SECONDS,
             )
 
             output = result.stdout.strip()
@@ -228,6 +230,11 @@ class BackendAdapter:
 
             raise BackendError(f"資料解析失敗 (非 JSON 且無法識別為 OK): {output}")
 
+        except subprocess.TimeoutExpired as e:
+            elapsed = e.timeout if e.timeout is not None else WSL_COMMAND_TIMEOUT_SECONDS
+            raise BackendError(
+                f"WSL 執行逾時：命令 {cmd} 超過 {elapsed:.0f} 秒未回應，請稍後重試或檢查 WSL 後端狀態。"
+            )
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr.strip() or "未知錯誤"
             raise BackendError(f"WSL 執行失敗: {error_msg}")
@@ -598,17 +605,45 @@ class BackendAdapter:
             return [str(x) for x in result]
         return []
 
-    def get_project_tree(self, uuid: str) -> Dict[str, Any]:
-        """呼叫 WSL 獲取指定專案的結構化目錄樹資料。"""
+    def get_project_tree(self, uuid: str, max_depth: int | None = None) -> Dict[str, Any]:
+        """呼叫 WSL 獲取結構化目錄樹；未傳 depth 時保持舊契約。"""
         if not uuid:
             raise BackendError("讀取目錄樹失敗：UUID 為空。")
 
-        result = self._run_wsl_command("get_project_tree", uuid)
+        if max_depth is None:
+            result = self._run_wsl_command("get_project_tree", uuid)
+        else:
+            if max_depth < 0:
+                raise BackendError("讀取目錄樹失敗：max_depth 必須是 0 以上整數。")
+            result = self._run_wsl_command(
+                "get_project_tree",
+                uuid,
+                "--max-depth",
+                str(max_depth),
+            )
 
         if isinstance(result, dict):
             return result
 
         raise BackendError("讀取目錄樹失敗：後端未回傳合法 JSON 物件。")
+
+    def get_tree_children(self, uuid: str, path_key: str, depth: int = 1) -> Dict[str, Any]:
+        """呼叫 WSL 讀取指定 project-relative path_key 的 bounded children。"""
+        if not uuid:
+            raise BackendError("讀取子節點失敗：UUID 為空。")
+        if depth < 0:
+            raise BackendError("讀取子節點失敗：depth 必須是 0 以上整數。")
+
+        result = self._run_wsl_command(
+            "get_tree_children",
+            uuid,
+            str(path_key or ""),
+            str(depth),
+        )
+        if isinstance(result, dict):
+            return result
+
+        raise BackendError("讀取子節點失敗：後端未回傳合法 JSON 物件。")
 
     def preview_tree_from_path(self, path: str) -> Dict[str, Any]:
         """呼叫 WSL 取得臨時資料夾的結構化預覽樹資料。"""
@@ -844,9 +879,13 @@ def get_log_content(uuid: str) -> List[str]:
     adapter = _ensure_adapter()
     return adapter.get_log_content(uuid)
 
-def get_project_tree(uuid: str) -> Dict[str, Any]:
+def get_project_tree(uuid: str, max_depth: int | None = None) -> Dict[str, Any]:
     adapter = _ensure_adapter()
-    return adapter.get_project_tree(uuid)
+    return adapter.get_project_tree(uuid, max_depth=max_depth)
+
+def get_tree_children(uuid: str, path_key: str, depth: int = 1) -> Dict[str, Any]:
+    adapter = _ensure_adapter()
+    return adapter.get_tree_children(uuid, path_key, depth=depth)
 
 def preview_tree_from_path(path: str) -> Dict[str, Any]:
     adapter = _ensure_adapter()

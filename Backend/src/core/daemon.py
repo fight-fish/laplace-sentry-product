@@ -992,17 +992,21 @@ def handle_stop_sentry(args: List[str], projects_file_path: Optional[str] = None
             except Exception: pass
             del sentry_log_files[uuid_to_stop]
 
-def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    【API】依專案 UUID 取得結構化目錄樹資料。
-    只回傳 JSON 樹資料，不寫入 Markdown、不產生副作用。
-    """
+def _parse_tree_max_depth(raw_value: str, command_name: str) -> int:
+    """解析 tree depth；0 代表只回查詢根節點。"""
+    try:
+        depth = int(raw_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"【{command_name} 失敗】：depth 必須是 0 以上整數。")
+
+    if depth < 0:
+        raise ValueError(f"【{command_name} 失敗】：depth 必須是 0 以上整數。")
+    return depth
+
+
+def _load_project_tree_context(uuid_target: str, projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """載入 tree 查詢共用上下文；只讀 projects 與第一個 target 註解。"""
     PROJECTS_FILE = get_projects_file_path(projects_file_path)
-
-    if len(args) != 1:
-        raise ValueError("【讀取目錄樹失敗】：需要 1 個參數 (uuid)。")
-
-    uuid_target = args[0]
     projects_data = read_projects_data_readonly(PROJECTS_FILE)
     selected_project = next((p for p in projects_data if p.get('uuid') == uuid_target), None)
 
@@ -1010,13 +1014,10 @@ def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] =
         raise ValueError(f"未找到具有該 UUID 的專案 '{uuid_target}'。")
 
     project_path = selected_project.get('path')
-    targets = _get_targets_from_project(selected_project)
-    ignore_list = selected_project.get("ignore_patterns")
-    ignore_patterns = set(ignore_list) if isinstance(ignore_list, list) else None
-
     if not project_path or not os.path.isdir(project_path):
         raise ValueError(f"專案 '{selected_project.get('name')}' 的路徑不存在或無效。")
 
+    targets = _get_targets_from_project(selected_project)
     old_content = ""
     if targets:
         first_target = targets[0]
@@ -1027,17 +1028,132 @@ def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] =
             except Exception:
                 old_content = ""
 
+    ignore_list = selected_project.get("ignore_patterns")
+    ignore_patterns = set(ignore_list) if isinstance(ignore_list, list) else None
+    return {
+        "project": selected_project,
+        "project_path": project_path,
+        "old_content": old_content,
+        "ignore_patterns": ignore_patterns,
+    }
+
+
+def _tree_contains_depth_limit(node: Any) -> bool:
+    """檢查 tree 任一節點是否因 depth 限制而尚未載入 children。"""
+    if not isinstance(node, dict):
+        return False
+    if bool(node.get("depth_limited", False)):
+        return True
+    children = node.get("children", [])
+    return isinstance(children, list) and any(_tree_contains_depth_limit(child) for child in children)
+
+
+def _resolve_safe_project_directory(project_path: str, raw_path_key: str) -> Tuple[str, str]:
+    """把 project-relative path_key 解析為安全目錄，拒絕 traversal 與 symlink escape。"""
+    raw = str(raw_path_key or "").strip().replace("\\", "/")
+    if raw in ("", ".", "(root)"):
+        normalized_key = ""
+        relative_os_path = ""
+    else:
+        if raw.startswith("/") or os.path.splitdrive(raw)[0]:
+            raise ValueError("【讀取子節點失敗】：path_key 必須是專案根目錄下的相對路徑。")
+
+        parts = [part for part in raw.strip("/").split("/") if part not in ("", ".")]
+        if any(part == ".." for part in parts):
+            raise ValueError("【讀取子節點失敗】：path_key 不得包含 '..'。")
+        if parts and ":" in parts[0]:
+            raise ValueError("【讀取子節點失敗】：path_key 不得包含磁碟機或 URI 前綴。")
+
+        normalized_key = "/".join(parts)
+        relative_os_path = os.path.join(*parts) if parts else ""
+
+    project_real = os.path.realpath(project_path)
+    candidate = os.path.join(project_real, relative_os_path) if relative_os_path else project_real
+    candidate_real = os.path.realpath(candidate)
+
+    try:
+        is_contained = os.path.commonpath([project_real, candidate_real]) == project_real
+    except ValueError:
+        is_contained = False
+
+    if not is_contained:
+        raise ValueError("【讀取子節點失敗】：path_key 指向專案根目錄之外（含 symlink escape）。")
+    if not os.path.isdir(candidate_real):
+        raise ValueError(f"【讀取子節點失敗】：目錄不存在或不是資料夾 -> {raw_path_key}")
+
+    canonical_key = f"{normalized_key}/" if normalized_key else ""
+    return canonical_key, candidate_real
+
+
+def handle_get_project_tree(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    【API】依專案 UUID 取得結構化目錄樹資料。
+    只回傳 JSON 樹資料，不寫入 Markdown、不產生副作用。
+    """
+    if len(args) not in (1, 3):
+        raise ValueError("【讀取目錄樹失敗】：用法 get_project_tree <uuid> [--max-depth <n>]。")
+
+    uuid_target = args[0]
+    max_depth: Optional[int] = None
+    if len(args) == 3:
+        if args[1] != "--max-depth":
+            raise ValueError("【讀取目錄樹失敗】：可選參數必須是 --max-depth <n>。")
+        max_depth = _parse_tree_max_depth(args[2], "讀取目錄樹")
+
+    context = _load_project_tree_context(uuid_target, projects_file_path=projects_file_path)
+    selected_project = context["project"]
+    project_path = context["project_path"]
+
     tree_data = generate_structured_tree(
         project_path,
-        old_content_string=old_content,
-        ignore_patterns=ignore_patterns,
+        old_content_string=context["old_content"],
+        max_depth=max_depth,
+        ignore_patterns=context["ignore_patterns"],
     )
 
-    return {
+    response = {
         "uuid": uuid_target,
         "project_name": selected_project.get("name", "Unnamed_Project"),
         "project_path": project_path,
         "tree": tree_data,
+    }
+    if max_depth is not None:
+        response["max_depth"] = max_depth
+        response["depth_limited"] = _tree_contains_depth_limit(tree_data)
+    return response
+
+
+def handle_get_tree_children(args: List[str], projects_file_path: Optional[str] = None) -> Dict[str, Any]:
+    """【API】讀取專案內指定資料夾的 bounded children，正式資料與註解皆唯讀。"""
+    if len(args) not in (2, 3):
+        raise ValueError("【讀取子節點失敗】：用法 get_tree_children <uuid> <path_key> [depth]。")
+
+    uuid_target, raw_path_key = args[0], args[1]
+    depth = _parse_tree_max_depth(args[2], "讀取子節點") if len(args) == 3 else 1
+    context = _load_project_tree_context(uuid_target, projects_file_path=projects_file_path)
+    project_path = context["project_path"]
+    canonical_path_key, _safe_directory = _resolve_safe_project_directory(project_path, raw_path_key)
+
+    subtree = generate_structured_tree(
+        project_path,
+        old_content_string=context["old_content"],
+        max_depth=depth,
+        ignore_patterns=context["ignore_patterns"],
+        start_path_key=canonical_path_key,
+    )
+    children = subtree.get("children", []) if isinstance(subtree, dict) else []
+    parent = dict(subtree) if isinstance(subtree, dict) else {}
+    parent.pop("children", None)
+
+    return {
+        "uuid": uuid_target,
+        "project_name": context["project"].get("name", "Unnamed_Project"),
+        "project_path": project_path,
+        "parent_path_key": canonical_path_key,
+        "depth": depth,
+        "depth_limited": _tree_contains_depth_limit(subtree),
+        "parent": parent,
+        "children": children if isinstance(children, list) else [],
     }
 
 
@@ -1541,6 +1657,13 @@ def main_dispatcher(argv: List[str], **kwargs):
                 print("錯誤：缺少 UUID 參數。", file=sys.stderr)
                 return 1
             result = handle_get_project_tree(args, projects_file_path=projects_file_path)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+
+        elif command == 'get_tree_children':
+            if len(args) not in (2, 3):
+                print("錯誤：get_tree_children 需要 <uuid> <path_key> [depth]。", file=sys.stderr)
+                return 1
+            result = handle_get_tree_children(args, projects_file_path=projects_file_path)
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif command == 'preview_tree':

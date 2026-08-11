@@ -198,7 +198,8 @@ def _generate_tree(
     folder_spacing: int = 0,
     max_depth: Optional[int] = None,
     ignore_patterns: Optional[Set[str]] = None,
-) -> Tuple[List[str], List[TreeNode]]:
+    start_path_key: str = "",
+) -> Tuple[List[str], List[TreeNode], Dict[str, Dict[str, bool]]]:
     """
     產生目錄樹的純文字行列表，並同步產生每一行對應的相對路徑 key。
 
@@ -207,21 +208,43 @@ def _generate_tree(
     """
     lines: List[str] = []
     nodes: List[TreeNode] = []
+    node_load_metadata: Dict[str, Dict[str, bool]] = {}
 
-    # 根節點顯示名稱，例如 "laplace_sentry_control_v2/"
-    root_name = os.path.basename(os.path.normpath(root_path)) + "/"
+    normalized_start = str(start_path_key or "").replace("\\", "/").strip("/")
+    structured_root_key = f"{normalized_start}/" if normalized_start else ""
+    start_directory = (
+        os.path.join(root_path, *normalized_start.split("/"))
+        if normalized_start
+        else root_path
+    )
+
+    # 子樹查詢仍以 project-relative path_key 為座標，不把子資料夾重設為新專案根。
+    root_name = os.path.basename(os.path.normpath(start_directory)) + "/"
 
     # 根節點：對外仍然保留原本的顯示形式
     root_line = root_name
     lines.append(root_line)
-    # 根的相對路徑 key 我們定義為空字串 ""
-    nodes.append((root_line, ""))
+    nodes.append((root_line, structured_root_key))
 
     # 準備忽略名單：系統預設 + 使用者設定（聯集）
     if ignore_patterns:
         ignore_set: Set[str] = SYSTEM_DEFAULT_IGNORE | set(ignore_patterns)
     else:
         ignore_set = set(SYSTEM_DEFAULT_IGNORE)
+
+    def directory_has_visible_children(directory: str) -> bool:
+        try:
+            return any(name not in ignore_set for name in os.listdir(directory))
+        except OSError:
+            return False
+
+    root_has_children = directory_has_visible_children(start_directory)
+    root_children_loaded = not root_has_children or max_depth is None or max_depth >= 1
+    node_load_metadata[structured_root_key] = {
+        "has_children": root_has_children,
+        "children_loaded": root_children_loaded,
+        "depth_limited": root_has_children and not root_children_loaded,
+    }
 
     def recursive_helper(
         directory: str,
@@ -299,6 +322,21 @@ def _generate_tree(
             # 樹狀圖裡這一行是一個節點，有對應的 path key
             nodes.append((line, key))
 
+            if is_dir:
+                has_children = directory_has_visible_children(full_path)
+                children_loaded = not has_children or max_depth is None or depth < max_depth
+                node_load_metadata[key] = {
+                    "has_children": has_children,
+                    "children_loaded": children_loaded,
+                    "depth_limited": has_children and not children_loaded,
+                }
+            else:
+                node_load_metadata[key] = {
+                    "has_children": False,
+                    "children_loaded": True,
+                    "depth_limited": False,
+                }
+
             # 如果是資料夾，遞迴進去
             if is_dir:
                 child_prefix = prefix + ("    " if is_last else "│   ")
@@ -313,9 +351,9 @@ def _generate_tree(
                 nodes.append((spacer, None))
 
     # 從 root 下層開始遞迴，根本身已經手動加入
-    recursive_helper(root_path, prefix="", depth=1, rel_path="")
+    recursive_helper(start_directory, prefix="", depth=1, rel_path=structured_root_key)
 
-    return lines, nodes
+    return lines, nodes, node_load_metadata
 
 
 # ==============================================================================
@@ -427,6 +465,8 @@ def _build_structured_tree(
     tree_nodes: List[TreeNode],
     path_comments: Dict[str, str],
     basename_comments: Dict[str, str],
+    node_load_metadata: Optional[Dict[str, Dict[str, bool]]] = None,
+    root_path_key: str = "",
 ) -> Dict[str, object]:
     """
     將扁平的 tree_nodes 轉為巢狀 TreeNode JSON 結構。
@@ -446,6 +486,10 @@ def _build_structured_tree(
             "path_key": "",
             "is_dir": True,
             "comment": None,
+            "comment_exists": False,
+            "has_children": False,
+            "children_loaded": True,
+            "depth_limited": False,
             "children": [],
         }
 
@@ -457,7 +501,7 @@ def _build_structured_tree(
         if path_key is None:
             continue
 
-        is_root = (path_key == "")
+        is_root = (path_key == root_path_key)
         is_dir = is_root or path_key.endswith("/")
 
         if is_root:
@@ -479,6 +523,8 @@ def _build_structured_tree(
             if text and not text.startswith("TODO:"):
                 comment_exists = True
 
+        load_metadata = (node_load_metadata or {}).get(path_key, {})
+
         node_map[path_key] = {
             "name": name,
             "path_key": path_key,
@@ -487,12 +533,16 @@ def _build_structured_tree(
             "comment": comment,
             "comment_exists": comment_exists,
 
+            "has_children": bool(load_metadata.get("has_children", False)),
+            "children_loaded": bool(load_metadata.get("children_loaded", True)),
+            "depth_limited": bool(load_metadata.get("depth_limited", False)),
+
             "children": [],
         }
 
     # 第二輪：掛回父節點
     for path_key, node in node_map.items():
-        if path_key == "":
+        if path_key == root_path_key:
             continue
 
         parent_key = _get_parent_path_key(path_key)
@@ -507,13 +557,17 @@ def _build_structured_tree(
         if isinstance(parent_children, list):
             parent_children.append(node)
 
-    root_node = node_map.get("")
+    root_node = node_map.get(root_path_key)
     if root_node is None:
         return {
             "name": "",
             "path_key": "",
             "is_dir": True,
             "comment": None,
+            "comment_exists": False,
+            "has_children": False,
+            "children_loaded": True,
+            "depth_limited": False,
             "children": [],
         }
 
@@ -526,6 +580,7 @@ def generate_structured_tree(
     folder_spacing=0,
     max_depth=None,
     ignore_patterns=None,
+    start_path_key="",
 ):
     """
     提供給 UI 顯示鏈使用的結構化樹資料 API。
@@ -538,17 +593,23 @@ def generate_structured_tree(
         root_name,
     )
 
-    _tree_lines, tree_nodes = _generate_tree(
+    _tree_lines, tree_nodes, node_load_metadata = _generate_tree(
         root_path,
         folder_spacing=folder_spacing,
         max_depth=max_depth,
         ignore_patterns=ignore_patterns,
+        start_path_key=start_path_key,
     )
+
+    normalized_start = str(start_path_key or "").replace("\\", "/").strip("/")
+    structured_root_key = f"{normalized_start}/" if normalized_start else ""
 
     return _build_structured_tree(
         tree_nodes,
         path_comments,
         basename_comments,
+        node_load_metadata=node_load_metadata,
+        root_path_key=structured_root_key,
     )
 
 
@@ -571,7 +632,7 @@ def generate_annotated_tree(
     )
 
     # 2. 產生最新的樹狀結構
-    tree_lines, tree_nodes = _generate_tree(
+    tree_lines, tree_nodes, _node_load_metadata = _generate_tree(
         root_path,
         folder_spacing=folder_spacing,
         max_depth=max_depth,

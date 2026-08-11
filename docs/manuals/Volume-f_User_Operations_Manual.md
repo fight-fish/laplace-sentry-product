@@ -118,7 +118,7 @@ run_ui.bat
 
 ---
 
-# 6. Manual Update 手動更新
+# 6. Manual Project Update 手動更新專案內容
 
 若需立即更新：
 
@@ -128,7 +128,24 @@ run_ui.bat
 
 ---
 
-# 7. Understanding Status 理解系統狀態
+這裡的「立即更新」只表示重新掃描使用者專案並更新樹狀結構或輸出文件，不會更新 Laplace Sentry 產品程式，也不會改寫 Windows 或 WSL 正式安裝副本。
+
+---
+
+# 7. Product Version Upgrade 產品版本升級
+
+產品版本升級是部署行為，與上一節的專案內容更新不同。
+
+- `install.bat` 只用於首次安裝；已有正式副本時不得用重新安裝代替升級。
+- `upgrade.bat` 的公開能力只提供安全預演與指定 TEMP staging，不會直接套用到正式副本。
+- 正式升級必須由系統維護者依當輪正式裁決完成預檢、資料保護、準備、驗證、套用與必要回復。
+- 一般使用者不得直接呼叫原始碼中的內部模式，也不要手動複製整個工作樹覆蓋正式安裝位置。
+
+若需要產品升級，請先聯絡系統維護者確認本輪版本來源、受保護資料、停止條件與回復方式。文件存在或測試通過，不代表正式升級已可無條件自助執行。
+
+---
+
+# 8. Understanding Status 理解系統狀態
 
 ---
 
@@ -146,7 +163,7 @@ run_ui.bat
 
 ---
 
-# 8. Common Scenarios 常見使用情境
+# 9. Common Scenarios 常見使用情境
 
 ---
 
@@ -168,7 +185,7 @@ run_ui.bat
 
 ---
 
-# 9. Troubleshooting 常見問題排除
+# 10. Troubleshooting 常見問題排除
 
 ---
 
@@ -193,7 +210,7 @@ run_ui.bat
 
 ---
 
-# 10. Safety Guidelines 操作安全指引
+# 11. Safety Guidelines 操作安全指引
 
 ⚠ 不要手動刪除系統資料夾
 ⚠ 不要強制關閉背景監控
@@ -201,7 +218,7 @@ run_ui.bat
 
 ---
 
-# 11. Glossary 名詞解釋
+# 12. Glossary 名詞解釋
 
 | 名詞   | 說明        |
 | ---- | --------- |
@@ -212,7 +229,7 @@ run_ui.bat
 
 ---
 
-# 12. Support 支援資訊
+# 13. Support 支援資訊
 
 若遇到問題：
 
@@ -222,7 +239,7 @@ run_ui.bat
 
 ---
 
-# 13. Manual Authority 手冊效力聲明
+# 14. Manual Authority 手冊效力聲明
 
 本手冊為：
 

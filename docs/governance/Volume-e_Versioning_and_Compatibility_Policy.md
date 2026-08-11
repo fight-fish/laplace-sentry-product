@@ -233,7 +233,53 @@ MAJOR.MINOR.PATCH
 
 ---
 
-# 9. Constitutional Authority 憲章效力聲明
+# 9. Current Upgrade Governance 現役升級治理
+
+## 9.1 現役升級治理模型
+
+### 單一目標真相
+
+正式升級的 target commit 只允許由正式準備 helper 的單一欄位宣告。其他主程序、測試與文件只能讀取或指向該來源，不得各自複製一份動態版本值。
+
+### Basis 與 checkpoint gate
+
+正式準備前必須核對指定分支、遠端主線、staged 狀態（Git 暫存區）及既有修改範圍。staged 非空必須拒絕；dirty／untracked 僅接受正式 helper 明列的允許範圍，未列入允許範圍的 dirty 或 untracked 路徑必須拒絕。
+
+checkpoint 只能是明示核准錨點，或符合核准 parent lineage 與精確 changed-path shape 的單一直接子版本。不得把任意後代、合併形狀、少檔、多檔或替換檔視為等價基準。
+
+### Transaction journal 與 marker-last
+
+正式準備與套用以 transaction journal 作為交易狀態與可恢復步驟的單一證據。套用前先封存原貌與來源證據；受控檔案全部寫入並通過檢查後，版本 marker 才能最後更新。
+
+若中途失敗、證據不完整或重入狀態不明，流程必須停止並依 journal、preimage 與已完成步驟進入 rollback 或 recovery，不得靠重新複製整包掩蓋半輪狀態。
+
+### 受保護資料與三副本邊界
+
+升級流程必須明確區分：
+
+1. 開發工作樹：原始碼、文件與測試的主要工程真相。
+2. Windows Frontend 正式安裝副本：使用者實際啟動的前端及其本機設定。
+3. WSL Backend 正式執行副本：後端程式、環境與受保護持久資料。
+
+正式升級不得把工作樹修改直接視為 runtime 已更新，也不得用首次安裝器覆蓋既有副本。專案資料、設定、版本標記與其他受保護項目必須依 manifest、備份與驗證契約處理。
+
+### 證據分級
+
+| 證據層 | 能證明什麼 | 不能外推什麼 |
+| --- | --- | --- |
+| Quick gate | 日常語法、靜態契約、Python contract 與少量 TEMP 代表案例仍在 | 不代表完整 heavy matrix 或正式環境成立 |
+| Heavy TEMP matrix | 在隔離目標中驗證失敗注入、重入、回復與邊界 | 不代表真實正式副本已檢查或套用 |
+| Formal environment evidence | 經明確授權後，對正式環境進行唯讀預檢、準備、套用或復原所得證據 | 不得由較低層綠燈自動推定 |
+
+任何一層通過，都只能支持該層實際執行的結論；release ready 必須另依正式發佈條件裁定。
+
+### 正式授權邊界
+
+公開升級入口只承接安全 dry-run 與 TEMP staging。正式 preflight、prepare、validation、apply 與 recovery 均屬授權制能力；存在內部實作或測試不等於已授權執行。
+
+---
+
+# 10. Constitutional Authority 憲章效力聲明
 
 本文件為：
 
