@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 使一筆已被裁決為舊目標的正式 prepare 交易失效，但不碰正式目標。
 .DESCRIPTION
@@ -40,7 +40,11 @@ function Read-FormalInvalidateJournal {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Transaction journal is missing.' }
     try { $journal = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Transaction journal is unreadable.' }
     foreach ($field in @('schema','mode','state','result','transaction_id','transaction_root','transaction_parent','target_commit','manifests','formal_target_write_count')) { if ($null -eq $journal.PSObject.Properties[$field]) { throw "[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Journal is missing required field: $field" } }
-    if ($journal.schema -ne $FormalPrepareSchema -or $journal.mode -ne 'PrepareFormal' -or $journal.state -ne 'prepared_pending_apply' -or [int]$journal.formal_target_write_count -ne 0) { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Journal is not an intact prepared zero-write transaction.' }
+    if ($journal.schema -ne $FormalPrepareSchema -or $journal.mode -ne 'PrepareFormal' -or
+        $journal.state -ne 'prepared_pending_apply' -or $journal.result -ne 'prepared' -or
+        [int]$journal.formal_target_write_count -ne 0) {
+        throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Journal is not an intact prepared zero-write transaction.'
+    }
     if (-not (Test-PathsEqual -First $Inputs.TransactionRoot -Second ([string]$journal.transaction_root)) -or -not (Test-PathsEqual -First (Split-Path -Leaf $Inputs.TransactionRoot) -Second ([string]$journal.transaction_id)) -or -not (Test-PathsEqual -First (Split-Path -Parent $Inputs.TransactionRoot) -Second ([string]$journal.transaction_parent))) { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Explicit transaction path and journal identity disagree.' }
     if ([bool](Get-OptionalProperty -Object $journal -Name 'fixture_mode' -Default $false)) { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Formal internal invalidation rejects fixture journals.' }
     if ([string]$journal.target_commit -eq $FormalUpgradeTargetCommit) { throw '[UPGRADE_INVALIDATE_TARGET_MATCH] Selected transaction already names the ruled target commit.' }
@@ -55,7 +59,7 @@ function Assert-FormalInvalidatedJournal {
     if ($journal.state -ne 'invalidated' -or $journal.result -ne 'invalidated' -or @($journal.events | Where-Object { $_ -eq 'invalidated:stale_target_commit' }).Count -ne 1) { throw '[UPGRADE_INVALIDATE_RESULT_FAIL] Invalidated terminal state or event is missing.' }
     $inv = $journal.invalidation
     foreach ($field in @('reason_code','prior_state','prior_result','observed_target_commit','ruled_target_commit','invalidated_at_utc','invocation_mode','journal_sha256_before','manifest_sha256')) { if ($null -eq $inv.PSObject.Properties[$field]) { throw "[UPGRADE_INVALIDATE_RESULT_FAIL] Invalidation evidence is missing: $field" } }
-    if ($inv.reason_code -ne 'stale_target_commit' -or $inv.prior_state -ne 'prepared_pending_apply' -or $inv.prior_result -ne 'prepared_pending_apply' -or $inv.observed_target_commit -eq $inv.ruled_target_commit -or $inv.ruled_target_commit -ne $FormalUpgradeTargetCommit -or $inv.invocation_mode -ne 'InvalidateFormalInternal' -or $inv.journal_sha256_before -ne $BeforeHash) { throw '[UPGRADE_INVALIDATE_RESULT_FAIL] Invalidation evidence is inconsistent.' }
+    if ($inv.reason_code -ne 'stale_target_commit' -or $inv.prior_state -ne 'prepared_pending_apply' -or $inv.prior_result -ne 'prepared' -or $inv.observed_target_commit -eq $inv.ruled_target_commit -or $inv.ruled_target_commit -ne $FormalUpgradeTargetCommit -or $inv.invocation_mode -ne 'InvalidateFormalInternal' -or $inv.journal_sha256_before -ne $BeforeHash) { throw '[UPGRADE_INVALIDATE_RESULT_FAIL] Invalidation evidence is inconsistent.' }
     foreach ($name in @('source','preimage','package')) { if ([string]$inv.manifest_sha256.$name -ne [string]$Record.ManifestHashes.$name) { throw "[UPGRADE_INVALIDATE_RESULT_FAIL] Manifest hash evidence changed: $name" } }
     if ([int]$journal.formal_target_write_count -ne 0) { throw '[UPGRADE_INVALIDATE_RESULT_FAIL] Invalidation crossed the zero formal-write boundary.' }
 }
@@ -70,7 +74,7 @@ function Invoke-FormalInvalidateInternalMode {
         $beforeHash = Get-FileSha256 $record.Path
         $journal = $record.Journal
         $journal.events = @($journal.events) + 'invalidated:stale_target_commit'
-        $journal | Add-Member -NotePropertyName invalidation -NotePropertyValue ([pscustomobject][ordered]@{ reason_code='stale_target_commit'; prior_state='prepared_pending_apply'; prior_result=[string]$journal.result; observed_target_commit=[string]$journal.target_commit; ruled_target_commit=$FormalUpgradeTargetCommit; invalidated_at_utc=[DateTime]::UtcNow.ToString('o'); invocation_mode='InvalidateFormalInternal'; journal_sha256_before=$beforeHash; manifest_sha256=$record.ManifestHashes }) -Force
+        $journal | Add-Member -NotePropertyName invalidation -NotePropertyValue ([pscustomobject][ordered]@{ reason_code='stale_target_commit'; prior_state=[string]$journal.state; prior_result=[string]$journal.result; observed_target_commit=[string]$journal.target_commit; ruled_target_commit=$FormalUpgradeTargetCommit; invalidated_at_utc=[DateTime]::UtcNow.ToString('o'); invocation_mode='InvalidateFormalInternal'; journal_sha256_before=$beforeHash; manifest_sha256=$record.ManifestHashes }) -Force
         $journal.state = 'invalidated'; $journal.result = 'invalidated'
         Save-MixedRepairJournal -JournalPath $record.Path -Journal $journal
         $after = [pscustomobject]@{ Path=$record.Path; Journal=(Get-Content -LiteralPath $record.Path -Raw -Encoding UTF8 | ConvertFrom-Json); ManifestHashes=$record.ManifestHashes }
