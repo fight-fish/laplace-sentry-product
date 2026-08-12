@@ -32,6 +32,8 @@ $FormalPrepareTestBaselineHead = 'ff66dafb2e89491ec53976198231bee95e5b0dc7'
 $FormalPrepareUpgradeCoreCheckpointHead = '39c6378ed984b4caa08357b45ed1fe3acfd98e28'
 # 決策 283/284 核准的測試修正存檔點；只允許精確兩檔的單一直接子提交，不接受更深後代。
 $FormalPrepareInvalidationContractCheckpointHead = '803a3f480d545d53b40352dde09d98cd4704a003'
+# 決策 291 退修基準；只允許精確兩檔的單一直接子提交，不接受更深後代。
+$FormalPrepareRealMergeBasisCheckpointHead = '61fd4d158be8f0b3953357ab966bc15bb401d06f'
 # 決策 289 核准的合併後主線重錨；live Prepare 只接受 local main 等於 origin/main 且位於此合併提交。
 $FormalPreparePreMergeMainHead = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 $FormalPrepareMergedMainHead = '1b8f4ba83589bae3694c27ffa630fc0051a224b7'
@@ -103,7 +105,8 @@ $FormalPrepareApprovedCheckpointHeads = @(
     $FormalPrepareInvalidatedCheckpointHead,
     $FormalPrepareTestBaselineHead,
     $FormalPrepareUpgradeCoreCheckpointHead,
-    $FormalPrepareInvalidationContractCheckpointHead
+    $FormalPrepareInvalidationContractCheckpointHead,
+    $FormalPrepareRealMergeBasisCheckpointHead
 )
 $FormalPrepareAuthorizedChildPathsByParent = @{}
 $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareCheckpointHead] = @($FormalPrepareCheckpointPaths)
@@ -111,6 +114,7 @@ $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareApplyCheckpointHead] = 
 $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareInvalidatedCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
 $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareUpgradeCoreCheckpointHead] = @($FormalPrepareUpgradeCoreCheckpointPaths)
 $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareInvalidationContractCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareRealMergeBasisCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
 $FormalPrepareFixtureDirtyPaths = @($FormalPrepareApplyCheckpointPaths + 'tests/upgrade_mixed_repair_smoke.ps1')
 $FormalUpgradeTargetCommit = 'd9bd8b21fb47a07154d0c730f90dab9ec69b85f1'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
@@ -255,7 +259,7 @@ function Test-FormalPrepareApprovedMergeShape {
     if ($parents.Count -ne 2) {
         return $false
     }
-    if (-not (($parents -contains $FormalPreparePreMergeMainHead) -and ($parents -contains $FormalPrepareApprovedMergeSourceHead))) {
+    if ($parents[0] -ne $FormalPreparePreMergeMainHead -or $parents[1] -ne $FormalPrepareApprovedMergeSourceHead) {
         return $false
     }
     if (-not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareMergeMainPaths -ActualPaths $ChangedPaths)) {
@@ -332,7 +336,11 @@ function Assert-FormalPrepareCheckpointBasis {
             } else {
                 $ParentHead = ''
             }
-            $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+            if ($ParentHeads.Count -gt 1) {
+                $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $ParentHeads[0], $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+            } else {
+                $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+            }
             $CurrentTree = (Get-GitOutput -Arguments @('show', '-s', '--format=%T', $CurrentHead) | Select-Object -First 1).Trim()
         } catch {
             throw "[$FailureTag] checkpoint_basis_unverified: $($_.Exception.Message)"
