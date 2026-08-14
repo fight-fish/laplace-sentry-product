@@ -62,7 +62,6 @@ $BackendSource = Join-Path $RepoRoot 'Backend'
 $TempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $FormalFrontendTarget = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendTarget = '\\wsl.localhost\Ubuntu\home\serpal\.laplace_sentry_backend'
-$MixedRepairOriginMain = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
 
 # 同一 immutable commit 的 Git object metadata 不會在同一 prepare process 內改變；只快取這類查詢，絕不快取 working-tree hash。
 $global:LaplaceSentryImmutableGitOutputCache = @{}
@@ -1234,8 +1233,8 @@ function Assert-MixedRepoBasis {
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
     if ($branch -ne 'main') { throw "[UPGRADE_MIXED_BASIS_FAIL] Expected branch main, got $branch." }
     [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head -FailureTag 'UPGRADE_MIXED_BASIS_FAIL')
-    if (-not $originMain.Equals($MixedRepairOriginMain, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "[UPGRADE_MIXED_BASIS_FAIL] origin/main changed: $originMain"
+    if (-not $originMain.Equals($head, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "[UPGRADE_MIXED_BASIS_FAIL] Structurally approved HEAD differs from origin/main: head=$head origin_main=$originMain"
     }
     if ($staged.Count -gt 0) {
         throw "[UPGRADE_MIXED_BASIS_FAIL] Staged changes are forbidden: $($staged -join ', ')"

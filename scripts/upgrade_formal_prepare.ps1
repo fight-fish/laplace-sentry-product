@@ -22,101 +22,23 @@ Side effects: writes only below the verified transaction parent; never writes fo
 Set-StrictMode -Version Latest
 
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
-$FormalPrepareRepoHead = '942b418b23c86bda1f8a7382877798d0d89279b0'
-$FormalPrepareCheckpointHead = '97165869fb82f6eeb1bf3803fbe868d20532ffc7'
-$FormalPrepareApplyCheckpointHead = '175dc2f1000e17e3977e856fd2501e7afa40690b'
-$FormalPrepareInvalidatedCheckpointHead = '0dfd996d11d72b188e1ae4c2407eb138140dbafb'
-# 決策 227 核准的五檔測試基線；只接受此精確 commit，不接受任意後續 descendant。
-$FormalPrepareTestBaselineHead = 'ff66dafb2e89491ec53976198231bee95e5b0dc7'
-# 決策 242 核准的升級核心錨點；只允許精確五檔的單一直接子提交，不接受更深後代。
-$FormalPrepareUpgradeCoreCheckpointHead = '39c6378ed984b4caa08357b45ed1fe3acfd98e28'
-# 決策 283/284 核准的測試修正存檔點；只允許精確兩檔的單一直接子提交，不接受更深後代。
-$FormalPrepareInvalidationContractCheckpointHead = '803a3f480d545d53b40352dde09d98cd4704a003'
-# 決策 291 退修基準；只允許精確兩檔的單一直接子提交，不接受更深後代。
-$FormalPrepareRealMergeBasisCheckpointHead = '61fd4d158be8f0b3953357ab966bc15bb401d06f'
-# 決策 289 核准的合併後主線重錨；live Prepare 只接受 local main 等於 origin/main 且位於此合併提交。
-$FormalPreparePreMergeMainHead = '1e7bc2b8c3f03d81c79617b0328cfd51f40c0ac1'
-$FormalPrepareMergedMainHead = '1b8f4ba83589bae3694c27ffa630fc0051a224b7'
-$FormalPrepareApprovedMergeSourceHead = '19d2cfccc39b9fe4eb58f69cefe3435998f0c5ec'
-$FormalPrepareApprovedMergeTree = 'e69fa87b10d2469b52d279678099a71277691a76'
-$FormalPrepareOriginMain = $FormalPrepareMergedMainHead
-$FormalPrepareCheckpointPaths = @(
+# 決策 314 核准的現役 main anchor；只允許它、精確六檔的單一直接子，以及該子提交的唯一 merge shape。
+$FormalPrepareApprovedBasisAnchorHead = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
+$FormalPrepareApprovedBasisPaths = @(
     'scripts/upgrade_formal_prepare.ps1',
-    'tests/upgrade_formal_prepare_smoke.ps1'
-)
-$FormalPrepareApplyCheckpointPaths = @(
-    'scripts/upgrade.ps1',
-    'scripts/upgrade_formal_apply.ps1',
-    'tests/upgrade_formal_apply_smoke.ps1',
-    'scripts/upgrade_formal_prepare.ps1',
-    'tests/upgrade_formal_prepare_smoke.ps1'
-)
-$FormalPrepareInvalidatedCheckpointPaths = @(
-    'scripts/upgrade_formal_prepare.ps1',
-    'tests/upgrade_formal_prepare_smoke.ps1'
-)
-$FormalPrepareUpgradeCoreCheckpointPaths = @(
-    'scripts/upgrade.ps1',
-    'scripts/upgrade_formal_prepare.ps1',
-    'tests/upgrade_formal_apply_smoke.ps1',
     'tests/upgrade_formal_prepare_smoke.ps1',
-    'tests/upgrade_mixed_repair_smoke.ps1'
-)
-$FormalPrepareMergeMainPaths = @(
-    'Backend/src/core/daemon.py',
-    'Backend/src/core/engine.py',
-    'docs/governance/volume-a-system-constitution-and-architecture.md',
-    'docs/governance/Volume-b_System_Entry_Points_and_Operations_Manual.md',
-    'docs/governance/Volume-c_Data_Contract_and_API_Specification.md',
-    'docs/governance/Volume-e_Versioning_and_Compatibility_Policy.md',
-    'docs/manuals/Volume-f_User_Operations_Manual.md',
-    'Frontend/run_dev_ui.bat',
-    'Frontend/run_ui.bat',
-    'Frontend/run_ui.vbs',
-    'Frontend/src/backend/adapter.py',
-    'Frontend/src/tray/tray_app.py',
-    'install.bat',
-    'README.md',
     'scripts/upgrade.ps1',
-    'scripts/upgrade_formal_apply.ps1',
-    'scripts/upgrade_formal_invalidate.ps1',
-    'scripts/upgrade_formal_prepare.ps1',
-    'tests/_tree_query_contract_bootstrap.py',
-    'tests/README.md',
-    'tests/run_upgrade_quick_gate.ps1',
-    'tests/test_frontend_lazy_tree_contract.py',
-    'tests/test_tree_query_contract.py',
-    'tests/upgrade_formal_apply_smoke.ps1',
-    'tests/upgrade_formal_invalidate_smoke.ps1',
-    'tests/upgrade_formal_preflight_contract.ps1',
-    'tests/upgrade_formal_preflight_smoke.ps1',
-    'tests/upgrade_formal_prepare_smoke.ps1',
-    'tests/upgrade_isolated_apply_smoke.ps1',
-    'tests/upgrade_isolated_smoke.ps1',
     'tests/upgrade_mixed_repair_smoke.ps1',
-    'uninstall.bat',
-    'uninstall_zh.ps1',
-    'upgrade.bat'
+    'tests/upgrade_formal_apply_smoke.ps1',
+    'tests/test_frontend_lazy_tree_contract.py'
 )
 $FormalPrepareApprovedCheckpointHeads = @(
-    $FormalPrepareRepoHead,
-    $FormalPrepareCheckpointHead,
-    $FormalPrepareApplyCheckpointHead,
-    $FormalPrepareInvalidatedCheckpointHead,
-    $FormalPrepareTestBaselineHead,
-    $FormalPrepareUpgradeCoreCheckpointHead,
-    $FormalPrepareInvalidationContractCheckpointHead,
-    $FormalPrepareRealMergeBasisCheckpointHead
+    $FormalPrepareApprovedBasisAnchorHead
 )
 $FormalPrepareAuthorizedChildPathsByParent = @{}
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareCheckpointHead] = @($FormalPrepareCheckpointPaths)
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareApplyCheckpointHead] = @($FormalPrepareApplyCheckpointPaths)
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareInvalidatedCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareUpgradeCoreCheckpointHead] = @($FormalPrepareUpgradeCoreCheckpointPaths)
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareInvalidationContractCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
-$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareRealMergeBasisCheckpointHead] = @($FormalPrepareInvalidatedCheckpointPaths)
-$FormalPrepareFixtureDirtyPaths = @($FormalPrepareApplyCheckpointPaths + 'tests/upgrade_mixed_repair_smoke.ps1')
-$FormalUpgradeTargetCommit = 'd9bd8b21fb47a07154d0c730f90dab9ec69b85f1'
+$FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareApprovedBasisAnchorHead] = @($FormalPrepareApprovedBasisPaths)
+$FormalPrepareFixtureDirtyPaths = @($FormalPrepareApprovedBasisPaths)
+$FormalUpgradeTargetCommit = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
 $FormalPrepareJournalReserveBytes = [int64](1MB)
 $FormalPrepareSafetyMarginBytes = [int64](64MB)
@@ -249,23 +171,25 @@ function Test-FormalPrepareApprovedMergeShape {
         [string]$CurrentHead,
         [string[]]$ParentHeads,
         [string[]]$ChangedPaths,
-        [string]$CurrentTree = ''
+        [string]$CurrentTree = '',
+        [string[]]$ApprovedSourceParentHeads = @(),
+        [string[]]$ApprovedSourceChangedPaths = @(),
+        [string]$ApprovedSourceTree = ''
     )
 
-    if ($CurrentHead -ne $FormalPrepareMergedMainHead) {
-        return $false
-    }
     $parents = @($ParentHeads | Where-Object { $_ })
-    if ($parents.Count -ne 2) {
+    if ($parents.Count -ne 2 -or $parents[0] -ne $FormalPrepareApprovedBasisAnchorHead) {
         return $false
     }
-    if ($parents[0] -ne $FormalPreparePreMergeMainHead -or $parents[1] -ne $FormalPrepareApprovedMergeSourceHead) {
+    $sourceParents = @($ApprovedSourceParentHeads | Where-Object { $_ })
+    if ($sourceParents.Count -ne 1 -or $sourceParents[0] -ne $FormalPrepareApprovedBasisAnchorHead) {
         return $false
     }
-    if (-not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareMergeMainPaths -ActualPaths $ChangedPaths)) {
+    if (-not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareApprovedBasisPaths -ActualPaths $ApprovedSourceChangedPaths) -or
+        -not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareApprovedBasisPaths -ActualPaths $ChangedPaths)) {
         return $false
     }
-    if ($CurrentTree -and $CurrentTree -ne $FormalPrepareApprovedMergeTree) {
+    if (-not $CurrentTree -or -not $ApprovedSourceTree -or $CurrentTree -ne $ApprovedSourceTree) {
         return $false
     }
     return $true
@@ -277,19 +201,19 @@ function Test-FormalPrepareCheckpointShape {
         [string]$ParentHead,
         [string[]]$ChangedPaths,
         [string[]]$ParentHeads = @(),
-        [string]$CurrentTree = ''
+        [string]$CurrentTree = '',
+        [string[]]$ApprovedSourceParentHeads = @(),
+        [string[]]$ApprovedSourceChangedPaths = @(),
+        [string]$ApprovedSourceTree = ''
     )
 
     if ($FormalPrepareApprovedCheckpointHeads -contains $CurrentHead) {
         return $true
     }
     if ($ParentHeads.Count -gt 1) {
-        return Test-FormalPrepareApprovedMergeShape -CurrentHead $CurrentHead -ParentHeads $ParentHeads -ChangedPaths $ChangedPaths -CurrentTree $CurrentTree
+        return Test-FormalPrepareApprovedMergeShape -CurrentHead $CurrentHead -ParentHeads $ParentHeads -ChangedPaths $ChangedPaths -CurrentTree $CurrentTree -ApprovedSourceParentHeads $ApprovedSourceParentHeads -ApprovedSourceChangedPaths $ApprovedSourceChangedPaths -ApprovedSourceTree $ApprovedSourceTree
     }
-    if (-not $ParentHead) {
-        return $false
-    }
-    if (-not $FormalPrepareAuthorizedChildPathsByParent.ContainsKey($ParentHead)) {
+    if (-not $ParentHead -or -not $FormalPrepareAuthorizedChildPathsByParent.ContainsKey($ParentHead)) {
         return $false
     }
     return Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareAuthorizedChildPathsByParent[$ParentHead] -ActualPaths $ChangedPaths
@@ -302,14 +226,14 @@ function Assert-FormalPrepareCheckpointBasis {
         [string]$ParentHead = '',
         [string[]]$ChangedPaths = @(),
         [string[]]$ParentHeads = @(),
-        [string]$CurrentTree = ''
+        [string]$CurrentTree = '',
+        [string[]]$ApprovedSourceParentHeads = @(),
+        [string[]]$ApprovedSourceChangedPaths = @(),
+        [string]$ApprovedSourceTree = ''
     )
 
     if (-not $CurrentHead) {
         throw "[$FailureTag] unable_to_resolve_head"
-    }
-    if ($CurrentHead -eq $FormalPrepareRepoHead) {
-        return 'working_tree'
     }
     if ($FormalPrepareApprovedCheckpointHeads -contains $CurrentHead) {
         return 'checkpoint'
@@ -317,27 +241,24 @@ function Assert-FormalPrepareCheckpointBasis {
 
     $hasSuppliedShape = $PSBoundParameters.ContainsKey('ChangedPaths') -and ($PSBoundParameters.ContainsKey('ParentHeads') -or $PSBoundParameters.ContainsKey('ParentHead'))
     if (-not $PSBoundParameters.ContainsKey('ParentHeads')) {
-        if ($ParentHead) {
-            $ParentHeads = @($ParentHead)
-        } else {
-            $ParentHeads = @()
-        }
+        if ($ParentHead) { $ParentHeads = @($ParentHead) } else { $ParentHeads = @() }
     }
 
     if (-not $hasSuppliedShape) {
         try {
             $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $CurrentHead) | Select-Object -First 1).Trim()) -split '\s+'
-            if ($identity.Count -lt 2) {
-                throw 'unexpected_parent_shape'
-            }
+            if ($identity.Count -lt 2) { throw 'unexpected_parent_shape' }
             $ParentHeads = @($identity[1..($identity.Count - 1)])
-            if ($ParentHeads.Count -eq 1) {
-                $ParentHead = $ParentHeads[0]
-            } else {
-                $ParentHead = ''
-            }
+            if ($ParentHeads.Count -eq 1) { $ParentHead = $ParentHeads[0] } else { $ParentHead = '' }
             if ($ParentHeads.Count -gt 1) {
                 $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $ParentHeads[0], $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+                $approvedSourceHead = $ParentHeads[1]
+                $approvedSourceIdentity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $approvedSourceHead) | Select-Object -First 1).Trim()) -split '\s+'
+                if ($approvedSourceIdentity.Count -lt 2) { throw 'unexpected_approved_source_parent_shape' }
+                $ApprovedSourceParentHeads = @($approvedSourceIdentity[1..($approvedSourceIdentity.Count - 1)])
+                if ($ApprovedSourceParentHeads.Count -ne 1) { throw 'unexpected_approved_source_parent_shape' }
+                $ApprovedSourceChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $ApprovedSourceParentHeads[0], $approvedSourceHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+                $ApprovedSourceTree = (Get-GitOutput -Arguments @('show', '-s', '--format=%T', $approvedSourceHead) | Select-Object -First 1).Trim()
             } else {
                 $ChangedPaths = @(Get-GitOutput -Arguments @('diff-tree', '--no-commit-id', '--name-only', '-r', $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
             }
@@ -347,25 +268,28 @@ function Assert-FormalPrepareCheckpointBasis {
         }
     }
 
-    if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths -ParentHeads $ParentHeads -CurrentTree $CurrentTree)) {
-        throw "[$FailureTag] Expected an approved prepare/apply checkpoint anchor, its exact single authorized direct child, or the approved post-merge main shape; got $CurrentHead."
+    if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths -ParentHeads $ParentHeads -CurrentTree $CurrentTree -ApprovedSourceParentHeads $ApprovedSourceParentHeads -ApprovedSourceChangedPaths $ApprovedSourceChangedPaths -ApprovedSourceTree $ApprovedSourceTree)) {
+        throw "[$FailureTag] Expected the ruled basis anchor, its exact six-file direct child, or that child's exact post-merge main shape; got $CurrentHead."
     }
     return 'checkpoint'
 }
+
 function Assert-FormalPrepareRepoState {
     param(
+        [Parameter(Mandatory = $true)][string]$CurrentHead,
         [Parameter(Mandatory = $true)][string]$OriginMain,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Staged,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Dirty,
         [bool]$FixtureMode
     )
-    if (-not $OriginMain.Equals($FormalPrepareOriginMain, [System.StringComparison]::OrdinalIgnoreCase) -or $Staged.Count -gt 0) {
-        throw '[UPGRADE_PREPARE_BASIS_FAIL] origin/main changed or staged files exist.'
+    if (-not $OriginMain.Equals($CurrentHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Current structurally approved HEAD differs from origin/main.'
+    }
+    if ($Staged.Count -gt 0) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Staged files exist.'
     }
     $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
-    if ($FixtureMode) {
-        $allowed += $FormalPrepareFixtureDirtyPaths
-    }
+    if ($FixtureMode) { $allowed += $FormalPrepareFixtureDirtyPaths }
     $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
     $unexpected = @($normalizedDirty | Where-Object { $_ -notin $allowed })
     if ($unexpected.Count -gt 0) {
@@ -386,6 +310,7 @@ function Assert-FormalPrepareMainBranch {
 function Assert-FormalPrepareRepoBasis {
     param([bool]$FixtureMode)
     $branch = Assert-FormalPrepareMainBranch -BranchOutput (Get-GitOutput -Arguments @('branch', '--show-current') | Select-Object -First 1)
+
     $head = Get-HeadCommit
     $originMain = (Get-GitOutput -Arguments @('rev-parse', 'origin/main') | Select-Object -First 1).Trim()
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
@@ -393,7 +318,7 @@ function Assert-FormalPrepareRepoBasis {
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }
     })
-    Assert-FormalPrepareRepoState -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
+    Assert-FormalPrepareRepoState -CurrentHead $head -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
     $plan = New-UpgradePlan -Inputs ([pscustomobject]@{
         Mode = 'PrepareFormal'
         BuildVersion = $FormalUpgradeTargetCommit.Substring(0, 7)
@@ -404,7 +329,6 @@ function Assert-FormalPrepareRepoBasis {
     })
     Assert-ManagedSourcesMatchHead -Plan $plan
 }
-
 function Get-FormalPrepareObservation {
     param([Parameter(Mandatory = $true)]$Inputs)
     if (Test-FormalPrepareFixtureMode -Inputs $Inputs) {

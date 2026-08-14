@@ -33,6 +33,8 @@ $TempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $SuiteRoot = Join-Path $TempBase ('LaplaceSentryFormalApplySmoke-' + [Guid]::NewGuid().ToString('N'))
 $OutsideRoot = Join-Path $TempBase ('LaplaceSentryFormalApplyOutside-' + [Guid]::NewGuid().ToString('N'))
 $TemplateRoot = Join-Path $SuiteRoot '_template'
+$GitBranchShim = Join-Path $SuiteRoot '_git-branch-shim\git.cmd'
+$RealGitExe = (Get-Command git.exe -ErrorAction Stop).Source
 $FormalFrontend = Join-Path $env:LOCALAPPDATA 'LaplaceSentry'
 $FormalBackendLinux = '/home/serpal/.laplace_sentry_backend'
 $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
@@ -72,6 +74,28 @@ function Quote-Argument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Initialize-BranchOnlyGitShim {
+    $shimRoot = Split-Path -Parent $GitBranchShim
+    New-Item -ItemType Directory -Path $shimRoot -Force | Out-Null
+    $content = @"
+@echo off
+if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="--show-current" if "%~5"=="" (
+  echo main
+  exit /b 0
+)
+"$RealGitExe" %*
+"@
+    Set-Content -LiteralPath $GitBranchShim -Value $content -Encoding ASCII
+}
+
+function Assert-BranchOnlyGitShimContract {
+    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 'main') 'Branch-only Git shim did not simulate main.'
+    foreach ($revision in @('HEAD', 'origin/main')) {
+        $throughShim = (& $GitBranchShim -C $RepoRoot rev-parse $revision).Trim()
+        $throughRealGit = (& $RealGitExe -C $RepoRoot rev-parse $revision).Trim()
+        Assert-True ($throughShim -eq $throughRealGit) "Branch-only Git shim intercepted non-branch truth: $revision"
+    }
+}
 function Get-ExpectedManagedPaths {
     $specs = @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ }) + @($BackendAllowlist | ForEach-Object { 'Backend/' + $_ })
     $paths = @(& git -C $RepoRoot ls-tree -r --name-only $TargetCommit -- @specs)
@@ -170,6 +194,7 @@ function Invoke-UpgradeProcess {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = 'powershell.exe'; $startInfo.Arguments = $arguments; $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true; $startInfo.RedirectStandardError = $true; $startInfo.CreateNoWindow = $true
+    $startInfo.EnvironmentVariables['PATH'] = (Split-Path -Parent $GitBranchShim) + ';' + $startInfo.EnvironmentVariables['PATH']
     $process = [Diagnostics.Process]::Start($startInfo)
     $stdout = $process.StandardOutput.ReadToEnd(); $stderr = $process.StandardError.ReadToEnd(); $process.WaitForExit()
     $json = $null
@@ -363,6 +388,8 @@ function Invoke-FailureRollbackCase {
 
 try {
     New-Item -ItemType Directory -Path $SuiteRoot, $OutsideRoot -Force | Out-Null
+    Initialize-BranchOnlyGitShim
+    Assert-BranchOnlyGitShimContract
     $formalBefore = Get-FormalBoundaryCanonical
     Initialize-ApplyTemplate
 
