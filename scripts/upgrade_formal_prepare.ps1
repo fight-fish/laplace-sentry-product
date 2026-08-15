@@ -22,19 +22,19 @@ Side effects: writes only below the verified transaction parent; never writes fo
 Set-StrictMode -Version Latest
 
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
-# 決策 314 核准的現役 main anchor；只允許它、精確六檔的單一直接子，以及該子提交的唯一 merge shape。
-$FormalPrepareApprovedBasisAnchorHead = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
+# 決策 329 核准的現役施工 anchor；只允許它、精確五檔的單一直接子，以及該子提交的唯一 merge shape。
+$FormalPrepareApprovedBasisAnchorHead = 'bf8f57bf7e1d31d3a708ba80ef0316faef8ebea9'
 $FormalPrepareApprovedBasisPaths = @(
-    'scripts/upgrade_formal_prepare.ps1',
-    'tests/upgrade_formal_prepare_smoke.ps1',
     'scripts/upgrade.ps1',
-    'tests/upgrade_mixed_repair_smoke.ps1',
-    'tests/upgrade_formal_apply_smoke.ps1',
-    'tests/test_frontend_lazy_tree_contract.py'
+    'tests/upgrade_formal_preflight_smoke.ps1',
+    'tests/run_upgrade_quick_gate.ps1',
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1'
 )
 $FormalPrepareApprovedCheckpointHeads = @(
     $FormalPrepareApprovedBasisAnchorHead
 )
+$FormalPrepareApprovedWorkingBranch = 's/S-02-03b/formal-preflight-mixed-contract'
 $FormalPrepareAuthorizedChildPathsByParent = @{}
 $FormalPrepareAuthorizedChildPathsByParent[$FormalPrepareApprovedBasisAnchorHead] = @($FormalPrepareApprovedBasisPaths)
 $FormalPrepareFixtureDirtyPaths = @($FormalPrepareApprovedBasisPaths)
@@ -269,7 +269,7 @@ function Assert-FormalPrepareCheckpointBasis {
     }
 
     if (-not (Test-FormalPrepareCheckpointShape -CurrentHead $CurrentHead -ParentHead $ParentHead -ChangedPaths $ChangedPaths -ParentHeads $ParentHeads -CurrentTree $CurrentTree -ApprovedSourceParentHeads $ApprovedSourceParentHeads -ApprovedSourceChangedPaths $ApprovedSourceChangedPaths -ApprovedSourceTree $ApprovedSourceTree)) {
-        throw "[$FailureTag] Expected the ruled basis anchor, its exact six-file direct child, or that child's exact post-merge main shape; got $CurrentHead."
+        throw "[$FailureTag] Expected the ruled basis anchor, its exact five-file direct child, or that child's exact post-merge main shape; got $CurrentHead."
     }
     return 'checkpoint'
 }
@@ -280,9 +280,10 @@ function Assert-FormalPrepareRepoState {
         [Parameter(Mandatory = $true)][string]$OriginMain,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Staged,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Dirty,
-        [bool]$FixtureMode
+        [bool]$FixtureMode,
+        [bool]$CheckpointApproved = $false
     )
-    if (-not $OriginMain.Equals($CurrentHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $OriginMain.Equals($CurrentHead, [System.StringComparison]::OrdinalIgnoreCase) -and -not $CheckpointApproved) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Current structurally approved HEAD differs from origin/main.'
     }
     if ($Staged.Count -gt 0) {
@@ -303,7 +304,9 @@ function Assert-FormalPrepareMainBranch {
     if ([string]::IsNullOrWhiteSpace($branch)) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got detached HEAD.'
     }
-    if ($branch -ne 'main') { throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got $branch." }
+    if ($branch -notin @('main', $FormalPrepareApprovedWorkingBranch)) {
+        throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main or the exact approved working branch, got $branch."
+    }
     return $branch
 }
 
@@ -318,7 +321,7 @@ function Assert-FormalPrepareRepoBasis {
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }
     })
-    Assert-FormalPrepareRepoState -CurrentHead $head -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
+    Assert-FormalPrepareRepoState -CurrentHead $head -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode -CheckpointApproved $true
     $plan = New-UpgradePlan -Inputs ([pscustomobject]@{
         Mode = 'PrepareFormal'
         BuildVersion = $FormalUpgradeTargetCommit.Substring(0, 7)

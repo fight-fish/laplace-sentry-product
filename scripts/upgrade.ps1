@@ -1147,11 +1147,29 @@ function Invoke-FormalPreflightMode {
             $result.targets.frontend | Add-Member -NotePropertyName marker_commit -NotePropertyValue $markerCommit
             $result.targets.backend | Add-Member -NotePropertyName marker_commit -NotePropertyValue $markerCommit
             if ($coherence.missing.Count -gt 0 -or $coherence.extra.Count -gt 0 -or $coherence.blob_drift.Count -gt 0) {
-                Add-FormalPreflightFailure -Result $result -Tag '[UPGRADE_TARGET_DRIFT]' -CheckId 'target_coherence' -Message "Managed target drift: missing=$($coherence.missing.Count), extra=$($coherence.extra.Count), blob=$($coherence.blob_drift.Count)."
-                Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'fail' -TruthSource 'Formal managed file set/blob versus marker commit tree' -Reason ($coherence | ConvertTo-Json -Depth 6 -Compress)
+                try {
+                    $mixedLayout = @(Resolve-MixedRepairLayout -Inputs $Inputs)
+                    $mixedReplace = @($mixedLayout | Where-Object { $_.action -eq 'replace' })
+                    $mixedUnchanged = @($mixedLayout | Where-Object { $_.action -eq 'verify_unchanged' })
+                    if ($mixedLayout.Count -ne 26 -or $mixedReplace.Count -ne 1 -or
+                        $mixedReplace[0].git_path -ne 'Frontend/src/backend/adapter.py' -or
+                        $mixedUnchanged.Count -ne 25) {
+                        throw '[UPGRADE_MIXED_SOURCE_FAIL] Exact Base layout shape was not proven.'
+                    }
+                    Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'pass' -TruthSource 'Exact ruled mixed source contract' -Reason "contract=$MixedRepairSchema; managed=26; replace=1; unchanged=25; marker=$MixedRepairMarker"
+                }
+                catch {
+                    Add-FormalPreflightFailure -Result $result -Tag '[UPGRADE_TARGET_DRIFT]' -CheckId 'target_coherence' -Message "Managed target drift: missing=$($coherence.missing.Count), extra=$($coherence.extra.Count), blob=$($coherence.blob_drift.Count)."
+                    $failureReason = [ordered]@{
+                        generic_coherence = $coherence
+                        mixed_contract = $MixedRepairSchema
+                        mixed_contract_error = $_.Exception.Message
+                    }
+                    Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'fail' -TruthSource 'Formal managed file set/blob versus marker commit tree, then exact ruled mixed source contract' -Reason ($failureReason | ConvertTo-Json -Depth 8 -Compress)
+                }
             }
             else {
-                Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'pass' -TruthSource 'Formal managed file set/blob versus marker commit tree' -Reason "Managed target matches marker commit ($($coherence.actual_count) files)."
+                Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'pass' -TruthSource 'Formal managed file set/blob versus marker commit tree' -Reason "contract=generic-marker-tree-v1; managed=$($coherence.actual_count); marker=$markerCommit"
             }
         }
         catch {
@@ -1229,13 +1247,13 @@ function Get-Utf8Sha256 {
 function Assert-MixedRepoBasis {
     $branch = (Get-GitOutput -Arguments @('branch', '--show-current') | Select-Object -First 1).Trim()
     $head = Get-HeadCommit
-    $originMain = (Get-GitOutput -Arguments @('rev-parse', 'origin/main') | Select-Object -First 1).Trim()
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
-    if ($branch -ne 'main') { throw "[UPGRADE_MIXED_BASIS_FAIL] Expected branch main, got $branch." }
-    [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head -FailureTag 'UPGRADE_MIXED_BASIS_FAIL')
-    if (-not $originMain.Equals($head, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "[UPGRADE_MIXED_BASIS_FAIL] Structurally approved HEAD differs from origin/main: head=$head origin_main=$originMain"
+    if ($branch -notin @('main', $FormalPrepareApprovedWorkingBranch)) {
+        throw "[UPGRADE_MIXED_BASIS_FAIL] Expected branch main or the exact approved working branch, got $branch."
     }
+    [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head -FailureTag 'UPGRADE_MIXED_BASIS_FAIL')
+    # A ruled anchor/direct-child/merge checkpoint may intentionally differ from origin/main;
+    # Assert-FormalPrepareCheckpointBasis above is the fail-closed source-shape proof.
     if ($staged.Count -gt 0) {
         throw "[UPGRADE_MIXED_BASIS_FAIL] Staged changes are forbidden: $($staged -join ', ')"
     }

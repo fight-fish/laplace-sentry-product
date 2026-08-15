@@ -3,7 +3,7 @@ param(
     [ValidateSet('all', 'source-target', 'runtime-observation', 'protected-data', 'path-boundary')]
     [string[]]$Group = @('all'),
 
-    [ValidateSet('all', 'success', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
+    [ValidateSet('all', 'success', 'exact-mixed', 'exact-mixed-adapter-near-miss', 'exact-mixed-managed-near-miss', 'exact-mixed-missing', 'exact-mixed-extra', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
     [string[]]$Case = @('all'),
 
     [ValidateRange(10, 600)]
@@ -39,6 +39,8 @@ $UpgradeScript = Join-Path $RepoRoot 'scripts\upgrade.ps1'
 $TempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $SuiteRoot = Join-Path $TempBase ("LaplaceSentryFormalPreflightSmoke-" + [Guid]::NewGuid().ToString('N'))
 $HeadShort = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
+$MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$MixedRepairMarker = '1e7bc2b'
 $SelectedGroups = @($Group)
 $SelectedCases = @($Case)
 $RunAllGroups = $SelectedGroups -contains 'all'
@@ -132,6 +134,40 @@ function Copy-ManagedTree {
     $HeadShort | Set-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Encoding ASCII -NoNewline
     "[General]`r`neye_size=480" | Set-Content -LiteralPath (Join-Path $Case.Frontend 'sentry_config.ini') -Encoding UTF8
     '[{"uuid":"fixture","name":"fixture"}]' | Set-Content -LiteralPath (Join-Path $Case.Backend 'data\projects.json') -Encoding UTF8
+}
+
+function Copy-GitBlobToFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Commit,
+        [Parameter(Mandatory = $true)][string]$GitPath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $blob = (& git -C $RepoRoot rev-parse "$Commit`:$GitPath").Trim()
+    Assert-True ($LASTEXITCODE -eq 0 -and $blob -match '^[0-9a-f]{40}$') "Unable to resolve fixture blob: $Commit`:$GitPath"
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git.exe'
+    $startInfo.Arguments = "-C `"$RepoRoot`" cat-file blob $blob"
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        [void]$process.Start()
+        $stream = [IO.File]::Open($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $process.StandardOutput.BaseStream.CopyTo($stream) } finally { $stream.Dispose() }
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        Assert-True ($process.ExitCode -eq 0) "Unable to materialize fixture blob: $stderr"
+    }
+    finally { $process.Dispose() }
+}
+
+function Set-ExactMixedTarget {
+    param([Parameter(Mandatory = $true)]$Case)
+    Copy-GitBlobToFile -Commit $MixedRepairAdapterCommit -GitPath 'Frontend/src/backend/adapter.py' -Destination (Join-Path $Case.Frontend 'src\backend\adapter.py')
+    $MixedRepairMarker | Set-Content -LiteralPath (Join-Path $Case.Frontend 'version.txt') -Encoding ASCII -NoNewline
+    $MixedRepairMarker | Set-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Encoding ASCII -NoNewline
 }
 
 function New-Observation {
@@ -256,7 +292,8 @@ function Run-Case {
         [Parameter(Mandatory = $true)][scriptblock]$Arrange,
         [Parameter(Mandatory = $true)][int]$ExpectedExit,
         [string[]]$FailureTags = @(),
-        [string[]]$WarningTags = @()
+        [string[]]$WarningTags = @(),
+        [scriptblock]$AssertResult = $null
     )
     Invoke-SmokeCase $Name {
         $case = New-TestCase $Name
@@ -269,6 +306,7 @@ function Run-Case {
             $after = Get-TreeFingerprint $case.Root
             Assert-True ($before -ceq $after) "$Name changed fake target/observation content or timestamps."
             Assert-ResultTags -Result $result -ExpectedExit $ExpectedExit -FailureTags $FailureTags -WarningTags $WarningTags
+            if ($AssertResult) { & $AssertResult $result }
         }
         finally {
             Remove-TestTree $case.Root
@@ -281,7 +319,20 @@ try {
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
 
     Invoke-SmokeGroup 'source-target' {
-        Run-Case 'success' { param($case, $o) } 0
+        Run-Case 'success' { param($case, $o) } 0 @() @() {
+            param($result)
+            $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_coherence' })[0]
+            Assert-True ($check.status -eq 'pass' -and $check.reason -match 'contract=generic-marker-tree-v1') 'Generic coherent result was not identified as generic.'
+        }
+        Run-Case 'exact-mixed' { param($case, $o) Set-ExactMixedTarget $case } 0 @() @() {
+            param($result)
+            $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_coherence' })[0]
+            Assert-True ($check.status -eq 'pass' -and $check.reason -match 'contract=laplace-mixed-source-v1' -and $check.reason -match 'managed=26' -and $check.reason -match 'replace=1' -and $check.reason -match 'unchanged=25') 'Exact mixed result did not expose the ruled contract and shape.'
+        }
+        Run-Case 'exact-mixed-adapter-near-miss' { param($case, $o) Set-ExactMixedTarget $case; 'near-miss' | Add-Content -LiteralPath (Join-Path $case.Frontend 'src\backend\adapter.py') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
+        Run-Case 'exact-mixed-managed-near-miss' { param($case, $o) Set-ExactMixedTarget $case; 'near-miss' | Add-Content -LiteralPath (Join-Path $case.Backend 'main.py') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
+        Run-Case 'exact-mixed-missing' { param($case, $o) Set-ExactMixedTarget $case; Remove-Item -LiteralPath (Join-Path $case.Frontend 'run_ui.vbs') -Force } 2 @('[UPGRADE_TARGET_DRIFT]')
+        Run-Case 'exact-mixed-extra' { param($case, $o) Set-ExactMixedTarget $case; 'extra' | Set-Content -LiteralPath (Join-Path $case.Frontend 'src\unexpected-mixed-extra.txt') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
         Run-Case 'source-dirty' { param($case, $o) $o.source_dirty = $true } 2 @('[UPGRADE_SOURCE_DIRTY]')
         Run-Case 'target-missing' { param($case, $o) Remove-TestTree $case.Backend } 2 @('[UPGRADE_TARGET_FAIL]', '[UPGRADE_VERSION_FAIL]')
         Run-Case 'marker-missing' { param($case, $o) Remove-Item -LiteralPath (Join-Path $case.Frontend 'version.txt') -Force } 2 @('[UPGRADE_VERSION_FAIL]')

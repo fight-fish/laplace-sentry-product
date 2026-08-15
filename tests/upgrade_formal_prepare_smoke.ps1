@@ -209,15 +209,14 @@ function Assert-CheckpointBasisContract {
     $mergeHead = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     $sourceTree = 'cccccccccccccccccccccccccccccccccccccccc'
     $expectedPaths = @(
-        'scripts/upgrade_formal_prepare.ps1',
-        'tests/upgrade_formal_prepare_smoke.ps1',
         'scripts/upgrade.ps1',
-        'tests/upgrade_mixed_repair_smoke.ps1',
-        'tests/upgrade_formal_apply_smoke.ps1',
-        'tests/test_frontend_lazy_tree_contract.py'
+        'tests/upgrade_formal_preflight_smoke.ps1',
+        'tests/run_upgrade_quick_gate.ps1',
+        'scripts/upgrade_formal_prepare.ps1',
+        'tests/upgrade_formal_prepare_smoke.ps1'
     )
     $paths = @($FormalPrepareApprovedBasisPaths)
-    Assert-True (Test-FormalPrepareExactPathSet -ExpectedPaths $expectedPaths -ActualPaths $paths) 'Decision 314 basis path allowlist is not the exact ruled six-file set.'
+    Assert-True (Test-FormalPrepareExactPathSet -ExpectedPaths $expectedPaths -ActualPaths $paths) 'Decision 329 basis path allowlist is not the exact ruled five-file set.'
     $mergeParams = @{
         CurrentHead = $mergeHead
         ParentHeads = @($FormalPrepareApprovedBasisAnchorHead, $directChild)
@@ -229,10 +228,10 @@ function Assert-CheckpointBasisContract {
     }
 
     Assert-True ($FormalUpgradeTargetCommit -eq '08bb6641ac042c6ce20ec92501f6814fe9f22fac') 'Decision 312 formal payload target is not exact current main.'
-    Assert-True ($FormalUpgradeTargetCommit -eq $FormalPrepareApprovedBasisAnchorHead) 'Payload target and approved basis anchor diverged.'
-    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareApprovedBasisAnchorHead) -eq 'checkpoint') 'Decision 312 basis anchor was rejected.'
-    Assert-True ($paths.Count -eq 6) 'Decision 314 basis path allowlist is not exactly six files.'
-    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $directChild -ParentHead $FormalPrepareApprovedBasisAnchorHead -ChangedPaths $paths) -eq 'checkpoint') 'Exact direct six-file child was rejected.'
+    Assert-True ($FormalPrepareApprovedBasisAnchorHead -eq 'bf8f57bf7e1d31d3a708ba80ef0316faef8ebea9') 'Decision 329 approved basis anchor is not exact.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareApprovedBasisAnchorHead) -eq 'checkpoint') 'Decision 329 basis anchor was rejected.'
+    Assert-True ($paths.Count -eq 5) 'Decision 329 basis path allowlist is not exactly five files.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $directChild -ParentHead $FormalPrepareApprovedBasisAnchorHead -ChangedPaths $paths) -eq 'checkpoint') 'Exact direct five-file child was rejected.'
     Assert-True ((Assert-FormalPrepareCheckpointBasis @mergeParams) -eq 'checkpoint') 'Exact post-merge main shape was rejected.'
     Write-Output ('prepare ruled basis seam: PASS anchor=' + $FormalPrepareApprovedBasisAnchorHead + ' source=exact-direct-child')
 
@@ -251,12 +250,14 @@ function Assert-CheckpointBasisContract {
 
     Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain $FormalPrepareApprovedBasisAnchorHead -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false
     Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain $FormalPrepareApprovedBasisAnchorHead -Staged @() -Dirty ($paths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
+    Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain ('d' * 40) -Staged @() -Dirty @() -FixtureMode $false -CheckpointApproved $true
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain ('d' * 40) -Staged @() -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Origin drift was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain $FormalPrepareApprovedBasisAnchorHead -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Staged changes were accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareApprovedBasisAnchorHead -OriginMain $FormalPrepareApprovedBasisAnchorHead -Staged @() -Dirty @('unexpected.txt') -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Unexpected dirty path was accepted.'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main') -eq 'main') 'The main branch was rejected.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareApprovedWorkingBranch) -eq $FormalPrepareApprovedWorkingBranch) 'The exact approved working branch was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'A non-main branch was accepted.'
 }
