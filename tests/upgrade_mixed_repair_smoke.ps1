@@ -378,6 +378,9 @@ try {
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
     Initialize-BranchOnlyGitShim
     Assert-BranchOnlyGitShimContract
+    $basisText = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1') -Raw -Encoding UTF8
+    Assert-True ($basisText -notmatch 'CheckpointApproved') 'Mixed fixture is connected to a helper that can bypass live origin/main coherence.'
+    Assert-True ($basisText -match 'Assert-FormalPrepareMainBranch.+-FixtureMode \$FixtureMode') 'Mixed fixture lost the explicit fixture-only branch seam.'
 
     $success = New-MixedCase 'success'
     $beforeRecords = Get-TreeRecords $success

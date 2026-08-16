@@ -294,6 +294,10 @@ else {
     }
 }
 
+Invoke-GateCheck 'formal basis live-origin and real-merge negatives' {
+    Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_prepare_smoke.ps1') + '" -Group basis-only') -TimeoutSeconds 30
+}
+
 Write-Output 'upgrade quick gate: NOT_RUN name=heavy matrix detail=prepare full failure-injection/reentry, preflight full fixture matrix except helper contract/path-boundary/exact-mixed representatives, formal apply full matrix, mixed repair full matrix, isolated apply full matrix'
 Write-Output 'upgrade quick gate: NOT_RUN name=formal read-only detail=live PreflightFormal, live ValidateFormalApply, live PrepareFormal/ApplyFormal, transaction cleanup, formal runtime sync'
 

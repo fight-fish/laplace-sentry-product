@@ -390,6 +390,9 @@ try {
     New-Item -ItemType Directory -Path $SuiteRoot, $OutsideRoot -Force | Out-Null
     Initialize-BranchOnlyGitShim
     Assert-BranchOnlyGitShimContract
+    $basisText = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1') -Raw -Encoding UTF8
+    Assert-True ($basisText -notmatch 'CheckpointApproved') 'Formal apply fixture is connected to a helper that can bypass live origin/main coherence.'
+    Assert-True ($basisText -match 'Assert-FormalPrepareMainBranch.+-FixtureMode \$FixtureMode') 'Formal apply fixture lost the explicit fixture-only branch seam.'
     $formalBefore = Get-FormalBoundaryCanonical
     Initialize-ApplyTemplate
 
