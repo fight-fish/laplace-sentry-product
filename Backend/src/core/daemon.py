@@ -1740,8 +1740,6 @@ def main_dispatcher(argv: List[str], **kwargs):
         print(f"【守護進程發生未知致命錯誤】：{e}", file=sys.stderr)
         return 99
 
-
-# --- 主執行入口 ---
 # --- 主執行入口 ---
 if __name__ == "__main__":
     exit_code = main_dispatcher(sys.argv[1:])
