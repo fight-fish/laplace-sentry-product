@@ -199,8 +199,10 @@ class ScopedTrayAppLoader:
             original = self.original_modules[name]
             if original is MISSING:
                 sys.modules.pop(name, None)
-            else:
+            elif isinstance(original, types.ModuleType):
                 sys.modules[name] = original
+            else:
+                raise AssertionError(f"unexpected saved module type for {name}")
         sys.path[:] = self.original_sys_path
 
     def _install_fake_pyside_modules(self):
@@ -209,8 +211,8 @@ class ScopedTrayAppLoader:
         qtgui = types.ModuleType("PySide6.QtGui")
         qtwidgets = types.ModuleType("PySide6.QtWidgets")
 
-        qtcore.Qt = FakeQt
-        qtcore.Signal = Signal
+        setattr(qtcore, "Qt", FakeQt)
+        setattr(qtcore, "Signal", Signal)
         for name in [
             "QPoint",
             "QSize",
@@ -270,7 +272,7 @@ class ScopedTrayAppLoader:
             "QTextEdit",
         ]:
             setattr(qtwidgets, name, DummyBase)
-        qtwidgets.QTreeWidgetItem = FakeItem
+        setattr(qtwidgets, "QTreeWidgetItem", FakeItem)
 
         sys.modules["PySide6"] = pyside
         sys.modules["PySide6.QtCore"] = qtcore
@@ -283,10 +285,12 @@ class ScopedTrayAppLoader:
             sys.path.insert(0, frontend_path)
 
         spec = importlib.util.spec_from_file_location(TRAY_APP_TEST_MODULE, TRAY_APP_PATH)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot load tray app module from {TRAY_APP_PATH}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
-        module.QTreeWidgetItem = FakeItem
+        setattr(module, "QTreeWidgetItem", FakeItem)
         return module
 
 
@@ -491,7 +495,7 @@ class FrontendLazyTreeContractTests(unittest.TestCase):
             dashboard = self.make_dashboard(tray_app)
             dashboard._current_selected_project_uuid = lambda: "project-1"
             dashboard._latest_children_request_ids = {("project-1", "src/"): 99}
-            tray_app.QThread = FakeThread
+            setattr(tray_app, "QThread", FakeThread)
 
             dashboard._start_project_query(
                 "tree_children:src/",

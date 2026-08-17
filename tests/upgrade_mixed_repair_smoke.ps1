@@ -30,6 +30,8 @@ $UpgradeScript = Join-Path $RepoRoot 'scripts\upgrade.ps1'
 $TempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $SuiteRoot = Join-Path $TempBase ('LaplaceSentryMixedRepairSmoke-' + [Guid]::NewGuid().ToString('N'))
 $OutsideRoot = Join-Path $TempBase ('LaplaceSentryMixedRepairOutside-' + [Guid]::NewGuid().ToString('N'))
+$GitBranchShim = Join-Path $SuiteRoot '_git-branch-shim\git.cmd'
+$RealGitExe = (Get-Command git.exe -ErrorAction Stop).Source
 # 在受限 scope 直接讀 PrepareFormal 的正式目標來源，避免 mixed repair smoke 自帶第二份 target 或污染測試 scope。
 $TargetCommit = & { . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1'); $FormalUpgradeTargetCommit }
 $TargetShort = $TargetCommit.Substring(0, 7)
@@ -77,6 +79,28 @@ function Quote-Argument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Initialize-BranchOnlyGitShim {
+    $shimRoot = Split-Path -Parent $GitBranchShim
+    New-Item -ItemType Directory -Path $shimRoot -Force | Out-Null
+    $content = @"
+@echo off
+if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="--show-current" if "%~5"=="" (
+  echo main
+  exit /b 0
+)
+"$RealGitExe" %*
+"@
+    Set-Content -LiteralPath $GitBranchShim -Value $content -Encoding ASCII
+}
+
+function Assert-BranchOnlyGitShimContract {
+    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 'main') 'Branch-only Git shim did not simulate main.'
+    foreach ($revision in @('HEAD', 'origin/main')) {
+        $throughShim = (& $GitBranchShim -C $RepoRoot rev-parse $revision).Trim()
+        $throughRealGit = (& $RealGitExe -C $RepoRoot rev-parse $revision).Trim()
+        Assert-True ($throughShim -eq $throughRealGit) "Branch-only Git shim intercepted non-branch truth: $revision"
+    }
+}
 function Get-ExpectedManagedPaths {
     $pathSpecs = @()
     $pathSpecs += @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ })
@@ -288,6 +312,7 @@ function Invoke-MixedProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+    $startInfo.EnvironmentVariables['PATH'] = (Split-Path -Parent $GitBranchShim) + ';' + $startInfo.EnvironmentVariables['PATH']
     $process = [System.Diagnostics.Process]::Start($startInfo)
     $stdout = $process.StandardOutput.ReadToEnd()
     $stderr = $process.StandardError.ReadToEnd()
@@ -351,6 +376,11 @@ try {
     Assert-StrictTempPath $SuiteRoot
     Assert-StrictTempPath $OutsideRoot
     New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+    Initialize-BranchOnlyGitShim
+    Assert-BranchOnlyGitShimContract
+    $basisText = Get-Content -LiteralPath (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1') -Raw -Encoding UTF8
+    Assert-True ($basisText -notmatch 'CheckpointApproved') 'Mixed fixture is connected to a helper that can bypass live origin/main coherence.'
+    Assert-True ($basisText -match 'Assert-FormalPrepareMainBranch.+-FixtureMode \$FixtureMode') 'Mixed fixture lost the explicit fixture-only branch seam.'
 
     $success = New-MixedCase 'success'
     $beforeRecords = Get-TreeRecords $success

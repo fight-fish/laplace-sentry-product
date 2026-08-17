@@ -284,9 +284,21 @@ else {
         Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group path-boundary -Case outside-temp-boundary -CaseTimeoutSeconds 30') -TimeoutSeconds 45
         Assert-NoTempResidue
     }
+    Invoke-GateCheck 'TEMP preflight exact mixed positive' {
+        Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed -CaseTimeoutSeconds 30') -TimeoutSeconds 45
+        Assert-NoTempResidue
+    }
+    Invoke-GateCheck 'TEMP preflight exact mixed near-miss negative' {
+        Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed-adapter-near-miss -CaseTimeoutSeconds 30') -TimeoutSeconds 45
+        Assert-NoTempResidue
+    }
 }
 
-Write-Output 'upgrade quick gate: NOT_RUN name=heavy matrix detail=prepare full failure-injection/reentry, preflight full fixture matrix except helper contract and outside-temp-boundary representative, formal apply full matrix, mixed repair full matrix, isolated apply full matrix'
+Invoke-GateCheck 'formal basis live-origin and real-merge negatives' {
+    Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_prepare_smoke.ps1') + '" -Group basis-only') -TimeoutSeconds 30
+}
+
+Write-Output 'upgrade quick gate: NOT_RUN name=heavy matrix detail=prepare full failure-injection/reentry, preflight full fixture matrix except helper contract/path-boundary/exact-mixed representatives, formal apply full matrix, mixed repair full matrix, isolated apply full matrix'
 Write-Output 'upgrade quick gate: NOT_RUN name=formal read-only detail=live PreflightFormal, live ValidateFormalApply, live PrepareFormal/ApplyFormal, transaction cleanup, formal runtime sync'
 
 if ($script:Failed) {
