@@ -49,8 +49,18 @@ $FormalPrepareFollowUpPaths = @(
     'tests/upgrade_formal_apply_smoke.ps1'
 )
 $FormalPrepareCumulativePaths = @($FormalPrepareExistingCheckpointPaths + $FormalPreparePreflightCheckpointPaths + $FormalPrepareFollowUpPaths | Sort-Object -Unique)
-$FormalPrepareApprovedWorkingBranch = 's/S-02-03b/formal-preflight-mixed-contract'
-$FormalPrepareFixtureDirtyPaths = @($FormalPrepareFollowUpPaths)
+$FormalPrepareMergedMainHead = '8baf0d70d0b76069d12bf70e1342aca3d08432ac'
+$FormalPrepareApprovedWorkingBranch = 's/S-02-03b/exact-mixed-live-source-baseline'
+$FormalPrepareCurrentCutPaths = @(
+    'scripts/upgrade.ps1',
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/run_upgrade_quick_gate.ps1',
+    'tests/upgrade_formal_apply_smoke.ps1',
+    'tests/upgrade_formal_preflight_smoke.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1',
+    'tests/upgrade_mixed_repair_smoke.ps1'
+)
+$FormalPrepareFixtureDirtyPaths = @($FormalPrepareCurrentCutPaths)
 $FormalUpgradeTargetCommit = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
 $FormalPrepareJournalReserveBytes = [int64](1MB)
@@ -213,6 +223,32 @@ function Test-FormalPrepareApprovedMergeShape {
         $CurrentTree -and $CurrentTree -eq $ApprovedSourceTree)
 }
 
+function Test-FormalPrepareCurrentSourceCheckpointShape {
+    param(
+        [string[]]$ParentHeads,
+        [string[]]$ChangedPaths
+    )
+    $parents = @($ParentHeads | Where-Object { $_ })
+    return ($parents.Count -eq 1 -and
+        $parents[0] -eq $FormalPrepareMergedMainHead -and
+        (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareCurrentCutPaths -ActualPaths $ChangedPaths))
+}
+
+function Test-FormalPrepareCurrentMergeShape {
+    param(
+        [string[]]$ParentHeads,
+        [string[]]$ChangedPaths,
+        [string]$CurrentTree,
+        [string]$ApprovedSourceTree,
+        [bool]$SourceCheckpointValid
+    )
+    $parents = @($ParentHeads | Where-Object { $_ })
+    return ($SourceCheckpointValid -and $parents.Count -eq 2 -and
+        $parents[0] -eq $FormalPrepareMergedMainHead -and
+        $CurrentTree -and $CurrentTree -eq $ApprovedSourceTree -and
+        (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareCurrentCutPaths -ActualPaths $ChangedPaths))
+}
+
 function Get-FormalPrepareCommitShape {
     param([Parameter(Mandatory = $true)][string]$Commit)
     $identity = ((Get-GitOutput -Arguments @('rev-list', '--parents', '-n', '1', $Commit) | Select-Object -First 1).Trim()) -split '\s+'
@@ -255,11 +291,30 @@ function Assert-FormalPrepareCheckpointBasis {
                 $sourceTree = (Get-GitOutput -Arguments @('show', '-s', '--format=%T', $source) | Select-Object -First 1).Trim()
                 $cumulative = @(Get-GitOutput -Arguments @('diff', '--name-only', $FormalPrepareOriginMainHead, $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
                 $chainValid = Test-FormalPrepareRealSourceChain -SourceHead $source -RequireFollowUp $true
-                if (Test-FormalPrepareApprovedMergeShape -ParentHeads $current.Parents -ChangedPaths $cumulative -CurrentTree $current.Tree -ApprovedSourceTree $sourceTree -SourceChainValid $chainValid) { return 'checkpoint' }
+                if (Test-FormalPrepareApprovedMergeShape -ParentHeads $current.Parents -ChangedPaths $cumulative -CurrentTree $current.Tree -ApprovedSourceTree $sourceTree -SourceChainValid $chainValid) {
+                    if ($CurrentHead -eq $FormalPrepareMergedMainHead) { return 'merged-main' }
+                    return 'checkpoint'
+                }
+            }
+            if ($current.Parents.Count -eq 1 -and
+                (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads $current.Parents -ChangedPaths $current.Paths) -and
+                (Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareMergedMainHead -FailureTag $FailureTag) -eq 'merged-main') {
+                return 'source-checkpoint'
+            }
+            if ($current.Parents.Count -eq 2) {
+                $source = $current.Parents[1]
+                $sourceShape = Get-FormalPrepareCommitShape -Commit $source
+                $sourceValid = Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads $sourceShape.Parents -ChangedPaths $sourceShape.Paths
+                $sourceTree = $sourceShape.Tree
+                $changed = @(Get-GitOutput -Arguments @('diff', '--name-only', $FormalPrepareMergedMainHead, $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+                if ((Assert-FormalPrepareCheckpointBasis -CurrentHead $FormalPrepareMergedMainHead -FailureTag $FailureTag) -eq 'merged-main' -and
+                    (Test-FormalPrepareCurrentMergeShape -ParentHeads $current.Parents -ChangedPaths $changed -CurrentTree $current.Tree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $sourceValid)) {
+                    return 'future-merge'
+                }
             }
         }
     } catch { throw "[$FailureTag] checkpoint_basis_unverified: $($_.Exception.Message)" }
-    throw "[$FailureTag] Expected the ruled 08bb664 -> bf8f57b -> c7aa16c -> follow-up source chain or its exact [08bb664, follow-up] merge; got $CurrentHead."
+    throw "[$FailureTag] Expected the ruled legacy chain, merged main 8baf0d70, its exact seven-path direct child, or the exact [8baf0d70, source checkpoint] merge; got $CurrentHead."
 }
 
 function Assert-FormalPrepareRepoState {
@@ -268,20 +323,36 @@ function Assert-FormalPrepareRepoState {
         [Parameter(Mandatory = $true)][string]$OriginMain,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Staged,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Dirty,
-        [bool]$FixtureMode
+        [bool]$FixtureMode,
+        [string]$BasisKind = ''
     )
+    if (-not $BasisKind) { $BasisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $CurrentHead }
     if (-not $FixtureMode -and -not $OriginMain.Equals($CurrentHead, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Current structurally approved HEAD differs from origin/main.'
+    }
+    if ($FixtureMode -and $BasisKind -in @('merged-main', 'source-checkpoint') -and
+        -not $OriginMain.Equals($FormalPrepareMergedMainHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Fixture origin/main differs from the fixed merged-main anchor.'
     }
     if ($Staged.Count -gt 0) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Staged files exist.'
     }
-    $allowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
-    if ($FixtureMode) { $allowed += $FormalPrepareFixtureDirtyPaths }
+    $generalAllowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
     $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
-    $unexpected = @($normalizedDirty | Where-Object { $_ -notin $allowed })
+    $unexpected = @($normalizedDirty | Where-Object { $_ -notin $generalAllowed -and $_ -notin $FormalPrepareFixtureDirtyPaths })
     if ($unexpected.Count -gt 0) {
         throw "[UPGRADE_PREPARE_BASIS_FAIL] Unexpected working-tree path(s): $($unexpected -join ', ')"
+    }
+    $cutDirty = @($normalizedDirty | Where-Object { $_ -in $FormalPrepareFixtureDirtyPaths })
+    if (-not $FixtureMode -and $cutDirty.Count -gt 0) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Live mode does not accept current-cut working-tree changes.'
+    }
+    if ($FixtureMode -and $BasisKind -eq 'merged-main' -and
+        -not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareFixtureDirtyPaths -ActualPaths $cutDirty)) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Pre-checkpoint fixture requires the exact seven-path dirty set.'
+    }
+    if ($FixtureMode -and $BasisKind -ne 'merged-main' -and $cutDirty.Count -gt 0) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Checkpoint or merge fixture must not retain current-cut dirty paths.'
     }
 }
 
@@ -305,11 +376,14 @@ function Assert-FormalPrepareRepoBasis {
     $head = Get-HeadCommit
     $originMain = (Get-GitOutput -Arguments @('rev-parse', 'origin/main') | Select-Object -First 1).Trim()
     $staged = @(Get-GitOutput -Arguments @('diff', '--cached', '--name-only'))
-    [void](Assert-FormalPrepareCheckpointBasis -CurrentHead $head)
+    $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $head
+    if ($FixtureMode -and $basisKind -in @('merged-main', 'source-checkpoint') -and $branch -ne $FormalPrepareApprovedWorkingBranch) {
+        throw "[UPGRADE_PREPARE_BASIS_FAIL] $basisKind fixture requires branch $FormalPrepareApprovedWorkingBranch."
+    }
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }
     })
-    Assert-FormalPrepareRepoState -CurrentHead $head -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode
+    Assert-FormalPrepareRepoState -CurrentHead $head -OriginMain $originMain -Staged $staged -Dirty $dirty -FixtureMode $FixtureMode -BasisKind $basisKind
     $plan = New-UpgradePlan -Inputs ([pscustomobject]@{
         Mode = 'PrepareFormal'
         BuildVersion = $FormalUpgradeTargetCommit.Substring(0, 7)
