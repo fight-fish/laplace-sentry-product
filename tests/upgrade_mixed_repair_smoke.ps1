@@ -17,7 +17,7 @@ Order-sensitive checks: immutable source snapshots are captured before invoking 
 Side effects: creates and removes only verified strict children of system TEMP; never invokes upgrade.bat or touches formal runtime/Git state.
 #>
 
-# 這支腳本在做什麼：用共用正式目標 Git object 建立 25+1+舊 marker 的混合假目標，證明只換 adapter、marker-last 與完整回退。
+# 這支腳本在做什麼：用固定 source baseline、adapter override 與 package target 建立真實 24+1+1 混合假目標，證明 adapter/tray 升級、marker-last 與完整回退。
 # 這支腳本不做什麼：不讀寫正式副本、不操作真實程序／registry、不 stage／commit，也不把隔離通過當成正式修復。
 # 常改區塊：故障注入案例、來源 state ID、reconciliation 與 rollback 斷言。
 # 不要亂動的區塊：system TEMP 邊界、正式路徑拒絕、完整 path/existence/length/SHA-256/mtime 比對與最終零殘留。
@@ -36,6 +36,10 @@ $RealGitExe = (Get-Command git.exe -ErrorAction Stop).Source
 $TargetCommit = & { . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1'); $FormalUpgradeTargetCommit }
 $TargetShort = $TargetCommit.Substring(0, 7)
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$SourceCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+$ExpectedAdapterBlob = 'ad49188e2f54c00245f54744e1413cfe83e8d867'
+$ExpectedSourceTrayBlob = '13577b3bfa63af7ba320f0a410545503c704b4c2'
+$ExpectedTargetTrayBlob = 'bdc98668e3779fa006be5e3c7f05e220776374c2'
 $SourceMarker = '1e7bc2b'
 $Schema = 'laplace-mixed-source-v1'
 $FixedTime = [DateTime]::Parse('2024-01-02T03:04:05.0000000Z', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
@@ -85,7 +89,7 @@ function Initialize-BranchOnlyGitShim {
     $content = @"
 @echo off
 if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="--show-current" if "%~5"=="" (
-  echo main
+  echo s/S-02-03b/exact-mixed-live-source-baseline
   exit /b 0
 )
 "$RealGitExe" %*
@@ -94,7 +98,7 @@ if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="-
 }
 
 function Assert-BranchOnlyGitShimContract {
-    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 'main') 'Branch-only Git shim did not simulate main.'
+    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 's/S-02-03b/exact-mixed-live-source-baseline') 'Branch-only Git shim did not simulate the approved working branch.'
     foreach ($revision in @('HEAD', 'origin/main')) {
         $throughShim = (& $GitBranchShim -C $RepoRoot rev-parse $revision).Trim()
         $throughRealGit = (& $RealGitExe -C $RepoRoot rev-parse $revision).Trim()
@@ -141,13 +145,13 @@ function New-MixedCase {
     )
     $root = Join-Path $SuiteRoot $Name
     $build = Join-Path $root 'fixture-build'
-    $tree = Join-Path $build 'target'
+    $tree = Join-Path $build 'source'
     $oldTree = Join-Path $build 'old-adapter'
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     $pathSpecs = @()
     $pathSpecs += @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ })
     $pathSpecs += @($BackendAllowlist | ForEach-Object { 'Backend/' + $_ })
-    Export-CommitTree -Commit $TargetCommit -PathSpecs $pathSpecs -Destination $tree -WorkRoot (Join-Path $build 'target-archive')
+    Export-CommitTree -Commit $SourceCommit -PathSpecs $pathSpecs -Destination $tree -WorkRoot (Join-Path $build 'source-archive')
     Export-CommitTree -Commit $AdapterCommit -PathSpecs @('Frontend/src/backend/adapter.py') -Destination $oldTree -WorkRoot (Join-Path $build 'old-archive')
 
     $frontend = Join-Path $root 'frontend-target'
@@ -155,6 +159,10 @@ function New-MixedCase {
     Move-Item -LiteralPath (Join-Path $tree 'Frontend') -Destination $frontend
     Move-Item -LiteralPath (Join-Path $tree 'Backend') -Destination $backend
     Copy-Item -LiteralPath (Join-Path $oldTree 'Frontend\src\backend\adapter.py') -Destination (Join-Path $frontend 'src\backend\adapter.py') -Force
+    $actualSourceTrayBlob = (& git -C $RepoRoot hash-object -- (Join-Path $frontend 'src\tray\tray_app.py')).Trim()
+    $actualAdapterBlob = (& git -C $RepoRoot hash-object -- (Join-Path $frontend 'src\backend\adapter.py')).Trim()
+    Assert-True ($actualSourceTrayBlob -eq $ExpectedSourceTrayBlob) "Mixed template tray is not the ruled source-baseline blob: actual=$actualSourceTrayBlob expected=$ExpectedSourceTrayBlob"
+    Assert-True ($actualAdapterBlob -eq $ExpectedAdapterBlob) "Mixed template adapter is not the ruled override blob: actual=$actualAdapterBlob expected=$ExpectedAdapterBlob"
     Remove-TestTree $build
 
     New-Item -ItemType Directory -Path (Join-Path $backend 'data'), (Join-Path $frontend '.venv'), (Join-Path $backend 'logs') -Force | Out-Null
@@ -190,6 +198,7 @@ function New-MixedCase {
         Transaction = Join-Path $root 'transaction'
         Observation = $observation
         Adapter = Join-Path $frontend 'src\backend\adapter.py'
+        Tray = Join-Path $frontend 'src\tray\tray_app.py'
         FrontendMarker = Join-Path $frontend 'version.txt'
         BackendMarker = Join-Path $backend 'version.txt'
         Config = Join-Path $frontend 'sentry_config.ini'
@@ -393,8 +402,9 @@ try {
     Assert-True ($journal.state -eq 'committed_pending_acceptance') 'Success did not stop at committed_pending_acceptance.'
     Assert-True ($journal.source_manifest.software_state_id -eq $expectedIds.Software) 'Software state ID is not independently recomputable.'
     Assert-True ($journal.source_manifest.evidence_state_id -eq $expectedIds.Evidence) 'Evidence state ID is not independently recomputable.'
-    Assert-True (@($journal.files | Where-Object { $_.action -eq 'replace' }).Count -eq 1) 'Base plan did not contain exactly one replace.'
-    Assert-True (@($journal.files | Where-Object { $_.action -eq 'verify_unchanged' }).Count -eq 25) 'Base plan did not contain 25 verify_unchanged records.'
+    $replacePaths = @($journal.files | Where-Object { $_.action -eq 'replace' } | ForEach-Object { "$($_.side)/$($_.relative_path)" } | Sort-Object)
+    Assert-True (($replacePaths -join ',') -eq 'Frontend/src/backend/adapter.py,Frontend/src/tray/tray_app.py') 'Base plan did not contain exactly the adapter and tray replaces.'
+    Assert-True (@($journal.files | Where-Object { $_.action -eq 'verify_unchanged' }).Count -eq 24) 'Base plan did not contain 24 verify_unchanged records.'
     Assert-True ($journal.files.Count -eq 26 -and $journal.protected_preimage.Count -eq 2 -and $journal.versions.Count -eq 2) 'Full managed/protected preimage record counts are wrong.'
     Assert-True (@($journal.files | Where-Object { $_.package_path }).Count -eq 26 -and $journal.versions.Count -eq 2) 'Full managed/marker package record counts are wrong.'
     $SuccessEvidenceSummary = "software=$($journal.source_manifest.software_state_id) evidence=$($journal.source_manifest.evidence_state_id) preimage=26+4 package=26+2"
@@ -409,8 +419,11 @@ try {
         Assert-True ($afterRecords[$key] -ceq $beforeRecords[$key]) "verify_unchanged record was rewritten: $key"
     }
     $targetAdapterBlob = (& git -C $RepoRoot hash-object -- $success.Adapter).Trim()
-    $expectedAdapterBlob = (& git -C $RepoRoot rev-parse "$TargetCommit`:Frontend/src/backend/adapter.py").Trim()
-    Assert-True ($targetAdapterBlob -eq $expectedAdapterBlob) 'Success adapter did not become the shared formal target package blob.'
+    $expectedTargetAdapterBlob = (& git -C $RepoRoot rev-parse "$TargetCommit`:Frontend/src/backend/adapter.py").Trim()
+    Assert-True ($targetAdapterBlob -eq $expectedTargetAdapterBlob) 'Success adapter did not become the shared formal target package blob.'
+    $targetTrayBlob = (& git -C $RepoRoot hash-object -- $success.Tray).Trim()
+    Assert-True ($targetTrayBlob -eq $ExpectedTargetTrayBlob) 'Success tray did not become the ruled target package blob.'
+    Assert-True ($journal.source_baseline_commit -eq $SourceCommit -and $journal.source_adapter_commit -eq $AdapterCommit) 'Journal did not preserve the source baseline and adapter override identities.'
     Assert-True ((Get-Content -LiteralPath $success.BackendMarker -Raw).Trim() -eq $TargetShort) 'Backend marker was not updated to the shared formal target short hash.'
     Assert-True ((Get-Content -LiteralPath $success.FrontendMarker -Raw).Trim() -eq $TargetShort) 'Frontend marker was not updated to the shared formal target short hash.'
     Assert-True ((Get-GuardCanonical $success) -ceq $beforeGuards) 'Success changed protected/unmanaged/registry evidence.'
@@ -493,5 +506,5 @@ if ($failure) {
     Write-Error $failure
     exit 1
 }
-Write-Output "[PASS] mixed repair proved deterministic state IDs, prepare gates, one-file mutation, marker-last, crash reconciliation, semantic rollback, guard immutability, boundary rejection, and TEMP residue 0. $SuccessEvidenceSummary"
+Write-Output "[PASS] mixed repair proved deterministic state IDs, prepare gates, adapter and tray managed-file replacements, marker-last, crash reconciliation, semantic rollback, guard immutability, boundary rejection, and TEMP residue 0. $SuccessEvidenceSummary"
 exit 0

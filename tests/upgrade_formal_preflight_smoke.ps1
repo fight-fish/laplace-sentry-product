@@ -3,7 +3,7 @@ param(
     [ValidateSet('all', 'source-target', 'runtime-observation', 'protected-data', 'path-boundary')]
     [string[]]$Group = @('all'),
 
-    [ValidateSet('all', 'success', 'exact-mixed', 'exact-mixed-adapter-near-miss', 'exact-mixed-managed-near-miss', 'exact-mixed-missing', 'exact-mixed-extra', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
+    [ValidateSet('all', 'success', 'exact-mixed', 'exact-mixed-adapter-near-miss', 'exact-mixed-tray-target-near-miss', 'exact-mixed-tray-arbitrary-near-miss', 'exact-mixed-managed-near-miss', 'exact-mixed-missing', 'exact-mixed-extra', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
     [string[]]$Case = @('all'),
 
     [ValidateRange(10, 600)]
@@ -40,6 +40,10 @@ $TempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimE
 $SuiteRoot = Join-Path $TempBase ("LaplaceSentryFormalPreflightSmoke-" + [Guid]::NewGuid().ToString('N'))
 $HeadShort = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
 $MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$MixedRepairSourceCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+$MixedRepairTargetCommit = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
+$ExpectedAdapterBlob = 'ad49188e2f54c00245f54744e1413cfe83e8d867'
+$ExpectedSourceTrayBlob = '13577b3bfa63af7ba320f0a410545503c704b4c2'
 $MixedRepairMarker = '1e7bc2b'
 $SelectedGroups = @($Group)
 $SelectedCases = @($Case)
@@ -165,7 +169,12 @@ function Copy-GitBlobToFile {
 
 function Set-ExactMixedTarget {
     param([Parameter(Mandatory = $true)]$Case)
-    Copy-GitBlobToFile -Commit $MixedRepairAdapterCommit -GitPath 'Frontend/src/backend/adapter.py' -Destination (Join-Path $Case.Frontend 'src\backend\adapter.py')
+    $trayPath = Join-Path $Case.Frontend 'src\tray\tray_app.py'
+    $adapterPath = Join-Path $Case.Frontend 'src\backend\adapter.py'
+    Copy-GitBlobToFile -Commit $MixedRepairSourceCommit -GitPath 'Frontend/src/tray/tray_app.py' -Destination $trayPath
+    Copy-GitBlobToFile -Commit $MixedRepairAdapterCommit -GitPath 'Frontend/src/backend/adapter.py' -Destination $adapterPath
+    Assert-True ((& git -C $RepoRoot hash-object -- $trayPath).Trim() -eq $ExpectedSourceTrayBlob) 'Exact mixed fixture tray is not the ruled source-baseline blob.'
+    Assert-True ((& git -C $RepoRoot hash-object -- $adapterPath).Trim() -eq $ExpectedAdapterBlob) 'Exact mixed fixture adapter is not the ruled override blob.'
     $MixedRepairMarker | Set-Content -LiteralPath (Join-Path $Case.Frontend 'version.txt') -Encoding ASCII -NoNewline
     $MixedRepairMarker | Set-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Encoding ASCII -NoNewline
 }
@@ -272,7 +281,8 @@ function Assert-ResultTags {
         [string[]]$FailureTags = @(),
         [string[]]$WarningTags = @()
     )
-    Assert-True ($Result.ExitCode -eq $ExpectedExit) "Expected exit $ExpectedExit, got $($Result.ExitCode). stderr=$($Result.Stderr)"
+    $failureDetails = @($Result.Json.failures | ForEach-Object { "$($_.tag):$($_.message)" }) -join '; '
+    Assert-True ($Result.ExitCode -eq $ExpectedExit) "Expected exit $ExpectedExit, got $($Result.ExitCode). failures=$failureDetails stdout=$($Result.Stdout) stderr=$($Result.Stderr)"
     $actualFailures = @($Result.Json.failures | ForEach-Object { $_.tag })
     $actualWarnings = @($Result.Json.warnings | ForEach-Object { $_.tag })
     foreach ($tag in $FailureTags) { Assert-True ($tag -in $actualFailures) "Missing failure tag $tag; actual=$($actualFailures -join ',')" }
@@ -327,9 +337,11 @@ try {
         Run-Case 'exact-mixed' { param($case, $o) Set-ExactMixedTarget $case } 0 @() @() {
             param($result)
             $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_coherence' })[0]
-            Assert-True ($check.status -eq 'pass' -and $check.reason -match 'contract=laplace-mixed-source-v1' -and $check.reason -match 'managed=26' -and $check.reason -match 'replace=1' -and $check.reason -match 'unchanged=25') 'Exact mixed result did not expose the ruled contract and shape.'
+            Assert-True ($check.status -eq 'pass' -and $check.reason -match 'contract=laplace-mixed-source-v1' -and $check.reason -match 'managed=26' -and $check.reason -match 'replace=2' -and $check.reason -match 'unchanged=24') 'Exact mixed result did not expose the ruled contract and shape.'
         }
         Run-Case 'exact-mixed-adapter-near-miss' { param($case, $o) Set-ExactMixedTarget $case; 'near-miss' | Add-Content -LiteralPath (Join-Path $case.Frontend 'src\backend\adapter.py') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
+        Run-Case 'exact-mixed-tray-target-near-miss' { param($case, $o) Set-ExactMixedTarget $case; Copy-GitBlobToFile -Commit $MixedRepairTargetCommit -GitPath 'Frontend/src/tray/tray_app.py' -Destination (Join-Path $case.Frontend 'src\tray\tray_app.py') } 2 @('[UPGRADE_TARGET_DRIFT]')
+        Run-Case 'exact-mixed-tray-arbitrary-near-miss' { param($case, $o) Set-ExactMixedTarget $case; 'near-miss' | Add-Content -LiteralPath (Join-Path $case.Frontend 'src\tray\tray_app.py') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
         Run-Case 'exact-mixed-managed-near-miss' { param($case, $o) Set-ExactMixedTarget $case; 'near-miss' | Add-Content -LiteralPath (Join-Path $case.Backend 'main.py') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')
         Run-Case 'exact-mixed-missing' { param($case, $o) Set-ExactMixedTarget $case; Remove-Item -LiteralPath (Join-Path $case.Frontend 'run_ui.vbs') -Force } 2 @('[UPGRADE_TARGET_DRIFT]')
         Run-Case 'exact-mixed-extra' { param($case, $o) Set-ExactMixedTarget $case; 'extra' | Set-Content -LiteralPath (Join-Path $case.Frontend 'src\unexpected-mixed-extra.txt') -Encoding UTF8 } 2 @('[UPGRADE_TARGET_DRIFT]')

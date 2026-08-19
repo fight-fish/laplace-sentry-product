@@ -292,6 +292,10 @@ else {
         Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed-adapter-near-miss -CaseTimeoutSeconds 30') -TimeoutSeconds 45
         Assert-NoTempResidue
     }
+    Invoke-GateCheck 'TEMP preflight exact mixed tray target-adjacent negative' {
+        Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed-tray-target-near-miss -CaseTimeoutSeconds 30') -TimeoutSeconds 45
+        Assert-NoTempResidue
+    }
 }
 
 Invoke-GateCheck 'formal basis live-origin and real-merge negatives' {

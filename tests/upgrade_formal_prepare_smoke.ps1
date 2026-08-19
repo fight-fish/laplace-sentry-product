@@ -70,6 +70,10 @@ function Get-GitOutput {
 $TargetCommit = $FormalUpgradeTargetCommit
 $TargetShort = $TargetCommit.Substring(0, 7)
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$SourceCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+$ExpectedAdapterBlob = 'ad49188e2f54c00245f54744e1413cfe83e8d867'
+$ExpectedSourceTrayBlob = '13577b3bfa63af7ba320f0a410545503c704b4c2'
+$ExpectedTargetTrayBlob = 'bdc98668e3779fa006be5e3c7f05e220776374c2'
 $SourceMarker = '1e7bc2b'
 $FixedTime = [DateTime]::Parse('2024-01-02T03:04:05.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
 $FrontendAllowlist = @('assets', 'src', 'requirements.txt', 'run_ui.bat', 'run_ui.vbs', 'run_dev_ui.bat')
@@ -206,6 +210,7 @@ function Assert-ProductionWslMetadataSeam {
 
 function Assert-CheckpointBasisContract {
     $followUp = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $sourceCheckpoint = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
     $sourceTree = 'cccccccccccccccccccccccccccccccccccccccc'
     Assert-True ($FormalUpgradeTargetCommit -eq '08bb6641ac042c6ce20ec92501f6814fe9f22fac') 'Decision 312 formal payload target is not exact current main.'
     Assert-True ($FormalPrepareCumulativePaths.Count -eq 8) 'Decision 331 cumulative path set is not exactly eight files.'
@@ -224,12 +229,32 @@ function Assert-CheckpointBasisContract {
     Assert-True (-not (Test-FormalPrepareApprovedMergeShape -ParentHeads @($FormalPrepareOriginMainHead, $followUp) -ChangedPaths $FormalPrepareCumulativePaths -CurrentTree ('d' * 40) -ApprovedSourceTree $sourceTree -SourceChainValid $true)) 'Merge tree mismatch was accepted.'
     Assert-True (-not (Test-FormalPrepareApprovedMergeShape -ParentHeads @($FormalPrepareOriginMainHead, $followUp) -ChangedPaths $FormalPrepareCumulativePaths -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceChainValid $false)) 'Merge with an invalid source chain was accepted.'
 
-    Assert-FormalPrepareRepoState -CurrentHead $FormalPreparePreflightCheckpointHead -OriginMain $FormalPreparePreflightCheckpointHead -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false
-    Assert-FormalPrepareRepoState -CurrentHead $FormalPreparePreflightCheckpointHead -OriginMain $FormalPrepareOriginMainHead -Staged @() -Dirty ($FormalPrepareFollowUpPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true
-    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPreparePreflightCheckpointHead -OriginMain $FormalPrepareOriginMainHead -Staged @() -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Live origin drift was accepted despite exact source shape.'
-    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPreparePreflightCheckpointHead -OriginMain $FormalPreparePreflightCheckpointHead -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty @() -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Staged changes were accepted.'
-    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPreparePreflightCheckpointHead -OriginMain $FormalPreparePreflightCheckpointHead -Staged @() -Dirty @('unexpected.txt') -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL' 'Unexpected dirty path was accepted.'
-    Write-Output 'prepare ruled basis seam: PASS source_chain=08bb664-bf8f57b-c7aa16c-followup merge_parent=08bb664 cumulative_paths=8'
+    Assert-True ($FormalPrepareMergedMainHead -eq '8baf0d70d0b76069d12bf70e1342aca3d08432ac') 'Current merged-main anchor drifted.'
+    Assert-True ($FormalPrepareCurrentCutPaths.Count -eq 7) 'Current cut is not exactly seven files.'
+    Assert-True (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads @($FormalPrepareMergedMainHead) -ChangedPaths $FormalPrepareCurrentCutPaths) 'Exact direct-child checkpoint shape was rejected.'
+    Assert-True (-not (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads @($FormalPrepareOriginMainHead) -ChangedPaths $FormalPrepareCurrentCutPaths)) 'Sibling checkpoint shape was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads @($sourceCheckpoint) -ChangedPaths $FormalPrepareCurrentCutPaths)) 'Grandchild checkpoint shape was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads @($FormalPrepareMergedMainHead) -ChangedPaths ($FormalPrepareCurrentCutPaths | Select-Object -Skip 1))) 'Checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentSourceCheckpointShape -ParentHeads @($FormalPrepareMergedMainHead) -ChangedPaths ($FormalPrepareCurrentCutPaths + 'unexpected.txt'))) 'Checkpoint with an extra path was accepted.'
+
+    Assert-True (Test-FormalPrepareCurrentMergeShape -ParentHeads @($FormalPrepareMergedMainHead, $sourceCheckpoint) -ChangedPaths $FormalPrepareCurrentCutPaths -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $true) 'Exact current future merge shape was rejected.'
+    Assert-True (-not (Test-FormalPrepareCurrentMergeShape -ParentHeads @($sourceCheckpoint, $FormalPrepareMergedMainHead) -ChangedPaths $FormalPrepareCurrentCutPaths -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $true)) 'Wrong parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentMergeShape -ParentHeads @($FormalPrepareMergedMainHead, $sourceCheckpoint) -ChangedPaths ($FormalPrepareCurrentCutPaths | Select-Object -Skip 1) -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $true)) 'Current merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentMergeShape -ParentHeads @($FormalPrepareMergedMainHead, $sourceCheckpoint) -ChangedPaths ($FormalPrepareCurrentCutPaths + 'unexpected.txt') -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $true)) 'Current merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentMergeShape -ParentHeads @($FormalPrepareMergedMainHead, $sourceCheckpoint) -ChangedPaths $FormalPrepareCurrentCutPaths -CurrentTree ('d' * 40) -ApprovedSourceTree $sourceTree -SourceCheckpointValid $true)) 'Current merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareCurrentMergeShape -ParentHeads @($FormalPrepareMergedMainHead, $sourceCheckpoint) -ChangedPaths $FormalPrepareCurrentCutPaths -CurrentTree $sourceTree -ApprovedSourceTree $sourceTree -SourceCheckpointValid $false)) 'Current merge with an invalid source checkpoint was accepted.'
+
+    Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty ($FormalPrepareCurrentCutPaths + @('.gitignore', 'Frontend/src/backend/adapter.py')) -FixtureMode $true -BasisKind 'merged-main'
+    Assert-FormalPrepareRepoState -CurrentHead $sourceCheckpoint -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $true -BasisKind 'source-checkpoint'
+    Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @('.gitignore', 'Frontend/src/backend/adapter.py') -FixtureMode $false -BasisKind 'merged-main'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty ($FormalPrepareCurrentCutPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Pre-checkpoint fixture missing a dirty path was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty ($FormalPrepareCurrentCutPaths + 'unexpected.txt') -FixtureMode $true -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Pre-checkpoint fixture with arbitrary dirty was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $sourceCheckpoint -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @($FormalPrepareCurrentCutPaths[0]) -FixtureMode $true -BasisKind 'source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Checkpoint fixture retained a current-cut dirty path.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareOriginMainHead -Staged @() -Dirty $FormalPrepareCurrentCutPaths -FixtureMode $true -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Fixture origin drift was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty $FormalPrepareCurrentCutPaths -FixtureMode $true -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Staged changes were accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareOriginMainHead -Staged @() -Dirty @() -FixtureMode $false -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Live origin drift was accepted despite exact merged basis.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @($FormalPrepareCurrentCutPaths[0]) -FixtureMode $false -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Live current-cut dirty was accepted.'
+    Write-Output 'prepare ruled basis seam: PASS legacy=08bb664-bf8f57b-c7aa16c-691b619-8baf0d70 current=seven-path-direct-child future-merge=exact'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
@@ -241,9 +266,10 @@ function Assert-BranchGuardContract {
 
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
-    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead) -eq 'checkpoint') 'Current HEAD was not accepted as an approved checkpoint.'
+    $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
+    Assert-True ($basisKind -in @('merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
-    Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' checked=true')
+    Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
 function Assert-StrictTempPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -296,15 +322,15 @@ Set-StrictMode -Version Latest
 `$UpgradeScript = Join-Path `$RepoRoot 'scripts\upgrade.ps1'
 
 
-# Fixture-only seam: production keeps the main-branch guard, while the isolated
-# smoke child simulates only that branch-name observation. All HEAD, origin/main,
+# Fixture-only seam: production keeps its branch guard, while the isolated smoke
+# child simulates only the approved working-branch observation. All HEAD, origin/main,
 # status, tree, parent, path, and blob checks still delegate to the real Git CLI.
 function global:git {
     param([Parameter(ValueFromRemainingArguments=`$true)][object[]]`$GitArguments)
     `$parts = @(`$GitArguments | ForEach-Object { [string]`$_ })
     if (`$parts.Count -eq 4 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'branch' -and `$parts[3] -eq '--show-current') {
         `$global:LASTEXITCODE = 0
-        'main'
+        `$FormalPrepareApprovedWorkingBranch
         return
     }
     & git.exe @parts
@@ -352,17 +378,19 @@ function Export-CommitTree {
 
 function Initialize-PrepareTemplate {
     $build = Join-Path $TemplateRoot 'fixture-build'
-    $tree = Join-Path $build 'target'
+    $tree = Join-Path $build 'source'
     $oldTree = Join-Path $build 'old-adapter'
     New-Item -ItemType Directory -Path $TemplateRoot -Force | Out-Null
     $specs = @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ }) + @($BackendAllowlist | ForEach-Object { 'Backend/' + $_ })
-    Export-CommitTree -Commit $TargetCommit -PathSpecs $specs -Destination $tree -WorkRoot (Join-Path $build 'target-archive')
+    Export-CommitTree -Commit $SourceCommit -PathSpecs $specs -Destination $tree -WorkRoot (Join-Path $build 'source-archive')
     Export-CommitTree -Commit $AdapterCommit -PathSpecs @('Frontend/src/backend/adapter.py') -Destination $oldTree -WorkRoot (Join-Path $build 'old-archive')
     $frontend = Join-Path $TemplateRoot 'frontend-target'
     $backend = Join-Path $TemplateRoot 'backend-target'
     Move-Item -LiteralPath (Join-Path $tree 'Frontend') -Destination $frontend
     Move-Item -LiteralPath (Join-Path $tree 'Backend') -Destination $backend
     Copy-Item -LiteralPath (Join-Path $oldTree 'Frontend\src\backend\adapter.py') -Destination (Join-Path $frontend 'src\backend\adapter.py') -Force
+    Assert-True ((Get-GitOutput -Arguments @('hash-object', '--', (Join-Path $frontend 'src\tray\tray_app.py')) | Select-Object -First 1).Trim() -eq $ExpectedSourceTrayBlob) 'Prepare template tray is not the ruled source-baseline blob.'
+    Assert-True ((Get-GitOutput -Arguments @('hash-object', '--', (Join-Path $frontend 'src\backend\adapter.py')) | Select-Object -First 1).Trim() -eq $ExpectedAdapterBlob) 'Prepare template adapter is not the ruled override blob.'
     Remove-TestTree $build
     New-Item -ItemType Directory -Path (Join-Path $backend 'data') -Force | Out-Null
     "[General]`r`neye_size=480" | Set-Content -LiteralPath (Join-Path $frontend 'sentry_config.ini') -Encoding UTF8
@@ -683,8 +711,9 @@ try {
             Assert-True (@($packageManifest.records).Count -eq 28) 'Package manifest must contain 26 files and two markers.'
             $trayPackage = @($packageManifest.records | Where-Object { $_.key -eq 'Frontend/src/tray/tray_app.py' })[0]
             $expectedTrayBlob = (Get-GitOutput -Arguments @('rev-parse', "$TargetCommit`:Frontend/src/tray/tray_app.py") | Select-Object -First 1).Trim()
-            Assert-True ($trayPackage.git_blob -eq $expectedTrayBlob) 'Package tray payload did not bind to the target commit blob.'
+            Assert-True ($expectedTrayBlob -eq $ExpectedTargetTrayBlob -and $trayPackage.git_blob -eq $ExpectedTargetTrayBlob) 'Package tray payload did not bind to the ruled target blob.'
             $frontendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Frontend/src/tray/tray_app.py' })[0]
+            Assert-True ((Get-GitOutput -Arguments @('hash-object', '--', $frontendMetadata.source_path) | Select-Object -First 1).Trim() -eq $ExpectedSourceTrayBlob) 'Source manifest tray did not bind to the ruled source-baseline blob.'
             $backendMetadata = @($sourceManifest.records | Where-Object { $_.key -eq 'Backend/src/core/daemon.py' })[0]
             Assert-True ($frontendMetadata.attributes -and $frontendMetadata.sddl) 'Frontend attributes/SDDL were not sealed.'
             Assert-True ($backendMetadata.posix_mode -eq '755' -and $backendMetadata.uid -eq 1000 -and $backendMetadata.gid -eq 1000) 'Backend POSIX metadata was not sealed.'

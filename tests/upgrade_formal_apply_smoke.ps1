@@ -41,6 +41,9 @@ $FormalTransactions = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transact
 # 在受限 scope 直接讀 PrepareFormal 的正式目標來源，避免 apply smoke 自帶第二份 target 或污染測試 scope。
 $TargetCommit = & { . (Join-Path $RepoRoot 'scripts\upgrade_formal_prepare.ps1'); $FormalUpgradeTargetCommit }
 $AdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$SourceCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
+$ExpectedAdapterBlob = 'ad49188e2f54c00245f54744e1413cfe83e8d867'
+$ExpectedSourceTrayBlob = '13577b3bfa63af7ba320f0a410545503c704b4c2'
 $SourceMarker = '1e7bc2b'
 $FixedTime = [DateTime]::Parse('2024-01-02T03:04:05.0000000Z', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
 $FrontendAllowlist = @('assets', 'src', 'requirements.txt', 'run_ui.bat', 'run_ui.vbs', 'run_dev_ui.bat')
@@ -80,7 +83,7 @@ function Initialize-BranchOnlyGitShim {
     $content = @"
 @echo off
 if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="--show-current" if "%~5"=="" (
-  echo main
+  echo s/S-02-03b/exact-mixed-live-source-baseline
   exit /b 0
 )
 "$RealGitExe" %*
@@ -89,7 +92,7 @@ if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="-
 }
 
 function Assert-BranchOnlyGitShimContract {
-    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 'main') 'Branch-only Git shim did not simulate main.'
+    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 's/S-02-03b/exact-mixed-live-source-baseline') 'Branch-only Git shim did not simulate the approved working branch.'
     foreach ($revision in @('HEAD', 'origin/main')) {
         $throughShim = (& $GitBranchShim -C $RepoRoot rev-parse $revision).Trim()
         $throughRealGit = (& $RealGitExe -C $RepoRoot rev-parse $revision).Trim()
@@ -115,17 +118,19 @@ function Export-CommitTree {
 
 function Initialize-ApplyTemplate {
     $build = Join-Path $TemplateRoot 'fixture-build'
-    $tree = Join-Path $build 'target'
+    $tree = Join-Path $build 'source'
     $oldTree = Join-Path $build 'old-adapter'
     New-Item -ItemType Directory -Path $TemplateRoot -Force | Out-Null
     $specs = @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ }) + @($BackendAllowlist | ForEach-Object { 'Backend/' + $_ })
-    Export-CommitTree -Commit $TargetCommit -PathSpecs $specs -Destination $tree -WorkRoot (Join-Path $build 'target-archive')
+    Export-CommitTree -Commit $SourceCommit -PathSpecs $specs -Destination $tree -WorkRoot (Join-Path $build 'source-archive')
     Export-CommitTree -Commit $AdapterCommit -PathSpecs @('Frontend/src/backend/adapter.py') -Destination $oldTree -WorkRoot (Join-Path $build 'old-archive')
     $frontend = Join-Path $TemplateRoot 'frontend-target'
     $backend = Join-Path $TemplateRoot 'backend-target'
     Move-Item -LiteralPath (Join-Path $tree 'Frontend') -Destination $frontend
     Move-Item -LiteralPath (Join-Path $tree 'Backend') -Destination $backend
     Copy-Item -LiteralPath (Join-Path $oldTree 'Frontend\src\backend\adapter.py') -Destination (Join-Path $frontend 'src\backend\adapter.py') -Force
+    Assert-True ((& git -C $RepoRoot hash-object -- (Join-Path $frontend 'src\tray\tray_app.py')).Trim() -eq $ExpectedSourceTrayBlob) 'Apply template tray is not the ruled source-baseline blob.'
+    Assert-True ((& git -C $RepoRoot hash-object -- (Join-Path $frontend 'src\backend\adapter.py')).Trim() -eq $ExpectedAdapterBlob) 'Apply template adapter is not the ruled override blob.'
     Remove-TestTree $build
     New-Item -ItemType Directory -Path (Join-Path $backend 'data') -Force | Out-Null
     "[General]`r`neye_size=480" | Set-Content -LiteralPath (Join-Path $frontend 'sentry_config.ini') -Encoding UTF8
@@ -165,6 +170,7 @@ function New-ApplyCase {
         Transactions = Join-Path $root 'transactions'; Observation = Join-Path $root 'observation.json'
     }
     Add-Member -InputObject $case -NotePropertyName Adapter -NotePropertyValue (Join-Path $case.Frontend 'src\backend\adapter.py')
+    Add-Member -InputObject $case -NotePropertyName Tray -NotePropertyValue (Join-Path $case.Frontend 'src\tray\tray_app.py')
     Add-Member -InputObject $case -NotePropertyName Config -NotePropertyValue (Join-Path $case.Frontend 'sentry_config.ini')
     Add-Member -InputObject $case -NotePropertyName Projects -NotePropertyValue (Join-Path $case.Backend 'data\projects.json')
     foreach ($file in @(Get-ChildItem -LiteralPath $case.Frontend, $case.Backend -Recurse -File -Force)) { [IO.File]::SetLastWriteTimeUtc($file.FullName, $FixedTime) }
@@ -401,6 +407,8 @@ try {
     $positiveResult = Assert-ValidationResult -Case $positive -TransactionRoot $positive.Transaction -ExitCode 0 -Result 'eligible' -Tag ''
     Assert-True ($positiveResult.Json.eligible -and [double]$positiveResult.Json.age_seconds -ge 0 -and [double]$positiveResult.Json.age_seconds -le 1800) 'Fresh prepared transaction was not eligible within the fixed age.'
     Assert-True (@($positiveResult.Json.checks | Where-Object status -eq 'pass').Count -ge 7) 'Eligible result lacks traceable pass checks.'
+    Assert-True ((& git -C $RepoRoot hash-object -- $positive.Tray).Trim() -eq $ExpectedSourceTrayBlob) 'Eligible transaction source tray is not the ruled baseline blob.'
+    Assert-True ((& git -C $RepoRoot hash-object -- $positive.Adapter).Trim() -eq $ExpectedAdapterBlob) 'Eligible transaction source adapter is not the ruled override blob.'
 
     Restore-PreparedBaseline -Case $positive -Baseline $baseline -Name 'wrong-root'
     [void](Assert-ValidationResult -Case $positive -TransactionRoot $positive.Transactions -ExitCode 7 -Result 'rejected' -Tag '[UPGRADE_APPLY_TRANSACTION_FAIL]')
@@ -436,6 +444,10 @@ try {
 
     Restore-PreparedBaseline -Case $positive -Baseline $baseline -Name 'target-drift'
     'target-drift' | Add-Content -LiteralPath $positive.Adapter -Encoding UTF8
+    [void](Assert-ValidationResult -Case $positive -TransactionRoot $positive.Transaction -ExitCode 7 -Result 'rejected' -Tag '[UPGRADE_APPLY_TARGET_FAIL]')
+
+    Restore-PreparedBaseline -Case $positive -Baseline $baseline -Name 'tray-target-drift'
+    'tray-target-drift' | Add-Content -LiteralPath $positive.Tray -Encoding UTF8
     [void](Assert-ValidationResult -Case $positive -TransactionRoot $positive.Transaction -ExitCode 7 -Result 'rejected' -Tag '[UPGRADE_APPLY_TARGET_FAIL]')
 
     Restore-PreparedBaseline -Case $positive -Baseline $baseline -Name 'protected-drift'

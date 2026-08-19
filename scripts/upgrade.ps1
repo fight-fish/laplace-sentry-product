@@ -68,6 +68,7 @@ $global:LaplaceSentryImmutableGitOutputCache = @{}
 $global:LaplaceSentryExpectedManagedGitPathsCache = @{}
 
 $MixedRepairAdapterCommit = '4f228ae5f31754aa43a918274e3b542b6f0a2144'
+$MixedRepairSourceCommit = '971ba498d613c2bb20d46e14855cc0b0a326602a'
 $MixedRepairMarker = '1e7bc2b'
 $MixedRepairSchema = 'laplace-mixed-source-v1'
 $MixedRepairAbsentPath = 'Frontend/run_dev_ui.bat'
@@ -1151,12 +1152,13 @@ function Invoke-FormalPreflightMode {
                     $mixedLayout = @(Resolve-MixedRepairLayout -Inputs $Inputs)
                     $mixedReplace = @($mixedLayout | Where-Object { $_.action -eq 'replace' })
                     $mixedUnchanged = @($mixedLayout | Where-Object { $_.action -eq 'verify_unchanged' })
-                    if ($mixedLayout.Count -ne 26 -or $mixedReplace.Count -ne 1 -or
-                        $mixedReplace[0].git_path -ne 'Frontend/src/backend/adapter.py' -or
-                        $mixedUnchanged.Count -ne 25) {
+                    $mixedReplacePaths = @($mixedReplace.git_path | Sort-Object)
+                    if ($mixedLayout.Count -ne 26 -or $mixedReplace.Count -ne 2 -or
+                        ($mixedReplacePaths -join ',') -ne 'Frontend/src/backend/adapter.py,Frontend/src/tray/tray_app.py' -or
+                        $mixedUnchanged.Count -ne 24) {
                         throw '[UPGRADE_MIXED_SOURCE_FAIL] Exact Base layout shape was not proven.'
                     }
-                    Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'pass' -TruthSource 'Exact ruled mixed source contract' -Reason "contract=$MixedRepairSchema; managed=26; replace=1; unchanged=25; marker=$MixedRepairMarker"
+                    Add-FormalPreflightCheck -Result $result -Id 'target_coherence' -Status 'pass' -TruthSource 'Exact ruled mixed source contract' -Reason "contract=$MixedRepairSchema; managed=26; replace=2; unchanged=24; marker=$MixedRepairMarker"
                 }
                 catch {
                     Add-FormalPreflightFailure -Result $result -Tag '[UPGRADE_TARGET_DRIFT]' -CheckId 'target_coherence' -Message "Managed target drift: missing=$($coherence.missing.Count), extra=$($coherence.extra.Count), blob=$($coherence.blob_drift.Count)."
@@ -1387,7 +1389,9 @@ function Resolve-MixedRepairLayout {
         $expectedSourceBlob = if ($gitPath -eq 'Frontend/src/backend/adapter.py') {
             (Get-GitOutput -Arguments @('rev-parse', "$MixedRepairAdapterCommit`:$gitPath") | Select-Object -First 1).Trim()
         }
-        else { $packageBlob }
+        else {
+            (Get-GitOutput -Arguments @('rev-parse', "$MixedRepairSourceCommit`:$gitPath") | Select-Object -First 1).Trim()
+        }
         $exists = $actualByPath.ContainsKey($gitPath)
         if (-not $exists) {
             if ($MixedFixtureVariant -ne 'OriginallyAbsent' -or $gitPath -ne $MixedRepairAbsentPath) {
@@ -1437,9 +1441,11 @@ function Resolve-MixedRepairLayout {
     }
 
     if ($MixedFixtureVariant -eq 'Base') {
-        if (@($layout | Where-Object { $_.action -eq 'replace' }).Count -ne 1 -or
-            @($layout | Where-Object { $_.action -eq 'verify_unchanged' }).Count -ne 25) {
-            throw '[UPGRADE_MIXED_SOURCE_FAIL] Base fixture must resolve to one adapter replace and 25 verify_unchanged records.'
+        $replacePaths = @($layout | Where-Object { $_.action -eq 'replace' } | ForEach-Object { $_.git_path } | Sort-Object)
+        if ($replacePaths.Count -ne 2 -or
+            ($replacePaths -join ',') -ne 'Frontend/src/backend/adapter.py,Frontend/src/tray/tray_app.py' -or
+            @($layout | Where-Object { $_.action -eq 'verify_unchanged' }).Count -ne 24) {
+            throw '[UPGRADE_MIXED_SOURCE_FAIL] Base fixture must resolve to adapter/tray replace and 24 verify_unchanged records.'
         }
     }
     foreach ($markerPath in @((Join-Path $Inputs.FrontendTarget 'version.txt'), (Join-Path $Inputs.BackendTarget 'version.txt'))) {
@@ -2154,6 +2160,7 @@ function New-MixedRepairTransaction {
         mode = 'RepairMixedIsolated'
         state = 'prepared'
         target_commit = $FormalUpgradeTargetCommit
+        source_baseline_commit = $MixedRepairSourceCommit
         source_adapter_commit = $MixedRepairAdapterCommit
         source_marker = $MixedRepairMarker
         fixture_variant = $MixedFixtureVariant
