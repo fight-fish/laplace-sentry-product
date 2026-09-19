@@ -9,7 +9,7 @@ import os
 import tempfile
 import threading
 import time
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, TypedDict
 import math
 import ctypes
 from pathlib import Path
@@ -1424,6 +1424,13 @@ def _s0206_result_kind(value: object) -> str:
     return "other"
 
 
+def _s0206_as_number_source(value: object) -> "str | int | float":
+    """把診斷欄位收窄成 int()／float() 接受的型別；無法轉換者一律回 `""`，交由呼叫端既有 except 落回預設值。"""
+    if isinstance(value, (str, int, float)):
+        return value
+    return ""
+
+
 def _s0206_short_text(value: object) -> str:
     text = str(value or "")
     allowed = {
@@ -1449,6 +1456,15 @@ def _s0206_short_text(value: object) -> str:
         "unsupported_query_kind",
     }
     return text if text in allowed else "other"
+
+
+class _TreeItemTracePayload(TypedDict):
+    """目錄樹節點的診斷追蹤欄位；固定四鍵，值型別即 `_record_tree_expand_decision` 的參數契約。"""
+
+    path_key: str
+    loaded: bool
+    loading: bool
+    has_children: bool
 
 
 class S0206InstrumentationTracer:
@@ -1487,13 +1503,13 @@ class S0206InstrumentationTracer:
         for key in ("request_id", "active_count", "child_count"):
             if key in fields:
                 try:
-                    payload[key] = int(fields[key])
+                    payload[key] = int(_s0206_as_number_source(fields[key]))
                 except (TypeError, ValueError):
                     payload[key] = 0
         for key in ("query_elapsed_ms", "merge_elapsed_ms"):
             if key in fields:
                 try:
-                    payload[key] = max(0.0, round(float(fields[key]), 3))
+                    payload[key] = max(0.0, round(float(_s0206_as_number_source(fields[key])), 3))
                 except (TypeError, ValueError):
                     payload[key] = 0.0
         for key in ("loaded", "loading", "has_children"):
@@ -3237,7 +3253,7 @@ class DashboardWidget(QWidget):
             })
             item.addChild(placeholder_item)
 
-    def _tree_item_trace_payload(self, item: QTreeWidgetItem) -> dict[str, object]:
+    def _tree_item_trace_payload(self, item: QTreeWidgetItem) -> "_TreeItemTracePayload":
         payload = item.data(0, Qt.ItemDataRole.UserRole)
         if not isinstance(payload, dict):
             return {"path_key": "", "loaded": False, "loading": False, "has_children": False}
