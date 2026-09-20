@@ -198,7 +198,9 @@ function Assert-FormalApplyTransactionIdentity {
     }
 }
 
-function Get-FormalApplyTransactionAge {
+function Get-FormalTransactionAgeSeconds {
+    # 只解析並校驗時間身分，不強制 30 分鐘上限；上限判定由各呼叫端依自身語義決定。
+    # apply 要求「仍在窗口內」，invalidate 要求「確實已逾時」，兩者共用同一份解析與同一組常數。
     param([Parameter(Mandatory = $true)]$Journal)
     $created = [DateTime]::MinValue
     if (-not [DateTime]::TryParseExact([string]$Journal.created_at_utc, 'o', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$created)) {
@@ -214,7 +216,18 @@ function Get-FormalApplyTransactionAge {
         throw '[UPGRADE_APPLY_AGE_FAIL] Journal creation time disagrees with the transaction ID.'
     }
     $age = ([DateTime]::UtcNow - $created.ToUniversalTime()).TotalSeconds
-    if ($age -lt -5 -or $age -gt ($FormalApplyMaximumAgeMinutes * 60)) {
+    # 未來時間一律不可信：兩個呼叫端都不得接受，故在共用層即拒絕，訊息與拆分前的下界拒絕保持一致。
+    if ($age -lt -5) {
+        throw "[UPGRADE_APPLY_AGE_FAIL] Prepared transaction age is outside 0-$FormalApplyMaximumAgeMinutes minutes: $([Math]::Round($age, 3)) seconds."
+    }
+    return [double]$age
+}
+
+function Get-FormalApplyTransactionAge {
+    # Apply／Validate 語義：必須仍落在固定 0-30 分鐘窗口內，逾時即拒絕。行為與拆分前逐案等價。
+    param([Parameter(Mandatory = $true)]$Journal)
+    $age = Get-FormalTransactionAgeSeconds -Journal $Journal
+    if ($age -gt ($FormalApplyMaximumAgeMinutes * 60)) {
         throw "[UPGRADE_APPLY_AGE_FAIL] Prepared transaction age is outside 0-$FormalApplyMaximumAgeMinutes minutes: $([Math]::Round($age, 3)) seconds."
     }
     return [double]$age
