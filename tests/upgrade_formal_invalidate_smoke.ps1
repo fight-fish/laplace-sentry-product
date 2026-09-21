@@ -29,13 +29,14 @@ function Get-OptionalProperty { param($Object,[string]$Name,$Default=$null) if($
 . (Join-Path $RepoRoot 'scripts\upgrade_formal_apply.ps1')
 . (Join-Path $RepoRoot 'scripts\upgrade_formal_invalidate.ps1')
 function Assert-True { param([bool]$Condition,[string]$Message) if (-not $Condition) { throw "[ASSERT_FAIL] $Message" } }
-function Assert-Throws { param([scriptblock]$Action,[string]$Tag) $caught=$null;try{&$Action}catch{$caught=$_}; Assert-True ($null -ne $caught -and $caught.Exception.Message -match $Tag) "expected $Tag, got $($caught.Exception.Message)" }
+function Assert-Throws { param([scriptblock]$Action,[string]$Tag) $caught=$null;try{&$Action|Out-Null}catch{$caught=$_}; $msg=if($null -eq $caught){'<no exception>'}elseif($null -ne $caught.Exception){[string]$caught.Exception.Message}else{[string]$caught}; Assert-True ($null -ne $caught -and $msg -match $Tag) "expected $Tag, got $msg" }
 function Remove-OwnTree { param([string]$Path) if ((Test-Path -LiteralPath $Path) -and (Test-StrictPathInside -Candidate $Path -Container $TempRoot)) { Remove-Item -LiteralPath $Path -Recurse -Force } }
 function New-Case {
  # AgeMinutes 同時決定 transaction_id 時間戳與 created_at_utc，兩者必須一致才能通過時間身分校驗。
  # CreatedOverride 用來刻意製造兩者不一致或無法解析的負向案例。
- param([string]$Name,[string]$Result='prepared',[switch]$RuledTarget,[switch]$RootMismatch,[switch]$TamperManifest,[double]$AgeMinutes=0,[string]$CreatedOverride,[switch]$OmitCreated)
- $created=[DateTime]::UtcNow.AddMinutes(-$AgeMinutes)
+ param([string]$Name,[string]$Result='prepared',[switch]$RuledTarget,[switch]$RootMismatch,[switch]$TamperManifest,[double]$AgeMinutes=0,[double]$AgeSeconds,[string]$CreatedOverride,[switch]$OmitCreated)
+ # AgeSeconds 用於捨入邊界案例，需要秒以下精度；未指定時沿用 AgeMinutes。
+ $created=if($PSBoundParameters.ContainsKey('AgeSeconds')){[DateTime]::UtcNow.AddSeconds(-$AgeSeconds)}else{[DateTime]::UtcNow.AddMinutes(-$AgeMinutes)}
  $root=Join-Path $SuiteRoot $Name; $tx=Join-Path $root ($created.ToString('yyyyMMddTHHmmssfffffffZ') + '-' + [Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $tx -Force | Out-Null; $refs=[ordered]@{}
  foreach($n in @('source','preimage','package')) { $path=Join-Path $tx "$n-manifest.json"; [pscustomobject]@{schema=$FormalPrepareSchema;manifest_type=$n;manifest_id="$n-id";records=@()}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $path -Encoding UTF8; $refs[$n]=[pscustomobject]@{path=$path;sha256=(Get-FileSha256 $path);id="$n-id"} }
  if($TamperManifest){ Add-Content -LiteralPath $refs.source.path -Value 'tamper' }
@@ -66,6 +67,42 @@ try {
  Assert-ZeroWrite $fresh { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $fresh) } 'UPGRADE_INVALIDATE_TARGET_MATCH' 'fresh same-target'
  $freshEdge=New-Case 'same-target-edge' -RuledTarget -AgeMinutes ($FormalApplyMaximumAgeMinutes - 1)
  Assert-ZeroWrite $freshEdge { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $freshEdge) } 'UPGRADE_INVALIDATE_TARGET_MATCH' 'inside-window same-target'
+ # 捨入邊界：raw age 落在 (1800.000, 1800.0005] 時，三位小數證據會回落至 1800.000。
+ # 判定必須使用同一個正規化值，否則會先寫入 invalidated 再自驗失敗，留下半套交易。
+ # 真實時鐘無法穩定停在毫秒以下的窗口（實測 fixture 建立到判定之間即前進數十毫秒），
+ # 故以直接呼叫正規化 helper 驗證契約，再用大偏移案例驗證端到端流程。
+ $limitSeconds=$FormalApplyMaximumAgeMinutes * 60
+ foreach($raw in @(1800.0, 1800.0001, 1800.0004, 1800.00049, 1800.0005)){
+   $norm=Get-FormalInvalidateEvidenceAge -RawAgeSeconds $raw
+   Assert-True ($norm -le $limitSeconds) "normalised age for raw $raw must not exceed the window (got $norm)."
+ }
+ foreach($raw in @(1800.001, 1800.01, 1801.0)){
+   $norm=Get-FormalInvalidateEvidenceAge -RawAgeSeconds $raw
+   Assert-True ($norm -gt $limitSeconds) "normalised age for raw $raw must exceed the window (got $norm)."
+   Assert-True ($norm -eq [Math]::Round($norm,3)) "normalised age for raw $raw is not three-decimal."
+ }
+ # 正規化後仍明確大於門檻者必須可失效，且落檔值即判定所用的正規化值。
+ $justOver=New-Case 'round-boundary-over' -RuledTarget -AgeSeconds ($limitSeconds + 2)
+ $justOverResult=Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $justOver)
+ $justOverAfter=Get-Content $justOver.Journal -Raw -Encoding UTF8|ConvertFrom-Json
+ Assert-True ($justOverResult.result -eq 'invalidated' -and $justOverAfter.state -eq 'invalidated') 'just-over boundary did not invalidate.'
+ $joAge=[double]$justOverAfter.invalidation.age_seconds
+ Assert-True ($joAge -gt $limitSeconds) 'just-over evidence age is not above the window.'
+ Assert-True ($joAge -eq [Math]::Round($joAge,3)) 'landed age_seconds is not the normalised three-decimal value.'
+ # 接線驗證：invalidator 必須真的經過正規化 helper，而非各自捨入。
+ # 真實時鐘無法穩定落在 0.5 毫秒窗，故以「暫時攔截 helper」證明判定路徑確實呼叫它；
+ # 若判定改回使用 raw age，攔截將不再生效、下方斷言即失敗。
+ $script:NormaliseCallCount=0
+ $realNormalise=(Get-Command Get-FormalInvalidateEvidenceAge).ScriptBlock
+ function Get-FormalInvalidateEvidenceAge { param([Parameter(Mandatory=$true)][double]$RawAgeSeconds)
+   $script:NormaliseCallCount++
+   return [double][Math]::Round($RawAgeSeconds,3) }
+ $wired=New-Case 'normalise-wired' -RuledTarget -AgeSeconds ($limitSeconds + 2)
+ $wiredBefore=$script:NormaliseCallCount
+ [void](Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $wired))
+ Assert-True ($script:NormaliseCallCount -gt $wiredBefore) 'invalidator did not route its age through the normalisation helper.'
+ Set-Item -Path function:Get-FormalInvalidateEvidenceAge -Value $realNormalise
+ Assert-True ((Get-FormalInvalidateEvidenceAge -RawAgeSeconds 1800.0004) -le $limitSeconds) 'helper restore failed.'
  # 驗收 2：同 target 且確實逾時，允許一次 expired_transaction 失效並留下可信 age 證據。
  $expired=New-Case 'same-target-expired' -RuledTarget -AgeMinutes ($FormalApplyMaximumAgeMinutes + 5)
  $expiredHash=Get-FileSha256 $expired.Journal; $expiredSource=Get-FileSha256 (Join-Path $expired.Transaction 'source-manifest.json')
@@ -92,6 +129,37 @@ try {
  Assert-Throws { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs (New-Case 'root-mismatch' -RootMismatch)) } 'UPGRADE_INVALIDATE_TRANSACTION_FAIL'
  Assert-Throws { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs (New-Case 'manifest-tamper' -TamperManifest)) } 'UPGRADE_PREPARE_RECOVERY_REQUIRED'
  $boundaryCase=New-Case 'boundary'; Assert-Throws { Assert-FormalInvalidateInternalBoundary -Inputs (Get-Inputs $boundaryCase) } 'UPGRADE_INVALIDATE_BOUNDARY_FAIL'
+ # 直接時間契約：不經 Prepare／Apply fixture，故不受 production basis gate 影響，可在任意 HEAD 執行。
+ # 覆蓋共用解析層與 apply 上限層的既有語義，確保本輪正規化未改動 Apply／Validate 判定。
+ function New-AgeJournal { param([double]$AgeSeconds,[string]$CreatedOverride,[string]$IdOverride)
+   $t=[DateTime]::UtcNow.AddSeconds(-$AgeSeconds)
+   [pscustomobject]@{
+     created_at_utc=$(if($PSBoundParameters.ContainsKey('CreatedOverride')){$CreatedOverride}else{$t.ToString('o')})
+     transaction_id=$(if($PSBoundParameters.ContainsKey('IdOverride')){$IdOverride}else{$t.ToString('yyyyMMddTHHmmssfffffffZ')+'-'+('a'*32)})
+   } }
+ $limitSeconds=$FormalApplyMaximumAgeMinutes * 60
+ # fresh：兩層都接受
+ $freshJ=New-AgeJournal -AgeSeconds 5
+ Assert-True ((Get-FormalTransactionAgeSeconds -Journal $freshJ) -ge 5) 'shared parser rejected a fresh journal.'
+ Assert-True ((Get-FormalApplyTransactionAge -Journal $freshJ) -le $limitSeconds) 'apply age gate rejected a fresh journal.'
+ # expired：共用層接受並回報真實 age，apply 層必須拒絕
+ $expJ=New-AgeJournal -AgeSeconds ($limitSeconds + 600)
+ Assert-True ((Get-FormalTransactionAgeSeconds -Journal $expJ) -gt $limitSeconds) 'shared parser did not report an expired age.'
+ Assert-Throws { Get-FormalApplyTransactionAge -Journal $expJ } 'UPGRADE_APPLY_AGE_FAIL'
+ # malformed created_at_utc：兩層都必須拒絕
+ $malJ=New-AgeJournal -AgeSeconds 60 -CreatedOverride 'not-a-timestamp'
+ Assert-Throws { Get-FormalTransactionAgeSeconds -Journal $malJ } 'UPGRADE_APPLY_AGE_FAIL'
+ Assert-Throws { Get-FormalApplyTransactionAge -Journal $malJ } 'UPGRADE_APPLY_AGE_FAIL'
+ # future-dated：共用層即拒絕，不得被視為 fresh
+ $futJ=New-AgeJournal -AgeSeconds (-600)
+ Assert-Throws { Get-FormalTransactionAgeSeconds -Journal $futJ } 'UPGRADE_APPLY_AGE_FAIL'
+ Assert-Throws { Get-FormalApplyTransactionAge -Journal $futJ } 'UPGRADE_APPLY_AGE_FAIL'
+ # identity mismatch：created_at_utc 與 transaction_id 時間戳不一致必須拒絕
+ $mmJ=New-AgeJournal -AgeSeconds 60 -CreatedOverride ([DateTime]::UtcNow.AddSeconds(-3600).ToString('o'))
+ Assert-Throws { Get-FormalTransactionAgeSeconds -Journal $mmJ } 'UPGRADE_APPLY_AGE_FAIL'
+ # id shape 不合法必須拒絕
+ $shapeJ=New-AgeJournal -AgeSeconds 60 -IdOverride 'not-a-transaction-id'
+ Assert-Throws { Get-FormalTransactionAgeSeconds -Journal $shapeJ } 'UPGRADE_APPLY_AGE_FAIL'
  $upgradeBat=Get-Content (Join-Path $RepoRoot 'upgrade.bat') -Raw -Encoding UTF8; Assert-True ($upgradeBat -notmatch 'InvalidateFormal') 'upgrade.bat exposes internal invalidation.'
  Remove-OwnTree $SuiteRoot; Assert-True (-not (Test-Path -LiteralPath $SuiteRoot)) 'TEMP residue remains.'; Write-Output 'upgrade formal invalidate smoke: PASS'; exit 0
 } catch { [Console]::Error.WriteLine("upgrade formal invalidate smoke: FAIL: $($_.Exception.Message)"); try { Remove-OwnTree $SuiteRoot } catch {}; exit 1 }

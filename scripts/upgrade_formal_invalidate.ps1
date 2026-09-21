@@ -21,6 +21,14 @@ Age rule: the fixed validation window lives only in upgrade_formal_apply.ps1; th
 Set-StrictMode -Version Latest
 $FormalInvalidateSchema = 'laplace-formal-invalidate-v1'
 
+function Get-FormalInvalidateEvidenceAge {
+    # 逾時判定、journal 落檔與寫後自驗必須共用同一個值，否則落在捨入邊界的交易會先寫成
+    # invalidated、再因證據值回落而自驗失敗，留下已改狀態卻回報失敗的半套交易。
+    # 正規化一律先於門檻比較，三位小數即證據精度本身，不是事後美化。
+    param([Parameter(Mandatory = $true)][double]$RawAgeSeconds)
+    return [double][Math]::Round($RawAgeSeconds, 3)
+}
+
 function New-FormalInvalidateFailureResult {
     param($Inputs, [Parameter(Mandatory = $true)][string]$Message)
     return [pscustomobject]@{ schema = $FormalInvalidateSchema; mode = 'InvalidateFormalInternal'; result = 'rejected'; transaction_root = if ($Inputs) { $Inputs.TransactionRoot } else { $null }; formal_target_write_count = 0; error = $Message }
@@ -55,7 +63,7 @@ function Read-FormalInvalidateJournal {
     $ageSeconds = $null
     if ([string]$journal.target_commit -eq $FormalUpgradeTargetCommit) {
         if ($null -eq $journal.PSObject.Properties['created_at_utc']) { throw '[UPGRADE_INVALIDATE_TRANSACTION_FAIL] Journal is missing required field: created_at_utc' }
-        $ageSeconds = Get-FormalTransactionAgeSeconds -Journal $journal
+        $ageSeconds = Get-FormalInvalidateEvidenceAge -RawAgeSeconds (Get-FormalTransactionAgeSeconds -Journal $journal)
         if ($ageSeconds -le ($FormalApplyMaximumAgeMinutes * 60)) { throw '[UPGRADE_INVALIDATE_TARGET_MATCH] Selected transaction names the ruled target commit and is still inside the validation window.' }
         $reasonCode = 'expired_transaction'
     }
@@ -97,7 +105,8 @@ function Invoke-FormalInvalidateInternalMode {
         $journal.events = @($journal.events) + "invalidated:$reasonCode"
         $evidence = [ordered]@{ reason_code=$reasonCode; prior_state=[string]$journal.state; prior_result=[string]$journal.result; observed_target_commit=[string]$journal.target_commit; ruled_target_commit=$FormalUpgradeTargetCommit; invalidated_at_utc=[DateTime]::UtcNow.ToString('o'); invocation_mode='InvalidateFormalInternal'; journal_sha256_before=$beforeHash; manifest_sha256=$record.ManifestHashes }
         if ($reasonCode -eq 'expired_transaction') {
-            $evidence['age_seconds'] = [Math]::Round([double]$record.AgeSeconds, 3)
+            # 已於判定前正規化，這裡直接沿用同一值；不得在此重複捨入。
+            $evidence['age_seconds'] = [double]$record.AgeSeconds
             $evidence['max_age_minutes'] = $FormalApplyMaximumAgeMinutes
         }
         $journal | Add-Member -NotePropertyName invalidation -NotePropertyValue ([pscustomobject]$evidence) -Force
