@@ -255,6 +255,60 @@ function Assert-CheckpointBasisContract {
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareOriginMainHead -Staged @() -Dirty @() -FixtureMode $false -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Live origin drift was accepted despite exact merged basis.'
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $FormalPrepareMergedMainHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @($FormalPrepareCurrentCutPaths[0]) -FixtureMode $false -BasisKind 'merged-main' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Live current-cut dirty was accepted.'
     Write-Output 'prepare ruled basis seam: PASS legacy=08bb664-bf8f57b-c7aa16c-691b619-8baf0d70 current=seven-path-direct-child future-merge=exact'
+
+    # --- active anchor 線：非遞迴 exact shape 的正反矩陣 ---
+    # 全部直接對 shape helper 施測，不經 Assert-FormalPrepareCheckpointBasis，故不受自身 gate 影響。
+    $anchorHead = $FormalPrepareActiveAnchorHead
+    $anchorParents = $FormalPrepareActiveAnchorParents
+    $anchorTree = $FormalPrepareActiveAnchorTree
+    $anchorPaths = $FormalPrepareActiveAnchorPaths
+    $anchorArgs = @{ CurrentHead = $anchorHead; ParentHeads = $anchorParents; ChangedPaths = $anchorPaths; CurrentTree = $anchorTree; SourceTree = $anchorTree }
+
+    Assert-True ($anchorPaths.Count -eq 4) 'Active anchor cut is not exactly four files.'
+    Assert-True ($FormalPrepareActiveCutPaths.Count -eq 2) 'Active cut is not exactly two files.'
+    Assert-True ($FormalUpgradeTargetCommit -eq '08bb6641ac042c6ce20ec92501f6814fe9f22fac') 'Payload target drifted from the ruled commit.'
+    Assert-True ($anchorHead -ne $FormalUpgradeTargetCommit) 'Execution basis and payload target must stay distinct.'
+
+    # 正向：exact shape 必須被接受
+    Assert-True (Test-FormalPrepareActiveAnchorShape @anchorArgs) 'Exact active anchor shape was rejected.'
+    # 反例：錯 HEAD
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead ('f' * 40) -ParentHeads $anchorParents -ChangedPaths $anchorPaths -CurrentTree $anchorTree -SourceTree $anchorTree)) 'Arbitrary head was accepted as the active anchor.'
+    # 反例：反序 parents
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads @($anchorParents[1], $anchorParents[0]) -ChangedPaths $anchorPaths -CurrentTree $anchorTree -SourceTree $anchorTree)) 'Reversed anchor parent order was accepted.'
+    # 反例：單 parent
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads @($anchorParents[0]) -ChangedPaths $anchorPaths -CurrentTree $anchorTree -SourceTree $anchorTree)) 'Single-parent anchor was accepted.'
+    # 反例：缺 path／多 path
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads $anchorParents -ChangedPaths ($anchorPaths | Select-Object -Skip 1) -CurrentTree $anchorTree -SourceTree $anchorTree)) 'Anchor missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads $anchorParents -ChangedPaths ($anchorPaths + 'unexpected.txt') -CurrentTree $anchorTree -SourceTree $anchorTree)) 'Anchor with an extra path was accepted.'
+    # 反例：錯 tree／source tree 不等價
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads $anchorParents -ChangedPaths $anchorPaths -CurrentTree ('d' * 40) -SourceTree ('d' * 40))) 'Anchor tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveAnchorShape -CurrentHead $anchorHead -ParentHeads $anchorParents -ChangedPaths $anchorPaths -CurrentTree $anchorTree -SourceTree ('d' * 40))) 'Anchor merge dragging extra content was accepted.'
+
+    # active source checkpoint：單 parent 必須是 active anchor，且精確兩路徑
+    Assert-True (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads @($anchorHead) -ChangedPaths $FormalPrepareActiveCutPaths) 'Exact active source checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads @($FormalPrepareMergedMainHead) -ChangedPaths $FormalPrepareActiveCutPaths)) 'Legacy-parent checkpoint was accepted on the active line.'
+    Assert-True (-not (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads @($anchorHead) -ChangedPaths ($FormalPrepareActiveCutPaths | Select-Object -Skip 1))) 'Active checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads @($anchorHead) -ChangedPaths ($FormalPrepareActiveCutPaths + 'unexpected.txt'))) 'Active checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads @($anchorHead, $anchorHead) -ChangedPaths $FormalPrepareActiveCutPaths)) 'Two-parent active checkpoint was accepted.'
+
+    # active merge：parents 必須依序 [anchor, source checkpoint]，兩路徑，tree 等於 source tree
+    $activeSourceCkpt = 'c' * 40
+    $activeSourceTree = 'e' * 40
+    Assert-True (Test-FormalPrepareActiveMergeShape -ParentHeads @($anchorHead, $activeSourceCkpt) -ChangedPaths $FormalPrepareActiveCutPaths -CurrentTree $activeSourceTree -SourceTree $activeSourceTree -SourceCheckpointValid $true) 'Exact active merge shape was rejected.'
+    Assert-True (-not (Test-FormalPrepareActiveMergeShape -ParentHeads @($activeSourceCkpt, $anchorHead) -ChangedPaths $FormalPrepareActiveCutPaths -CurrentTree $activeSourceTree -SourceTree $activeSourceTree -SourceCheckpointValid $true)) 'Reversed active merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveMergeShape -ParentHeads @($anchorHead, $activeSourceCkpt) -ChangedPaths ($FormalPrepareActiveCutPaths | Select-Object -Skip 1) -CurrentTree $activeSourceTree -SourceTree $activeSourceTree -SourceCheckpointValid $true)) 'Active merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveMergeShape -ParentHeads @($anchorHead, $activeSourceCkpt) -ChangedPaths ($FormalPrepareActiveCutPaths + 'unexpected.txt') -CurrentTree $activeSourceTree -SourceTree $activeSourceTree -SourceCheckpointValid $true)) 'Active merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveMergeShape -ParentHeads @($anchorHead, $activeSourceCkpt) -ChangedPaths $FormalPrepareActiveCutPaths -CurrentTree ('d' * 40) -SourceTree $activeSourceTree -SourceCheckpointValid $true)) 'Active merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareActiveMergeShape -ParentHeads @($anchorHead, $activeSourceCkpt) -ChangedPaths $FormalPrepareActiveCutPaths -CurrentTree $activeSourceTree -SourceTree $activeSourceTree -SourceCheckpointValid $false)) 'Active merge with an invalid source checkpoint was accepted.'
+
+    # repo state：active 線的 origin／dirty／branch 規則
+    Assert-FormalPrepareRepoState -CurrentHead $anchorHead -OriginMain $anchorHead -Staged @() -Dirty ($FormalPrepareActiveCutPaths + @('.gitignore')) -FixtureMode $true -BasisKind 'active-anchor'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $anchorHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty $FormalPrepareActiveCutPaths -FixtureMode $true -BasisKind 'active-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active fixture origin drift was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $anchorHead -OriginMain $anchorHead -Staged @() -Dirty ($FormalPrepareActiveCutPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'active-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active pre-checkpoint fixture missing a dirty path was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeSourceCkpt -OriginMain $anchorHead -Staged @() -Dirty @($FormalPrepareActiveCutPaths[0]) -FixtureMode $true -BasisKind 'active-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active checkpoint fixture retained a cut dirty path.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareActiveWorkingBranch -FixtureMode $true) -eq $FormalPrepareActiveWorkingBranch) 'Active fixture working branch was rejected.'
+
+    Write-Output 'prepare active basis seam: PASS anchor=a59271f6 parents=exact-ordered paths=four tree=source-equal checkpoint=two-path merge=exact'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
@@ -267,7 +321,7 @@ function Assert-BranchGuardContract {
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
-    Assert-True ($basisKind -in @('merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
+    Assert-True ($basisKind -in @('active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
     Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
@@ -329,8 +383,25 @@ function global:git {
     param([Parameter(ValueFromRemainingArguments=`$true)][object[]]`$GitArguments)
     `$parts = @(`$GitArguments | ForEach-Object { [string]`$_ })
     if (`$parts.Count -eq 4 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'branch' -and `$parts[3] -eq '--show-current') {
+        # 依實際 HEAD 落在哪條線回報對應的 approved working branch：
+        # active 線回 active branch，舊鏈回舊 branch。production 的 branch guard 不受影響。
+        # 內部探測會覆寫 LASTEXITCODE，故一律在回傳前重設為 0。
+        `$observedHead = (& git.exe -C `$RepoRoot rev-parse HEAD 2>`$null | Select-Object -First 1)
+        `$observedHead = if (`$observedHead) { ([string]`$observedHead).Trim() } else { '' }
+        `$observedParents = @()
+        if (`$observedHead) {
+            `$rl = (& git.exe -C `$RepoRoot rev-list --parents -n1 `$observedHead 2>`$null | Select-Object -First 1)
+            if (`$rl) { `$observedParents = @(([string]`$rl).Trim() -split '\s+' | Select-Object -Skip 1) }
+        }
+        `$resolvedBranch = if (`$observedHead -eq `$FormalPrepareActiveAnchorHead -or
+            (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPrepareActiveAnchorHead)) {
+            `$FormalPrepareActiveWorkingBranch
+        }
+        else {
+            `$FormalPrepareApprovedWorkingBranch
+        }
         `$global:LASTEXITCODE = 0
-        `$FormalPrepareApprovedWorkingBranch
+        `$resolvedBranch
         return
     }
     & git.exe @parts
