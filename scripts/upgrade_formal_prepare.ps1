@@ -60,7 +60,30 @@ $FormalPrepareCurrentCutPaths = @(
     'tests/upgrade_formal_prepare_smoke.ps1',
     'tests/upgrade_mixed_repair_smoke.ps1'
 )
-$FormalPrepareFixtureDirtyPaths = @($FormalPrepareCurrentCutPaths)
+# --- active anchor（PR #5 合併後的 execution basis）---
+# 這是「哪個 Git 形狀可以發動正式流程」的錨點，與 payload target 是兩件事。
+# 它必須以自身的 exact shape（HEAD／parents 順序／path set／tree）證明，
+# 不得回頭呼叫 Assert-FormalPrepareCheckpointBasis，否則形成自證遞迴。
+$FormalPrepareActiveAnchorHead = 'a59271f61c9fc5479b66cad8b394798007035a39'
+$FormalPrepareActiveWorkingBranch = 's/S-02-03b/production-basis-reanchor'
+$FormalPrepareActiveAnchorParents = @(
+    'b383a784a27dc20dc61ad41d1111ea92938cf4a6',
+    'e16356628cea4095b4c1df31e1cc0733620e1a4f'
+)
+$FormalPrepareActiveAnchorTree = '5302279d4c165c595f487332b75be704e83484cf'
+$FormalPrepareActiveAnchorPaths = @(
+    'Frontend/src/tray/tray_app.py',
+    'scripts/upgrade_formal_apply.ps1',
+    'scripts/upgrade_formal_invalidate.ps1',
+    'tests/upgrade_formal_invalidate_smoke.ps1'
+)
+# active anchor 之後的下一刀：只動本輪兩個 allowlist 檔。
+$FormalPrepareActiveCutPaths = @(
+    'scripts/upgrade_formal_prepare.ps1',
+    'tests/upgrade_formal_prepare_smoke.ps1'
+)
+$FormalPrepareFixtureDirtyPaths = @($FormalPrepareActiveCutPaths)
+# payload target：正式升級要送進目標的內容版本，不隨 execution basis 前進而改變。
 $FormalUpgradeTargetCommit = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
 $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpgrade\transactions'
 $FormalPrepareJournalReserveBytes = [int64](1MB)
@@ -234,6 +257,59 @@ function Test-FormalPrepareCurrentSourceCheckpointShape {
         (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareCurrentCutPaths -ActualPaths $ChangedPaths))
 }
 
+function Test-FormalPrepareActiveAnchorShape {
+    # 非遞迴自證：只比對 active anchor 自身的固定 exact shape，不呼叫任何會再回到
+    # Assert-FormalPrepareCheckpointBasis 的判定，故不存在自我遞迴或以自己證明自己的問題。
+    # 四項全中才成立：exact HEAD、parents 順序、精確 path set、tree 與 source tree 等價。
+    param(
+        [string]$CurrentHead,
+        [string[]]$ParentHeads,
+        [string[]]$ChangedPaths,
+        [string]$CurrentTree,
+        [string]$SourceTree
+    )
+    $parents = @($ParentHeads | Where-Object { $_ })
+    if ($CurrentHead -ne $FormalPrepareActiveAnchorHead) { return $false }
+    if ($parents.Count -ne $FormalPrepareActiveAnchorParents.Count) { return $false }
+    for ($i = 0; $i -lt $FormalPrepareActiveAnchorParents.Count; $i++) {
+        if ($parents[$i] -ne $FormalPrepareActiveAnchorParents[$i]) { return $false }
+    }
+    if (-not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareActiveAnchorPaths -ActualPaths $ChangedPaths)) { return $false }
+    if (-not $CurrentTree -or $CurrentTree -ne $FormalPrepareActiveAnchorTree) { return $false }
+    # merge 的 tree 必須與被併入的 source tree 完全相同，確保沒有在合併時夾帶額外內容。
+    return ($SourceTree -and $CurrentTree -eq $SourceTree)
+}
+
+function Test-FormalPrepareActiveSourceCheckpointShape {
+    # active anchor 之後的下一刀：單 parent 必須正好是 active anchor，且只動兩個 allowlist 檔。
+    param(
+        [string[]]$ParentHeads,
+        [string[]]$ChangedPaths
+    )
+    $parents = @($ParentHeads | Where-Object { $_ })
+    return ($parents.Count -eq 1 -and
+        $parents[0] -eq $FormalPrepareActiveAnchorHead -and
+        (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareActiveCutPaths -ActualPaths $ChangedPaths))
+}
+
+function Test-FormalPrepareActiveMergeShape {
+    # 把上述 source checkpoint 併回 active anchor 的精確 merge：
+    # parents 必須依序為 [active anchor, source checkpoint]，累積變更仍只有兩檔，
+    # 且 merge tree 必須等於 source checkpoint tree（不得夾帶）。
+    param(
+        [string[]]$ParentHeads,
+        [string[]]$ChangedPaths,
+        [string]$CurrentTree,
+        [string]$SourceTree,
+        [bool]$SourceCheckpointValid
+    )
+    $parents = @($ParentHeads | Where-Object { $_ })
+    return ($SourceCheckpointValid -and $parents.Count -eq 2 -and
+        $parents[0] -eq $FormalPrepareActiveAnchorHead -and
+        (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareActiveCutPaths -ActualPaths $ChangedPaths) -and
+        $CurrentTree -and $SourceTree -and $CurrentTree -eq $SourceTree)
+}
+
 function Test-FormalPrepareCurrentMergeShape {
     param(
         [string[]]$ParentHeads,
@@ -284,6 +360,30 @@ function Assert-FormalPrepareCheckpointBasis {
         }
         else {
             $current = Get-FormalPrepareCommitShape -Commit $CurrentHead
+            # --- active anchor 線（PR #5 合併後）---
+            # 置於舊鏈判定之前；三者皆為非遞迴 exact shape，舊形狀保護原封不動保留於下方。
+            if ($CurrentHead -eq $FormalPrepareActiveAnchorHead) {
+                $anchorSourceTree = ''
+                if ($current.Parents.Count -eq 2) {
+                    $anchorSourceTree = (Get-GitOutput -Arguments @('show', '-s', '--format=%T', $current.Parents[1]) | Select-Object -First 1).Trim()
+                }
+                if (Test-FormalPrepareActiveAnchorShape -CurrentHead $CurrentHead -ParentHeads $current.Parents -ChangedPaths $current.Paths -CurrentTree $current.Tree -SourceTree $anchorSourceTree) {
+                    return 'active-anchor'
+                }
+            }
+            if (Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads $current.Parents -ChangedPaths $current.Paths) {
+                return 'active-source-checkpoint'
+            }
+            if ($current.Parents.Count -eq 2) {
+                $activeSource = $current.Parents[1]
+                $activeSourceShape = Get-FormalPrepareCommitShape -Commit $activeSource
+                $activeSourceValid = Test-FormalPrepareActiveSourceCheckpointShape -ParentHeads $activeSourceShape.Parents -ChangedPaths $activeSourceShape.Paths
+                $activeChanged = @(Get-GitOutput -Arguments @('diff', '--name-only', $FormalPrepareActiveAnchorHead, $CurrentHead) | ForEach-Object { ([string]$_).Replace('\', '/') })
+                if (Test-FormalPrepareActiveMergeShape -ParentHeads $current.Parents -ChangedPaths $activeChanged -CurrentTree $current.Tree -SourceTree $activeSourceShape.Tree -SourceCheckpointValid $activeSourceValid) {
+                    return 'active-merge'
+                }
+            }
+            # --- 舊鏈保護（原樣保留）---
             if ($current.Parents.Count -eq 1 -and $current.Parents[0] -eq $FormalPreparePreflightCheckpointHead -and
                 (Test-FormalPrepareRealSourceChain -SourceHead $CurrentHead -RequireFollowUp $true)) { return 'checkpoint' }
             if ($current.Parents.Count -eq 2) {
@@ -314,7 +414,7 @@ function Assert-FormalPrepareCheckpointBasis {
             }
         }
     } catch { throw "[$FailureTag] checkpoint_basis_unverified: $($_.Exception.Message)" }
-    throw "[$FailureTag] Expected the ruled legacy chain, merged main 8baf0d70, its exact seven-path direct child, or the exact [8baf0d70, source checkpoint] merge; got $CurrentHead."
+    throw "[$FailureTag] Expected the active anchor $($FormalPrepareActiveAnchorHead.Substring(0,8)), its exact two-path source checkpoint, the exact [active anchor, source checkpoint] merge, or the ruled legacy chain (merged main 8baf0d70, its exact seven-path direct child, or the exact [8baf0d70, source checkpoint] merge); got $CurrentHead."
 }
 
 function Assert-FormalPrepareRepoState {
@@ -334,24 +434,36 @@ function Assert-FormalPrepareRepoState {
         -not $OriginMain.Equals($FormalPrepareMergedMainHead, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Fixture origin/main differs from the fixed merged-main anchor.'
     }
+    # active 線 fixture 的 origin/main 必須精確等於 active anchor，不接受任意 origin/main。
+    if ($FixtureMode -and $BasisKind -in @('active-anchor', 'active-source-checkpoint', 'active-merge') -and
+        -not $OriginMain.Equals($FormalPrepareActiveAnchorHead, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw '[UPGRADE_PREPARE_BASIS_FAIL] Fixture origin/main differs from the fixed active anchor.'
+    }
     if ($Staged.Count -gt 0) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Staged files exist.'
     }
     $generalAllowed = @('.gitignore', 'Frontend/src/backend/adapter.py')
+    # 舊鏈與 active 線各有自己的 cut path 集合；此處只判斷「是否屬於任一條線的 cut」，
+    # 精確全集比對留給下方依 BasisKind 分流，避免兩條線互相誤殺。
+    $expectedCutPaths = if ($BasisKind -in @('active-anchor', 'active-source-checkpoint', 'active-merge')) { $FormalPrepareActiveCutPaths } else { $FormalPrepareCurrentCutPaths }
+    $anyCutPaths = @($FormalPrepareCurrentCutPaths + $FormalPrepareActiveCutPaths | Sort-Object -Unique)
     $normalizedDirty = @($Dirty | ForEach-Object { ([string]$_).Replace('\', '/') })
-    $unexpected = @($normalizedDirty | Where-Object { $_ -notin $generalAllowed -and $_ -notin $FormalPrepareFixtureDirtyPaths })
+    $unexpected = @($normalizedDirty | Where-Object { $_ -notin $generalAllowed -and $_ -notin $anyCutPaths })
     if ($unexpected.Count -gt 0) {
         throw "[UPGRADE_PREPARE_BASIS_FAIL] Unexpected working-tree path(s): $($unexpected -join ', ')"
     }
-    $cutDirty = @($normalizedDirty | Where-Object { $_ -in $FormalPrepareFixtureDirtyPaths })
+    $cutDirty = @($normalizedDirty | Where-Object { $_ -in $expectedCutPaths })
     if (-not $FixtureMode -and $cutDirty.Count -gt 0) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Live mode does not accept current-cut working-tree changes.'
     }
-    if ($FixtureMode -and $BasisKind -eq 'merged-main' -and
-        -not (Test-FormalPrepareExactPathSet -ExpectedPaths $FormalPrepareFixtureDirtyPaths -ActualPaths $cutDirty)) {
-        throw '[UPGRADE_PREPARE_BASIS_FAIL] Pre-checkpoint fixture requires the exact seven-path dirty set.'
+    # 「前 checkpoint」狀態（尚未提交本刀）才允許帶 cut dirty，且必須是精確全集；
+    # 已 checkpoint／已 merge 的形狀不得殘留任何 cut dirty。
+    $preCheckpointKinds = @('merged-main', 'active-anchor')
+    if ($FixtureMode -and $BasisKind -in $preCheckpointKinds -and
+        -not (Test-FormalPrepareExactPathSet -ExpectedPaths $expectedCutPaths -ActualPaths $cutDirty)) {
+        throw "[UPGRADE_PREPARE_BASIS_FAIL] Pre-checkpoint fixture requires the exact $($expectedCutPaths.Count)-path dirty set."
     }
-    if ($FixtureMode -and $BasisKind -ne 'merged-main' -and $cutDirty.Count -gt 0) {
+    if ($FixtureMode -and $BasisKind -notin $preCheckpointKinds -and $cutDirty.Count -gt 0) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Checkpoint or merge fixture must not retain current-cut dirty paths.'
     }
 }
@@ -362,7 +474,7 @@ function Assert-FormalPrepareMainBranch {
     if ([string]::IsNullOrWhiteSpace($branch)) {
         throw '[UPGRADE_PREPARE_BASIS_FAIL] Expected branch main, got detached HEAD.'
     }
-    $allowed = if ($FixtureMode) { @('main', $FormalPrepareApprovedWorkingBranch) } else { @('main') }
+    $allowed = if ($FixtureMode) { @('main', $FormalPrepareApprovedWorkingBranch, $FormalPrepareActiveWorkingBranch) } else { @('main') }
     if ($branch -notin $allowed) {
         throw "[UPGRADE_PREPARE_BASIS_FAIL] Expected branch $($allowed -join ' or '), got $branch."
     }
@@ -379,6 +491,9 @@ function Assert-FormalPrepareRepoBasis {
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $head
     if ($FixtureMode -and $basisKind -in @('merged-main', 'source-checkpoint') -and $branch -ne $FormalPrepareApprovedWorkingBranch) {
         throw "[UPGRADE_PREPARE_BASIS_FAIL] $basisKind fixture requires branch $FormalPrepareApprovedWorkingBranch."
+    }
+    if ($FixtureMode -and $basisKind -in @('active-anchor', 'active-source-checkpoint') -and $branch -ne $FormalPrepareActiveWorkingBranch) {
+        throw "[UPGRADE_PREPARE_BASIS_FAIL] $basisKind fixture requires branch $FormalPrepareActiveWorkingBranch."
     }
     $dirty = @(Get-GitOutput -Arguments @('status', '--porcelain=v1', '--untracked-files=all') | ForEach-Object {
         if ($_.Length -ge 4) { $_.Substring(3).Replace('\\', '/') } else { $_ }
