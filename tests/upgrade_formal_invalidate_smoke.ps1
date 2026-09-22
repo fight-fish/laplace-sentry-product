@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 <#
 .SYNOPSIS
@@ -89,20 +89,38 @@ try {
  $joAge=[double]$justOverAfter.invalidation.age_seconds
  Assert-True ($joAge -gt $limitSeconds) 'just-over evidence age is not above the window.'
  Assert-True ($joAge -eq [Math]::Round($joAge,3)) 'landed age_seconds is not the normalised three-decimal value.'
- # 接線驗證：invalidator 必須真的經過正規化 helper，而非各自捨入。
- # 真實時鐘無法穩定落在 0.5 毫秒窗，故以「暫時攔截 helper」證明判定路徑確實呼叫它；
- # 若判定改回使用 raw age，攔截將不再生效、下方斷言即失敗。
- $script:NormaliseCallCount=0
+ # 接線驗證：不能只證明 helper「被呼叫」——呼叫了卻忽略回傳值而改用 raw age 的回歸同樣會漏掉。
+ # 故改為讓 helper 回傳精確的邊界值，再以完整 invalidator 路徑觀察行為：
+ # 回傳值若真正控制門檻判定，1800.000 必拒絕且零寫入，1800.001 必成功且以同值落檔。
  $realNormalise=(Get-Command Get-FormalInvalidateEvidenceAge).ScriptBlock
- function Get-FormalInvalidateEvidenceAge { param([Parameter(Mandatory=$true)][double]$RawAgeSeconds)
-   $script:NormaliseCallCount++
-   return [double][Math]::Round($RawAgeSeconds,3) }
- $wired=New-Case 'normalise-wired' -RuledTarget -AgeSeconds ($limitSeconds + 2)
- $wiredBefore=$script:NormaliseCallCount
- [void](Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $wired))
- Assert-True ($script:NormaliseCallCount -gt $wiredBefore) 'invalidator did not route its age through the normalisation helper.'
- Set-Item -Path function:Get-FormalInvalidateEvidenceAge -Value $realNormalise
- Assert-True ((Get-FormalInvalidateEvidenceAge -RawAgeSeconds 1800.0004) -le $limitSeconds) 'helper restore failed.'
+ function Invoke-WithForcedEvidenceAge {
+   # 以固定回傳值攔截 helper，並保證還原：即使 Action 拋出也必須在 finally 還原，
+   # 否則後續案例會沿用被污染的 helper。
+   param([Parameter(Mandatory=$true)][double]$Forced,[Parameter(Mandatory=$true)][scriptblock]$Action)
+   $script:ForcedEvidenceAge=$Forced
+   Set-Item -Path function:Get-FormalInvalidateEvidenceAge -Value { param([Parameter(Mandatory=$true)][double]$RawAgeSeconds) return [double]$script:ForcedEvidenceAge }
+   try { & $Action }
+   finally {
+     Set-Item -Path function:Get-FormalInvalidateEvidenceAge -Value $realNormalise
+     Assert-True ((Get-FormalInvalidateEvidenceAge -RawAgeSeconds 1800.0004) -eq 1800.0) 'helper restore failed after forced-age interception.'
+   }
+ }
+ # 驗收 1：helper 回傳精確 1800.000 → 完整 invalidator 必須拒絕，且 journal 與三份 manifest 全部零寫入。
+ $atLimit=New-Case 'forced-at-limit' -RuledTarget -AgeSeconds ($limitSeconds + 600)
+ $atLimitHashes=@{}
+ foreach($n in @('transaction-journal.json','source-manifest.json','preimage-manifest.json','package-manifest.json')){ $atLimitHashes[$n]=Get-FileSha256 (Join-Path $atLimit.Transaction $n) }
+ $atLimitBody=Get-Content $atLimit.Journal -Raw -Encoding UTF8
+ Invoke-WithForcedEvidenceAge -Forced 1800.0 -Action { Assert-Throws { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $atLimit) } 'UPGRADE_INVALIDATE_TARGET_MATCH' }
+ foreach($n in $atLimitHashes.Keys){ Assert-True ((Get-FileSha256 (Join-Path $atLimit.Transaction $n)) -eq $atLimitHashes[$n]) "forced 1800.000 rejection rewrote $n." }
+ Assert-True ((Get-Content $atLimit.Journal -Raw -Encoding UTF8) -eq $atLimitBody) 'forced 1800.000 rejection changed journal content.'
+ # 驗收 2：helper 回傳精確 1800.001 → 必須成功失效，且落檔值精確等於該值並通過寫後自驗。
+ $overLimit=New-Case 'forced-over-limit' -RuledTarget -AgeSeconds ($limitSeconds + 600)
+ $overResult=$null
+ Invoke-WithForcedEvidenceAge -Forced 1800.001 -Action { $script:overResult=Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $overLimit) }
+ $overAfter=Get-Content $overLimit.Journal -Raw -Encoding UTF8|ConvertFrom-Json
+ Assert-True ($script:overResult.result -eq 'invalidated' -and $overAfter.state -eq 'invalidated') 'forced 1800.001 did not invalidate through the full invalidator.'
+ Assert-True ([double]$overAfter.invalidation.age_seconds -eq 1800.001) "forced 1800.001 landed a different age_seconds ($($overAfter.invalidation.age_seconds))."
+ Assert-True ($overAfter.invalidation.reason_code -eq 'expired_transaction' -and [int]$overAfter.formal_target_write_count -eq 0) 'forced 1800.001 evidence or zero-write boundary is wrong.'
  # 驗收 2：同 target 且確實逾時，允許一次 expired_transaction 失效並留下可信 age 證據。
  $expired=New-Case 'same-target-expired' -RuledTarget -AgeMinutes ($FormalApplyMaximumAgeMinutes + 5)
  $expiredHash=Get-FileSha256 $expired.Journal; $expiredSource=Get-FileSha256 (Join-Path $expired.Transaction 'source-manifest.json')
