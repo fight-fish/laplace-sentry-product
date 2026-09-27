@@ -308,12 +308,87 @@ function Assert-CheckpointBasisContract {
     Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeSourceCkpt -OriginMain $anchorHead -Staged @() -Dirty @($FormalPrepareActiveCutPaths[0]) -FixtureMode $true -BasisKind 'active-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active checkpoint fixture retained a cut dirty path.'
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareActiveWorkingBranch -FixtureMode $true) -eq $FormalPrepareActiveWorkingBranch) 'Active fixture working branch was rejected.'
 
-    Write-Output 'prepare active basis seam: PASS anchor=a59271f6 parents=exact-ordered paths=four tree=source-equal checkpoint=two-path merge=exact'
+    # post-merge origin guard：active-merge 的 origin 必須等於該 merge HEAD 自身。
+    # 合併一旦發生 origin/main 必然前進，故不能再要求等於 anchor；但仍須 fail-closed。
+    $activeMergeHead = 'b' * 40
+    Assert-FormalPrepareRepoState -CurrentHead $activeMergeHead -OriginMain $activeMergeHead -Staged @() -Dirty @('.gitignore') -FixtureMode $true -BasisKind 'active-merge'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeMergeHead -OriginMain $anchorHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'active-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active merge with a stale anchor origin was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeMergeHead -OriginMain ('9' * 40) -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'active-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active merge with an arbitrary origin was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeMergeHead -OriginMain $FormalPrepareMergedMainHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'active-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active merge with a legacy-chain origin was accepted.'
+    # pre-merge 形狀不得因本次分流而放寬：仍須等於 anchor，且不接受「等於自身 HEAD」。
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $activeSourceCkpt -OriginMain $activeSourceCkpt -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'active-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Active source checkpoint accepted origin equal to its own head.'
+
+    Write-Output 'prepare active basis seam: PASS anchor=a59271f6 parents=exact-ordered paths=four tree=source-equal checkpoint=two-path merge=exact postmerge-origin=head-bound'
+
+    # --- post-merge 三態 progression（PR #6 合併後）---
+    # 目的是讓「合併後還要在該 main 上繼續施工」可被完整表達；缺任一態，下一刀就會再撞同源盲區。
+    $pmHead = $FormalPreparePostMergeAnchorHead
+    $pmParents = $FormalPreparePostMergeAnchorParents
+    $pmTree = $FormalPreparePostMergeAnchorTree
+    $pmPaths = $FormalPreparePostMergeAnchorPaths
+    $pmArgs = @{ CurrentHead = $pmHead; ParentHeads = $pmParents; ChangedPaths = $pmPaths; CurrentTree = $pmTree; SourceTree = $pmTree }
+
+    Assert-True ($pmPaths.Count -eq 2) 'Post-merge anchor cut is not exactly two files.'
+    Assert-True ($FormalPreparePostMergeCutPaths.Count -eq 2) 'Post-merge cut is not exactly two files.'
+    Assert-True ($pmHead -ne $FormalPrepareActiveAnchorHead) 'Post-merge anchor must differ from the active anchor.'
+    Assert-True ($pmHead -ne $FormalUpgradeTargetCommit) 'Execution basis and payload target must stay distinct.'
+
+    # 態一：anchor —— exact shape 成立才接受
+    Assert-True (Test-FormalPreparePostMergeAnchorShape @pmArgs) 'Exact post-merge anchor shape was rejected.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead ('f' * 40) -ParentHeads $pmParents -ChangedPaths $pmPaths -CurrentTree $pmTree -SourceTree $pmTree)) 'Arbitrary head was accepted as the post-merge anchor.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads @($pmParents[1], $pmParents[0]) -ChangedPaths $pmPaths -CurrentTree $pmTree -SourceTree $pmTree)) 'Reversed post-merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads @($pmParents[0]) -ChangedPaths $pmPaths -CurrentTree $pmTree -SourceTree $pmTree)) 'Single-parent post-merge anchor was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads $pmParents -ChangedPaths ($pmPaths | Select-Object -Skip 1) -CurrentTree $pmTree -SourceTree $pmTree)) 'Post-merge anchor missing a path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads $pmParents -ChangedPaths ($pmPaths + 'unexpected.txt') -CurrentTree $pmTree -SourceTree $pmTree)) 'Post-merge anchor with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads $pmParents -ChangedPaths $pmPaths -CurrentTree ('d' * 40) -SourceTree ('d' * 40))) 'Post-merge anchor tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeAnchorShape -CurrentHead $pmHead -ParentHeads $pmParents -ChangedPaths $pmPaths -CurrentTree $pmTree -SourceTree ('d' * 40))) 'Post-merge anchor dragging extra content was accepted.'
+
+    # 態二：source checkpoint —— 單 parent 必須是 post-merge anchor，精確兩路徑
+    $pmCkpt = '7' * 40
+    $pmCkptTree = '8' * 40
+    Assert-True (Test-FormalPreparePostMergeSourceCheckpointShape -ParentHeads @($pmHead) -ChangedPaths $FormalPreparePostMergeCutPaths) 'Exact post-merge source checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPreparePostMergeSourceCheckpointShape -ParentHeads @($FormalPrepareActiveAnchorHead) -ChangedPaths $FormalPreparePostMergeCutPaths)) 'Active-anchor parent was accepted on the post-merge line.'
+    Assert-True (-not (Test-FormalPreparePostMergeSourceCheckpointShape -ParentHeads @($pmHead) -ChangedPaths ($FormalPreparePostMergeCutPaths | Select-Object -Skip 1))) 'Post-merge checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeSourceCheckpointShape -ParentHeads @($pmHead) -ChangedPaths ($FormalPreparePostMergeCutPaths + 'unexpected.txt'))) 'Post-merge checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeSourceCheckpointShape -ParentHeads @($pmHead, $pmHead) -ChangedPaths $FormalPreparePostMergeCutPaths)) 'Two-parent post-merge checkpoint was accepted.'
+
+    # 態三：merge —— parents 依序 [anchor, checkpoint]，兩路徑，tree 等於 source tree
+    Assert-True (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmHead, $pmCkpt) -ChangedPaths $FormalPreparePostMergeCutPaths -CurrentTree $pmCkptTree -SourceTree $pmCkptTree -SourceCheckpointValid $true) 'Exact post-merge merge shape was rejected.'
+    Assert-True (-not (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmCkpt, $pmHead) -ChangedPaths $FormalPreparePostMergeCutPaths -CurrentTree $pmCkptTree -SourceTree $pmCkptTree -SourceCheckpointValid $true)) 'Reversed post-merge merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmHead, $pmCkpt) -ChangedPaths ($FormalPreparePostMergeCutPaths | Select-Object -Skip 1) -CurrentTree $pmCkptTree -SourceTree $pmCkptTree -SourceCheckpointValid $true)) 'Post-merge merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmHead, $pmCkpt) -ChangedPaths ($FormalPreparePostMergeCutPaths + 'unexpected.txt') -CurrentTree $pmCkptTree -SourceTree $pmCkptTree -SourceCheckpointValid $true)) 'Post-merge merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmHead, $pmCkpt) -ChangedPaths $FormalPreparePostMergeCutPaths -CurrentTree ('d' * 40) -SourceTree $pmCkptTree -SourceCheckpointValid $true)) 'Post-merge merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPreparePostMergeMergeShape -ParentHeads @($pmHead, $pmCkpt) -ChangedPaths $FormalPreparePostMergeCutPaths -CurrentTree $pmCkptTree -SourceTree $pmCkptTree -SourceCheckpointValid $false)) 'Post-merge merge with an invalid source checkpoint was accepted.'
+
+    # repo state：三態各自的 origin／dirty 規則
+    # anchor＝前 checkpoint 狀態，必須攜帶精確兩檔全集 dirty
+    Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain $pmHead -Staged @() -Dirty ($FormalPreparePostMergeCutPaths + @('.gitignore')) -FixtureMode $true -BasisKind 'postmerge-anchor'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain $pmHead -Staged @() -Dirty ($FormalPreparePostMergeCutPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'postmerge-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge anchor with partial dirty was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain $pmHead -Staged @() -Dirty ($FormalPreparePostMergeCutPaths + 'unexpected.txt') -FixtureMode $true -BasisKind 'postmerge-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge anchor with extra dirty was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain $pmHead -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty $FormalPreparePostMergeCutPaths -FixtureMode $true -BasisKind 'postmerge-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge anchor with staged files was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain $FormalPrepareActiveAnchorHead -Staged @() -Dirty $FormalPreparePostMergeCutPaths -FixtureMode $true -BasisKind 'postmerge-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge anchor with stale active-anchor origin was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmHead -OriginMain ('9' * 40) -Staged @() -Dirty $FormalPreparePostMergeCutPaths -FixtureMode $true -BasisKind 'postmerge-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge anchor with arbitrary origin was accepted.'
+    # source checkpoint／merge＝已提交形狀，不得殘留 cut dirty
+    Assert-FormalPrepareRepoState -CurrentHead $pmCkpt -OriginMain $pmHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'postmerge-source-checkpoint'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmCkpt -OriginMain $pmHead -Staged @() -Dirty @($FormalPreparePostMergeCutPaths[0]) -FixtureMode $true -BasisKind 'postmerge-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge checkpoint retained a cut dirty path.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmCkpt -OriginMain $pmCkpt -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'postmerge-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge checkpoint accepted origin equal to its own head.'
+    $pmMergeHead = '6' * 40
+    Assert-FormalPrepareRepoState -CurrentHead $pmMergeHead -OriginMain $pmMergeHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'postmerge-merge'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmMergeHead -OriginMain $pmHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'postmerge-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge merge with a stale anchor origin was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $pmMergeHead -OriginMain $pmMergeHead -Staged @() -Dirty @($FormalPreparePostMergeCutPaths[0]) -FixtureMode $true -BasisKind 'postmerge-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Post-merge merge retained a cut dirty path.'
+    # branch：三態前兩態須為精確修補 branch
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Post-merge fix branch was rejected.'
+
+    Write-Output 'prepare postmerge basis seam: PASS anchor=4e390ead parents=exact-ordered paths=two tree=source-equal checkpoint=two-path merge=exact origin=kind-bound dirty=stage-bound'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareApprovedWorkingBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live working branch was accepted despite exact source shape.'
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareApprovedWorkingBranch -FixtureMode $true) -eq $FormalPrepareApprovedWorkingBranch) 'Fixture exact working branch was rejected.'
+    # post-merge 補修分支：精確常數 allowlist，接受該 exact 名稱但仍拒絕任意 branch 與 live 模式。
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Fixture post-merge fix branch was rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the post-merge fix branch.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPreparePostMergeFixBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss branch name was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'An arbitrary fixture branch was accepted.'
 }
@@ -321,7 +396,7 @@ function Assert-BranchGuardContract {
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
-    Assert-True ($basisKind -in @('active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
+    Assert-True ($basisKind -in @('postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
     Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
@@ -393,7 +468,13 @@ function global:git {
             `$rl = (& git.exe -C `$RepoRoot rev-list --parents -n1 `$observedHead 2>`$null | Select-Object -First 1)
             if (`$rl) { `$observedParents = @(([string]`$rl).Trim() -split '\s+' | Select-Object -Skip 1) }
         }
-        `$resolvedBranch = if (`$observedHead -eq `$FormalPrepareActiveAnchorHead -or
+        # post-merge 線必須先判：其 anchor 的 parent[0] 正好是 active anchor，
+        # 若先判 active 線會把 post-merge 形狀誤配成 active branch。
+        `$resolvedBranch = if (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
+            (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPreparePostMergeAnchorHead)) {
+            `$FormalPreparePostMergeFixBranch
+        }
+        elseif (`$observedHead -eq `$FormalPrepareActiveAnchorHead -or
             (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPrepareActiveAnchorHead)) {
             `$FormalPrepareActiveWorkingBranch
         }
