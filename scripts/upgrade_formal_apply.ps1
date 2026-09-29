@@ -563,6 +563,13 @@ function Save-FormalApplyFixtureJournal {
     Save-MixedRepairJournal -JournalPath $JournalPath -Journal $Journal
 }
 
+function Test-FormalApplyLockContentionException {
+    param([Parameter(Mandatory = $true)][Exception]$Exception)
+    # Windows 的 sharing / lock violation 分別是 32 / 33；其他 I/O、權限或路徑錯誤不得冒充鎖競爭。
+    $nativeErrorCode = ([int64]$Exception.HResult) -band 0xFFFF
+    return ($Exception -is [IO.IOException] -and $nativeErrorCode -in @(32, 33))
+}
+
 function New-FormalApplyExecutionLock {
     param([Parameter(Mandatory = $true)]$Inputs, [Parameter(Mandatory = $true)][string]$TransactionId)
     $path = Get-FormalApplyExecutionLockPath -Inputs $Inputs
@@ -581,7 +588,15 @@ function New-FormalApplyExecutionLock {
     }
     catch {
         if ($null -ne $stream) { $stream.Dispose() }
-        throw "[UPGRADE_APPLY_LOCK_FAIL] Another upgrade owns the single upgrade lock: $path"
+        # PowerShell 會把靜態 .NET 呼叫包成 MethodInvocationException；分類與診斷都必須回到實際 I/O 原因。
+        $cause = $_.Exception.GetBaseException()
+        if (Test-FormalApplyLockContentionException -Exception $cause) {
+            throw "[UPGRADE_APPLY_LOCK_FAIL] Another upgrade owns the single upgrade lock: $path"
+        }
+        $causeType = $cause.GetType().FullName
+        $causeMessage = (([string]$cause.Message) -replace '[\r\n\t]+', ' ').Trim()
+        if ([string]::IsNullOrWhiteSpace($causeMessage)) { $causeMessage = '<empty>' }
+        throw "[UPGRADE_APPLY_LOCK_FAIL] Upgrade-lock setup failed: exception_type=$causeType; hresult=$([int64]$cause.HResult); message=$causeMessage; path=$path"
     }
 }
 

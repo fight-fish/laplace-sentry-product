@@ -56,6 +56,20 @@ function Assert-ZeroWrite {
 function Get-Inputs { param($Case) [pscustomobject]@{Mode='InvalidateFormalInternal';TransactionRoot=$Case.Transaction;IsolationRoot=$Case.Root;PreflightObservationPath=$null;FrontendTarget=(Join-Path $Case.Root 'fake-frontend');BackendTarget=(Join-Path $Case.Root 'fake-backend')} }
 try {
  New-Item -ItemType Directory -Path $SuiteRoot -Force | Out-Null
+ # Invalidate 是共用 lock helper 的 caller；非競爭 setup 失敗必須原樣帶出受控原因，且 journal／manifest 全部零寫入。
+ $lockSetupFailure=New-Case 'lock-setup-failure'
+ $lockSetupHashes=@{}
+ foreach($n in @('transaction-journal.json','source-manifest.json','preimage-manifest.json','package-manifest.json')){ $lockSetupHashes[$n]=Get-FileSha256 (Join-Path $lockSetupFailure.Transaction $n) }
+ $lockSetupPath=Join-Path $lockSetupFailure.Root 'formal-upgrade.lock'
+ New-Item -ItemType Directory -Path $lockSetupPath | Out-Null
+ $lockSetupCaught=$null
+ try { Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $lockSetupFailure) | Out-Null } catch { $lockSetupCaught=$_ }
+ $lockSetupMessage=if($null -eq $lockSetupCaught){'<no exception>'}else{[string]$lockSetupCaught.Exception.Message}
+ Assert-True ($null -ne $lockSetupCaught -and $lockSetupMessage -match '\[UPGRADE_APPLY_LOCK_FAIL\]') "Invalidate did not propagate the shared lock failure tag: $lockSetupMessage"
+ Assert-True ($lockSetupMessage -notmatch 'Another upgrade owns the single upgrade lock') 'Invalidate misreported non-contention lock setup failure as contention.'
+ Assert-True ($lockSetupMessage -match 'exception_type=System\.[^;]+; hresult=-?\d+; message=.+; path=') 'Invalidate omitted the controlled original lock failure cause.'
+ foreach($n in $lockSetupHashes.Keys){ Assert-True ((Get-FileSha256 (Join-Path $lockSetupFailure.Transaction $n)) -eq $lockSetupHashes[$n]) "Invalidate lock failure rewrote $n." }
+ Remove-Item -LiteralPath $lockSetupPath -Force
  $success=New-Case 'success'; $journalHash=Get-FileSha256 $success.Journal; $sourceHash=Get-FileSha256 (Join-Path $success.Transaction 'source-manifest.json'); $result=Invoke-FormalInvalidateInternalMode -Inputs (Get-Inputs $success); $after=Get-Content $success.Journal -Raw -Encoding UTF8|ConvertFrom-Json
  Assert-True ($result.result -eq 'invalidated' -and $after.state -eq 'invalidated' -and [int]$after.formal_target_write_count -eq 0) 'success did not create zero-write invalidated terminal.'
  Assert-True ($after.invalidation.reason_code -eq 'stale_target_commit' -and $after.invalidation.prior_state -eq 'prepared_pending_apply' -and $after.invalidation.prior_result -eq 'prepared' -and $after.invalidation.journal_sha256_before -eq $journalHash -and $after.invalidation.manifest_sha256.source -eq $sourceHash) 'success evidence is incomplete or inconsistent.'
