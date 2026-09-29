@@ -379,7 +379,53 @@ function Assert-CheckpointBasisContract {
     # branch：三態前兩態須為精確修補 branch
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Post-merge fix branch was rejected.'
 
+    # --- formal-lock 三態 progression（PR #7 合併後）---
+    $flHead = $FormalPrepareFormalLockAnchorHead
+    $flParents = $FormalPrepareFormalLockAnchorParents
+    $flTree = $FormalPrepareFormalLockAnchorTree
+    $flPaths = $FormalPrepareFormalLockAnchorPaths
+    $flArgs = @{ CurrentHead = $flHead; ParentHeads = $flParents; ChangedPaths = $flPaths; CurrentTree = $flTree; SourceTree = $flTree }
+    Assert-True ($FormalPrepareFormalLockCutPaths.Count -eq 5) 'Formal-lock cut is not exactly five files.'
+    Assert-True (Test-FormalPrepareFormalLockAnchorShape @flArgs) 'Exact formal-lock anchor shape was rejected.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead ('f' * 40) -ParentHeads $flParents -ChangedPaths $flPaths -CurrentTree $flTree -SourceTree $flTree)) 'Wrong formal-lock anchor head was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads @($flParents[1], $flParents[0]) -ChangedPaths $flPaths -CurrentTree $flTree -SourceTree $flTree)) 'Reversed formal-lock parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads @($flParents[0]) -ChangedPaths $flPaths -CurrentTree $flTree -SourceTree $flTree)) 'Single-parent formal-lock anchor was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads $flParents -ChangedPaths ($flPaths | Select-Object -Skip 1) -CurrentTree $flTree -SourceTree $flTree)) 'Formal-lock anchor missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads $flParents -ChangedPaths ($flPaths + 'unexpected.txt') -CurrentTree $flTree -SourceTree $flTree)) 'Formal-lock anchor with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads $flParents -ChangedPaths $flPaths -CurrentTree ('d' * 40) -SourceTree ('d' * 40))) 'Formal-lock anchor tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockAnchorShape -CurrentHead $flHead -ParentHeads $flParents -ChangedPaths $flPaths -CurrentTree $flTree -SourceTree ('d' * 40))) 'Formal-lock anchor dragging extra content was accepted.'
+
+    $flCkpt = '5' * 40
+    $flCkptTree = '4' * 40
+    Assert-True (Test-FormalPrepareFormalLockSourceCheckpointShape -ParentHeads @($flHead) -ChangedPaths $FormalPrepareFormalLockCutPaths) 'Exact formal-lock source checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareFormalLockSourceCheckpointShape -ParentHeads @($FormalPreparePostMergeAnchorHead) -ChangedPaths $FormalPrepareFormalLockCutPaths)) 'Post-merge anchor parent was accepted on the formal-lock line.'
+    Assert-True (-not (Test-FormalPrepareFormalLockSourceCheckpointShape -ParentHeads @($flHead) -ChangedPaths ($FormalPrepareFormalLockCutPaths | Select-Object -Skip 1))) 'Formal-lock checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockSourceCheckpointShape -ParentHeads @($flHead) -ChangedPaths ($FormalPrepareFormalLockCutPaths + 'unexpected.txt'))) 'Formal-lock checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockSourceCheckpointShape -ParentHeads @($flHead, $flHead) -ChangedPaths $FormalPrepareFormalLockCutPaths)) 'Two-parent formal-lock checkpoint was accepted.'
+
+    Assert-True (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flHead, $flCkpt) -ChangedPaths $FormalPrepareFormalLockCutPaths -CurrentTree $flCkptTree -SourceTree $flCkptTree -SourceCheckpointValid $true) 'Exact formal-lock merge shape was rejected.'
+    Assert-True (-not (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flCkpt, $flHead) -ChangedPaths $FormalPrepareFormalLockCutPaths -CurrentTree $flCkptTree -SourceTree $flCkptTree -SourceCheckpointValid $true)) 'Reversed formal-lock merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flHead, $flCkpt) -ChangedPaths ($FormalPrepareFormalLockCutPaths | Select-Object -Skip 1) -CurrentTree $flCkptTree -SourceTree $flCkptTree -SourceCheckpointValid $true)) 'Formal-lock merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flHead, $flCkpt) -ChangedPaths ($FormalPrepareFormalLockCutPaths + 'unexpected.txt') -CurrentTree $flCkptTree -SourceTree $flCkptTree -SourceCheckpointValid $true)) 'Formal-lock merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flHead, $flCkpt) -ChangedPaths $FormalPrepareFormalLockCutPaths -CurrentTree ('d' * 40) -SourceTree $flCkptTree -SourceCheckpointValid $true)) 'Formal-lock merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareFormalLockMergeShape -ParentHeads @($flHead, $flCkpt) -ChangedPaths $FormalPrepareFormalLockCutPaths -CurrentTree $flCkptTree -SourceTree $flCkptTree -SourceCheckpointValid $false)) 'Formal-lock merge with an invalid source checkpoint was accepted.'
+
+    Assert-FormalPrepareRepoState -CurrentHead $flHead -OriginMain $flHead -Staged @() -Dirty $FormalPrepareFormalLockCutPaths -FixtureMode $true -BasisKind 'formal-lock-anchor'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flHead -OriginMain $flHead -Staged @() -Dirty ($FormalPrepareFormalLockCutPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'formal-lock-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock anchor with partial dirty was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flHead -OriginMain $flHead -Staged @() -Dirty ($FormalPrepareFormalLockCutPaths + '.gitignore') -FixtureMode $true -BasisKind 'formal-lock-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock anchor with extra dirty was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flHead -OriginMain $flHead -Staged @('scripts/upgrade_formal_prepare.ps1') -Dirty $FormalPrepareFormalLockCutPaths -FixtureMode $true -BasisKind 'formal-lock-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock anchor with staged files was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flHead -OriginMain $FormalPreparePostMergeAnchorHead -Staged @() -Dirty $FormalPrepareFormalLockCutPaths -FixtureMode $true -BasisKind 'formal-lock-anchor' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock anchor with stale origin was accepted.'
+    Assert-FormalPrepareRepoState -CurrentHead $flCkpt -OriginMain $flHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'formal-lock-source-checkpoint'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flCkpt -OriginMain $flHead -Staged @() -Dirty @($FormalPrepareFormalLockCutPaths[0]) -FixtureMode $true -BasisKind 'formal-lock-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock checkpoint retained a cut dirty path.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flCkpt -OriginMain $flCkpt -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'formal-lock-source-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock checkpoint accepted origin equal to its own head.'
+    $flMergeHead = '3' * 40
+    Assert-FormalPrepareRepoState -CurrentHead $flMergeHead -OriginMain $flMergeHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'formal-lock-merge'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flMergeHead -OriginMain $flHead -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'formal-lock-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock merge with stale anchor origin was accepted.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $flMergeHead -OriginMain $flMergeHead -Staged @() -Dirty @($FormalPrepareFormalLockCutPaths[0]) -FixtureMode $true -BasisKind 'formal-lock-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Formal-lock merge retained a cut dirty path.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareFormalLockWorkingBranch -FixtureMode $true) -eq $FormalPrepareFormalLockWorkingBranch) 'Formal-lock working branch was rejected.'
+
     Write-Output 'prepare postmerge basis seam: PASS anchor=4e390ead parents=exact-ordered paths=two tree=source-equal checkpoint=two-path merge=exact origin=kind-bound dirty=stage-bound'
+    Write-Output 'prepare formal-lock basis seam: PASS anchor=cb9ae02d parents=exact-ordered paths=five tree=source-equal checkpoint=five-path merge=exact origin=kind-bound dirty=exact stage=bound'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
@@ -389,6 +435,9 @@ function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Fixture post-merge fix branch was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the post-merge fix branch.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPreparePostMergeFixBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss branch name was accepted.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareFormalLockWorkingBranch -FixtureMode $true) -eq $FormalPrepareFormalLockWorkingBranch) 'Fixture formal-lock branch was rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareFormalLockWorkingBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the formal-lock branch.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPrepareFormalLockWorkingBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss formal-lock branch was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'An arbitrary fixture branch was accepted.'
 }
@@ -396,7 +445,7 @@ function Assert-BranchGuardContract {
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
-    Assert-True ($basisKind -in @('postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
+    Assert-True ($basisKind -in @('formal-lock-anchor', 'formal-lock-source-checkpoint', 'formal-lock-merge', 'postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
     Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
@@ -470,7 +519,11 @@ function global:git {
         }
         # post-merge 線必須先判：其 anchor 的 parent[0] 正好是 active anchor，
         # 若先判 active 線會把 post-merge 形狀誤配成 active branch。
-        `$resolvedBranch = if (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
+        `$resolvedBranch = if (`$observedHead -eq `$FormalPrepareFormalLockAnchorHead -or
+            (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPrepareFormalLockAnchorHead)) {
+            `$FormalPrepareFormalLockWorkingBranch
+        }
+        elseif (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
             (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPreparePostMergeAnchorHead)) {
             `$FormalPreparePostMergeFixBranch
         }

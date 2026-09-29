@@ -83,7 +83,7 @@ function Initialize-BranchOnlyGitShim {
     $content = @"
 @echo off
 if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="--show-current" if "%~5"=="" (
-  echo s/S-02-03b/exact-mixed-live-source-baseline
+  echo s/S-02-03b/formal-lock-diagnostics
   exit /b 0
 )
 "$RealGitExe" %*
@@ -92,12 +92,15 @@ if /I "%~1"=="-C" if /I "%~2"=="$RepoRoot" if /I "%~3"=="branch" if /I "%~4"=="-
 }
 
 function Assert-BranchOnlyGitShimContract {
-    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 's/S-02-03b/exact-mixed-live-source-baseline') 'Branch-only Git shim did not simulate the approved working branch.'
+    Assert-True ((& $GitBranchShim -C $RepoRoot branch --show-current).Trim() -eq 's/S-02-03b/formal-lock-diagnostics') 'Branch-only Git shim did not simulate the formal-lock working branch.'
     foreach ($revision in @('HEAD', 'origin/main')) {
         $throughShim = (& $GitBranchShim -C $RepoRoot rev-parse $revision).Trim()
         $throughRealGit = (& $RealGitExe -C $RepoRoot rev-parse $revision).Trim()
         Assert-True ($throughShim -eq $throughRealGit) "Branch-only Git shim intercepted non-branch truth: $revision"
     }
+    $shimStatus = @(& $GitBranchShim -C $RepoRoot status --porcelain=v1 --untracked-files=all)
+    $realStatus = @(& $RealGitExe -C $RepoRoot status --porcelain=v1 --untracked-files=all)
+    Assert-True (($shimStatus -join "`n") -ceq ($realStatus -join "`n")) 'Branch-only Git shim intercepted real working-tree status.'
 }
 function Get-ExpectedManagedPaths {
     $specs = @($FrontendAllowlist | ForEach-Object { 'Frontend/' + $_ }) + @($BackendAllowlist | ForEach-Object { 'Backend/' + $_ })
@@ -507,10 +510,26 @@ try {
         $lockStream = [IO.FileStream]::new($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         $lockRejected = Invoke-UpgradeProcess -Case $boundary -Mode 'ApplyFormalFixture' -TransactionRoot $boundary.Transaction
         Assert-True ($lockRejected.ExitCode -eq 8 -and $lockRejected.Stderr -match '\[UPGRADE_APPLY_LOCK_FAIL\]') "Held single upgrade lock did not stop apply. stdout=$($lockRejected.Stdout) stderr=$($lockRejected.Stderr)"
+        Assert-True ($lockRejected.Stderr -match 'Another upgrade owns the single upgrade lock') 'Real lock contention lost its specific owner diagnostic.'
         Assert-True ((Get-CaseTargetCanonical $boundary) -ceq $boundaryTargets -and (Get-TreeCanonical $boundary.Transaction) -ceq $boundaryTransaction) 'Lock rejection changed targets or transaction evidence.'
     }
     finally {
         if ($null -ne $lockStream) { $lockStream.Dispose() }
+        if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
+    }
+
+    # 同一路徑若是目錄，代表 lock setup 失敗而非另一個升級持鎖；必須保留受控原始原因並維持零寫入。
+    New-Item -ItemType Directory -Path $lockPath | Out-Null
+    try {
+        $setupFailureTargets = Get-CaseTargetCanonical $boundary
+        $setupFailureTransaction = Get-TreeCanonical $boundary.Transaction
+        $setupRejected = Invoke-UpgradeProcess -Case $boundary -Mode 'ApplyFormalFixture' -TransactionRoot $boundary.Transaction
+        Assert-True ($setupRejected.ExitCode -eq 8 -and $setupRejected.Stderr -match '\[UPGRADE_APPLY_LOCK_FAIL\]') "Non-contention lock setup failure did not fail closed. stdout=$($setupRejected.Stdout) stderr=$($setupRejected.Stderr)"
+        Assert-True ($setupRejected.Stderr -notmatch 'Another upgrade owns the single upgrade lock') 'Non-contention lock setup failure was misreported as lock contention.'
+        Assert-True ($setupRejected.Stderr -match 'exception_type=System\.[^;]+; hresult=-?\d+; message=.+; path=') 'Non-contention lock setup failure omitted controlled exception diagnostics.'
+        Assert-True ((Get-CaseTargetCanonical $boundary) -ceq $setupFailureTargets -and (Get-TreeCanonical $boundary.Transaction) -ceq $setupFailureTransaction) 'Non-contention lock setup failure changed targets or transaction evidence.'
+    }
+    finally {
         if (Test-Path -LiteralPath $lockPath) { Remove-Item -LiteralPath $lockPath -Force }
     }
 
