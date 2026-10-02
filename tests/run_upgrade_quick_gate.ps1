@@ -288,6 +288,14 @@ else {
         Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed -CaseTimeoutSeconds 30') -TimeoutSeconds 45
         Assert-NoTempResidue
     }
+    Invoke-GateCheck 'TEMP preflight shallow source-history rejection' {
+        Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case source-history-shallow -CaseTimeoutSeconds 30') -TimeoutSeconds 45
+        Assert-NoTempResidue
+    }
+    Invoke-GateCheck 'TEMP preflight full-history true non-ancestor rejection' {
+        Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case marker-true-non-ancestor -CaseTimeoutSeconds 30') -TimeoutSeconds 45
+        Assert-NoTempResidue
+    }
     Invoke-GateCheck 'TEMP preflight exact mixed near-miss negative' {
         Invoke-ExternalProcess -FileName 'powershell.exe' -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + (Get-RepoPath 'tests\upgrade_formal_preflight_smoke.ps1') + '" -Group source-target -Case exact-mixed-adapter-near-miss -CaseTimeoutSeconds 30') -TimeoutSeconds 45
         Assert-NoTempResidue
