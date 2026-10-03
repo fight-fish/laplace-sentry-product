@@ -380,6 +380,52 @@ function Assert-CheckpointBasisContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Post-merge fix branch was rejected.'
 
     Write-Output 'prepare postmerge basis seam: PASS anchor=4e390ead parents=exact-ordered paths=two tree=source-equal checkpoint=two-path merge=exact origin=kind-bound dirty=stage-bound'
+
+    # --- PR #9 source-history progression：cb9 → exact e9 → two-file follow-up → normal merge ---
+    $shAnchor = $FormalPrepareSourceHistoryAnchorHead
+    $shCheckpoint = $FormalPrepareSourceHistoryCheckpointHead
+    $shCheckpointTree = $FormalPrepareSourceHistoryCheckpointTree
+    $shFollowUp = '1' * 40
+    $shFollowUpTree = '2' * 40
+    $shMerge = '3' * 40
+
+    Assert-True ($FormalPrepareSourceHistoryCheckpointPaths.Count -eq 7) 'Source-history checkpoint is not exactly seven files.'
+    Assert-True ($FormalPrepareSourceHistoryFollowUpPaths.Count -eq 2) 'Source-history follow-up is not exactly two files.'
+    Assert-True ($FormalPrepareSourceHistoryCumulativePaths.Count -eq 9) 'Source-history cumulative merge set is not exactly nine files.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree) 'Exact e9 source-history checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead ('f' * 40) -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree)) 'Arbitrary source-history checkpoint head was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($FormalPreparePostMergeAnchorHead) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree)) 'Wrong source-history checkpoint parent was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths ($FormalPrepareSourceHistoryCheckpointPaths | Select-Object -Skip 1) -CurrentTree $shCheckpointTree)) 'Source-history checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths ($FormalPrepareSourceHistoryCheckpointPaths + 'unexpected.txt') -CurrentTree $shCheckpointTree)) 'Source-history checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree ('d' * 40))) 'Source-history checkpoint tree drift was accepted.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths) 'Exact source-history follow-up was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths)) 'Squash/rebase-shaped follow-up was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint, $shAnchor) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths)) 'Two-parent follow-up was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths ($FormalPrepareSourceHistoryFollowUpPaths | Select-Object -Skip 1))) 'Source-history follow-up missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths ($FormalPrepareSourceHistoryFollowUpPaths + 'unexpected.txt'))) 'Source-history follow-up with an extra path was accepted.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true) 'Exact source-history normal merge was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shFollowUp, $shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Reversed source-history merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths ($FormalPrepareSourceHistoryCumulativePaths | Select-Object -Skip 1) -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths ($FormalPrepareSourceHistoryCumulativePaths + 'unexpected.txt') -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree ('d' * 40) -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $false)) 'Source-history merge with an invalid/stale follow-up was accepted.'
+
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $shAnchor) -eq 'postmerge-merge') 'Existing cb9 anchor entered the source-history merge branch.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $shCheckpoint) -eq 'sourcehistory-checkpoint') 'Exact e9 checkpoint was not accepted after the first-parent guard.'
+
+    Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shAnchor -Staged @() -Dirty $FormalPrepareSourceHistoryFollowUpPaths -FixtureMode $true -BasisKind 'sourcehistory-checkpoint'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shAnchor -Staged @() -Dirty ($FormalPrepareSourceHistoryFollowUpPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'sourcehistory-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history checkpoint accepted a partial follow-up dirty set.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shCheckpoint -Staged @() -Dirty $FormalPrepareSourceHistoryFollowUpPaths -FixtureMode $true -BasisKind 'sourcehistory-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history checkpoint accepted stale origin equal to itself.'
+    Assert-FormalPrepareRepoState -CurrentHead $shFollowUp -OriginMain $shAnchor -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-followup'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shFollowUp -OriginMain $shAnchor -Staged @() -Dirty @($FormalPrepareSourceHistoryFollowUpPaths[0]) -FixtureMode $true -BasisKind 'sourcehistory-followup' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history follow-up retained dirty basis files.'
+    Assert-FormalPrepareRepoState -CurrentHead $shMerge -OriginMain $shMerge -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-merge'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shMerge -OriginMain $shAnchor -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history merge accepted stale anchor origin.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $true) -eq $FormalPrepareSourceHistoryBranch) 'Source-history fixture branch was rejected.'
+
+    Write-Output 'prepare source-history progression seam: PASS anchor=cb9ae02d checkpoint=e9f4520 exact-seven followup=exact-two merge=normal-exact-nine tree=source-equal origin=kind-bound'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
@@ -389,6 +435,9 @@ function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Fixture post-merge fix branch was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the post-merge fix branch.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPreparePostMergeFixBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss branch name was accepted.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $true) -eq $FormalPrepareSourceHistoryBranch) 'Fixture source-history branch was rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the source-history branch.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPrepareSourceHistoryBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss source-history branch was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'An arbitrary fixture branch was accepted.'
 }
@@ -396,7 +445,7 @@ function Assert-BranchGuardContract {
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
-    Assert-True ($basisKind -in @('postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
+    Assert-True ($basisKind -in @('sourcehistory-checkpoint', 'sourcehistory-followup', 'sourcehistory-merge', 'postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
     Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
@@ -468,9 +517,14 @@ function global:git {
             `$rl = (& git.exe -C `$RepoRoot rev-list --parents -n1 `$observedHead 2>`$null | Select-Object -First 1)
             if (`$rl) { `$observedParents = @(([string]`$rl).Trim() -split '\s+' | Select-Object -Skip 1) }
         }
-        # post-merge 線必須先判：其 anchor 的 parent[0] 正好是 active anchor，
+        # source-history 線最具體，必須先判；follow-up 的 sole parent 是 e9。
+        `$resolvedBranch = if (`$observedHead -eq `$FormalPrepareSourceHistoryCheckpointHead -or
+            (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPrepareSourceHistoryCheckpointHead)) {
+            `$FormalPrepareSourceHistoryBranch
+        }
+        # post-merge 線必須先於 active 線判：其 anchor 的 parent[0] 正好是 active anchor，
         # 若先判 active 線會把 post-merge 形狀誤配成 active branch。
-        `$resolvedBranch = if (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
+        elseif (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
             (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPreparePostMergeAnchorHead)) {
             `$FormalPreparePostMergeFixBranch
         }
