@@ -240,6 +240,16 @@ function Get-HeadShortCommit {
     return ((Get-GitOutput -Arguments @('rev-parse', '--short', 'HEAD') | Select-Object -First 1).Trim())
 }
 
+function Assert-SourceHistoryQualified {
+    $shallowValue = ((Get-GitOutput -Arguments @('rev-parse', '--is-shallow-repository') | Select-Object -First 1).Trim()).ToLowerInvariant()
+    if ($shallowValue -notin @('true', 'false')) {
+        throw '[UPGRADE_GIT_FAIL] Git did not return a valid shallow-repository status.'
+    }
+    if ($shallowValue -eq 'true') {
+        throw '[UPGRADE_SOURCE_HISTORY_FAIL] The upgrade source repository is shallow. Prepare a non-shallow source outside the upgrade transaction; automatic fetch/deepen is forbidden.'
+    }
+}
+
 function Resolve-BuildVersion {
     if ($BuildVersion) {
         return $BuildVersion
@@ -690,6 +700,7 @@ function Resolve-IsolatedVersionContract {
         throw '[UPGRADE_VERSION_FAIL] Frontend and Backend old version markers must match.'
     }
 
+    Assert-SourceHistoryQualified
     $oldCommit = (Get-GitOutput -Arguments @('rev-parse', "$frontendOld^{commit}") | Select-Object -First 1).Trim()
     $headCommit = Get-HeadCommit
     $headShort = Get-HeadShortCommit
@@ -1107,8 +1118,18 @@ function Invoke-FormalPreflightMode {
         catch { Add-FormalPreflightFailure -Result $result -Tag '[UPGRADE_PROTECTED_DATA_FAIL]' -CheckId 'protected' -Message $_.Exception.Message }
     }
 
+    $sourceHistoryQualified = $true
+    try { Assert-SourceHistoryQualified }
+    catch {
+        $sourceHistoryQualified = $false
+        Add-FormalPreflightFailure -Result $result -Tag '[UPGRADE_SOURCE_HISTORY_FAIL]' -CheckId 'target_version' -Message $_.Exception.Message
+    }
+
     $markerCommit = $null
-    if ($frontendExists -and $backendExists -and
+    if (-not $sourceHistoryQualified) {
+        # Source history is a prerequisite for both marker resolution and ancestry proof.
+    }
+    elseif ($frontendExists -and $backendExists -and
         (Test-Path -LiteralPath $frontendVersionPath -PathType Leaf) -and
         (Test-Path -LiteralPath $backendVersionPath -PathType Leaf)) {
         $frontendMarker = (Get-Content -LiteralPath $frontendVersionPath -Raw -Encoding UTF8).Trim()

@@ -245,6 +245,8 @@ MAJOR.MINOR.PATCH
 
 正式準備前必須核對指定分支、遠端主線、staged 狀態（Git 暫存區）及既有修改範圍。staged 非空必須拒絕；dirty／untracked 僅接受正式 helper 明列的允許範圍，未列入允許範圍的 dirty 或 untracked 路徑必須拒絕。
 
+正式升級來源另須通過 source-history qualification：source repo 必須是 non-shallow，且 ancestry、tree、blob、diff 與 parent-shape 證據均取自本機 Git objects。shallow source 必須先以 `UPGRADE_SOURCE_HISTORY_FAIL` fail-closed；完整歷史中的真非祖先仍使用 `UPGRADE_VERSION_FAIL`。升級交易不得自行 fetch、deepen、unshallow，亦不得用遠端 compare 取代本機證據。
+
 checkpoint 只能是明示核准錨點，或符合核准 parent lineage 與精確 changed-path shape 的單一直接子版本。不得把任意後代、合併形狀、少檔、多檔或替換檔視為等價基準。
 
 ### Transaction journal 與 marker-last

@@ -86,18 +86,47 @@ function Invoke-UpgradeCase {
     param(
         $Case,
         [string]$Action = 'Apply',
-        [string]$Injection = 'None'
+        [string]$Injection = 'None',
+        [string]$UpgradeScriptPath = $UpgradeScript
     )
     $priorPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $UpgradeScript -Mode ApplyIsolated -IsolationRoot $Case.Root -StagingRoot $Case.Stage -FrontendTarget $Case.Frontend -BackendTarget $Case.Backend -IsolatedAction $Action -FailureInjection $Injection 2>&1)
+    $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $UpgradeScriptPath -Mode ApplyIsolated -IsolationRoot $Case.Root -StagingRoot $Case.Stage -FrontendTarget $Case.Frontend -BackendTarget $Case.Backend -IsolatedAction $Action -FailureInjection $Injection 2>&1)
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $priorPreference
     return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
 }
 
+function New-SourceHistoryFixture {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [switch]$Shallow
+    )
+    $sourceRoot = Join-Path $SuiteRoot $Name
+    $sourceUri = 'file:///' + $RepoRoot.Replace('\', '/')
+    $cloneArguments = @('clone', '--quiet', '--no-local')
+    if ($Shallow) { $cloneArguments += @('--depth', '1') }
+    $cloneArguments += @($sourceUri, $sourceRoot)
+    & git @cloneArguments
+    Assert-True ($LASTEXITCODE -eq 0) 'Unable to create isolated source-history fixture clone.'
+    Copy-Item -LiteralPath $UpgradeScript -Destination (Join-Path $sourceRoot 'scripts\upgrade.ps1') -Force
+    $actualShallow = (& git -C $sourceRoot rev-parse --is-shallow-repository).Trim()
+    $expectedShallow = if ($Shallow) { 'true' } else { 'false' }
+    Assert-True ($actualShallow -eq $expectedShallow) "Isolated source-history fixture shallow mismatch: expected=$expectedShallow actual=$actualShallow"
+    return $sourceRoot
+}
+
+function New-TrueNonAncestorCommit {
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+    $tree = (& git -C $SourceRoot rev-parse 'HEAD^{tree}').Trim()
+    Assert-True ($LASTEXITCODE -eq 0 -and $tree -match '^[0-9a-f]{40}$') 'Unable to resolve isolated fixture tree.'
+    $commit = (& git -C $SourceRoot -c 'user.name=Laplace Sentry Test' -c 'user.email=laplace-sentry-test@example.invalid' commit-tree $tree -m 'isolated true non-ancestor fixture').Trim()
+    Assert-True ($LASTEXITCODE -eq 0 -and $commit -match '^[0-9a-f]{40}$') 'Unable to create isolated true non-ancestor fixture commit.'
+    return $commit
+}
+
 function Assert-Restored {
-    param($Case, $Before, [string]$Label)
+    param($Case, $Before, [string]$Label, [string]$ExpectedVersion = $OldVersion)
     Assert-True ((Get-Sha $Case.Config) -eq $Before.Config) "$Label changed protected Frontend config."
     Assert-True ((Get-Sha $Case.Projects) -eq $Before.Projects) "$Label changed protected Backend projects.json."
     Assert-True ((Get-Sha $Case.FrontendOld) -eq $Before.FrontendOld) "$Label did not restore existing Frontend managed file."
@@ -106,8 +135,8 @@ function Assert-Restored {
     Assert-True (-not (Test-Path -LiteralPath $Case.NewFile)) "$Label did not remove a newly introduced managed file."
     Assert-True ((Get-Sha (Join-Path $Case.Frontend 'version.txt')) -eq $Before.FrontendVersion) "$Label did not restore the exact Frontend version bytes."
     Assert-True ((Get-Sha (Join-Path $Case.Backend 'version.txt')) -eq $Before.BackendVersion) "$Label did not restore the exact Backend version bytes."
-    Assert-True ((Get-Content -LiteralPath (Join-Path $Case.Frontend 'version.txt') -Raw).Trim() -eq $OldVersion) "$Label did not restore Frontend version."
-    Assert-True ((Get-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Raw).Trim() -eq $OldVersion) "$Label did not restore Backend version."
+    Assert-True ((Get-Content -LiteralPath (Join-Path $Case.Frontend 'version.txt') -Raw).Trim() -eq $ExpectedVersion) "$Label did not restore Frontend version."
+    Assert-True ((Get-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Raw).Trim() -eq $ExpectedVersion) "$Label did not restore Backend version."
 }
 
 function Assert-OverlapRejectedWithoutWrites {
@@ -155,6 +184,29 @@ try {
     Assert-True ($dirtyResult.ExitCode -eq 4) 'Dirty source injection was not rejected.'
     Assert-True (-not (Test-Path -LiteralPath $dirty.Stage)) 'Dirty source rejection wrote a staging transaction.'
     Assert-Restored -Case $dirty -Before $dirtyBefore -Label 'Dirty source rejection'
+
+    $shallowHistory = New-IsolatedCase 'source-history-shallow'
+    $shallowBefore = Get-CaseSnapshot $shallowHistory
+    $shallowSource = New-SourceHistoryFixture -Name 'source-repo-shallow' -Shallow
+    $shallowResult = Invoke-UpgradeCase -Case $shallowHistory -UpgradeScriptPath (Join-Path $shallowSource 'scripts\upgrade.ps1')
+    Assert-True ($shallowResult.ExitCode -eq 4) 'Shallow source history did not return isolated exit 4.'
+    Assert-True (($shallowResult.Output -join "`n") -match '\[UPGRADE_SOURCE_HISTORY_FAIL\]') 'Shallow source history did not report UPGRADE_SOURCE_HISTORY_FAIL.'
+    Assert-True (-not (Test-Path -LiteralPath $shallowHistory.Stage)) 'Shallow source history rejection wrote a staging transaction.'
+    Assert-Restored -Case $shallowHistory -Before $shallowBefore -Label 'Shallow source history rejection'
+
+    $trueNonAncestor = New-IsolatedCase 'source-history-true-non-ancestor'
+    $fullSource = New-SourceHistoryFixture -Name 'source-repo-full'
+    $nonAncestorCommit = New-TrueNonAncestorCommit -SourceRoot $fullSource
+    $nonAncestorCommit | Set-Content -LiteralPath (Join-Path $trueNonAncestor.Frontend 'version.txt') -Encoding ASCII -NoNewline
+    $nonAncestorCommit | Set-Content -LiteralPath (Join-Path $trueNonAncestor.Backend 'version.txt') -Encoding ASCII -NoNewline
+    $trueNonAncestorBefore = Get-CaseSnapshot $trueNonAncestor
+    $trueNonAncestorResult = Invoke-UpgradeCase -Case $trueNonAncestor -UpgradeScriptPath (Join-Path $fullSource 'scripts\upgrade.ps1')
+    $trueNonAncestorOutput = $trueNonAncestorResult.Output -join "`n"
+    Assert-True ($trueNonAncestorResult.ExitCode -eq 4) 'True non-ancestor source did not return isolated exit 4.'
+    Assert-True ($trueNonAncestorOutput -match '\[UPGRADE_VERSION_FAIL\]') 'True non-ancestor source did not retain UPGRADE_VERSION_FAIL.'
+    Assert-True ($trueNonAncestorOutput -notmatch '\[UPGRADE_SOURCE_HISTORY_FAIL\]') 'Full-history true non-ancestor was misclassified as shallow history.'
+    Assert-True (-not (Test-Path -LiteralPath $trueNonAncestor.Stage)) 'True non-ancestor rejection wrote a staging transaction.'
+    Assert-Restored -Case $trueNonAncestor -Before $trueNonAncestorBefore -Label 'True non-ancestor rejection' -ExpectedVersion $nonAncestorCommit
 
     foreach ($injection in @('FrontendApply', 'BackendApply', 'Version', 'Smoke')) {
         $case = New-IsolatedCase ("rollback-" + $injection.ToLowerInvariant())

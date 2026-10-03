@@ -1,9 +1,9 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('all', 'basis-only', 'metadata', 'formal-boundary', 'success', 'runtime-rejection', 'acl-rejection', 'source-rejection', 'transaction-boundary', 'failure-injection', 'reentry-cleanup')]
+    [ValidateSet('all', 'basis-only', 'metadata', 'compatibility', 'formal-boundary', 'success', 'runtime-rejection', 'acl-rejection', 'source-rejection', 'transaction-boundary', 'failure-injection', 'reentry-cleanup')]
     [string[]]$Group = @('all'),
 
-    [ValidateSet('all', 'success-and-rerun', 'active-lock', 'owned-ui', 'owned-daemon', 'owned-worker', 'ambiguous-runtime', 'acl-reject', 'owner-reject', 'space-reject', 'adapter-drift', 'tray-drift', 'marker-drift', 'transaction-overlap', 'transaction-unc', 'transaction-reparse', 'inject-preimage', 'inject-package', 'inject-prepare', 'inject-journal', 'inject-secondsnapshot', 'inject-evidencetamper', 'incomplete-rerun', 'evidence-tamper-rerun', 'multiple-transactions')]
+    [ValidateSet('all', 'compat-current', 'compat-legacy', 'compat-missing-field', 'compat-unknown-field', 'compat-wrong-type', 'compat-ini-missing-key', 'compat-ini-unknown-key', 'compat-ini-wrong-value', 'compat-unreadable', 'compat-legacy-rejection', 'compat-wrong-type-rejection', 'compat-unreadable-rejection', 'success-and-rerun', 'active-lock', 'owned-ui', 'owned-daemon', 'owned-worker', 'ambiguous-runtime', 'acl-reject', 'owner-reject', 'space-reject', 'adapter-drift', 'tray-drift', 'marker-drift', 'transaction-overlap', 'transaction-unc', 'transaction-reparse', 'inject-preimage', 'inject-package', 'inject-prepare', 'inject-journal', 'inject-secondsnapshot', 'inject-evidencetamper', 'incomplete-rerun', 'evidence-tamper-rerun', 'multiple-transactions')]
     [string[]]$Case = @('all')
 )
 
@@ -12,20 +12,20 @@ param(
 Proves PrepareFormal under isolated TEMP fixtures and the read-only production WSL metadata seam.
 
 .DESCRIPTION
-Purpose: exercise prepare success, rejection, interruption, reentry, integrity sealing, the zero-formal-write boundary, and production WSL stat argument handling.
+Purpose: exercise protected-data compatibility classification, prepare success, rejection, interruption, reentry, integrity sealing, the zero-formal-write boundary, and production WSL stat argument handling.
 Inputs: fixed Git objects, generated mixed Frontend/Backend targets and observation JSON below system TEMP, plus formal backend main.py as a read-only metadata witness.
 Outputs: one PASS/FAIL result; all fixture evidence is removed before exit.
 SSOT Output: process exit code; zero means every prepare-only assertion passed.
 Exit codes: 0 pass, 1 assertion, boundary, script, or cleanup failure.
 SKIP conditions: none.
-FAIL conditions: any wrong exit/result/state/count/hash/reentry/boundary result, TEMP residue, or production metadata command/parser result.
+FAIL conditions: any wrong compatibility/exit/result/state/count/hash/reentry/boundary result, protected-data mutation, TEMP residue, or production metadata command/parser result.
 Order-sensitive checks: formal-boundary and fixture target snapshots are captured before prepare and compared after every case.
 Side effects: creates and removes only verified strict children of system TEMP and issues read-only WSL stat calls; never invokes live PrepareFormal, upgrade.bat, Git writes, processes, registry, or runtime changes.
 #>
 
 # 這支腳本在做什麼：用 TEMP 假目標證明完整 prepare 契約，並唯讀走過 production WSL metadata 接縫。
 # 這支腳本不做什麼：不執行真實 prepare、不建立正式 transaction root，也不測 apply／repair／rollback。
-# 常改區塊：production metadata 接縫、拒絕案例、故障注入、manifest 與重入斷言。
+# 常改區塊：compatibility fixture、production metadata 接縫、拒絕案例、故障注入、manifest 與重入斷言。
 # 不要亂動的區塊：正式邊界前後 fingerprint、嚴格 TEMP 清理與 0 formal target writes。
 
 Set-StrictMode -Version Latest
@@ -380,6 +380,52 @@ function Assert-CheckpointBasisContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Post-merge fix branch was rejected.'
 
     Write-Output 'prepare postmerge basis seam: PASS anchor=4e390ead parents=exact-ordered paths=two tree=source-equal checkpoint=two-path merge=exact origin=kind-bound dirty=stage-bound'
+
+    # --- PR #9 source-history progression：cb9 → exact e9 → two-file follow-up → normal merge ---
+    $shAnchor = $FormalPrepareSourceHistoryAnchorHead
+    $shCheckpoint = $FormalPrepareSourceHistoryCheckpointHead
+    $shCheckpointTree = $FormalPrepareSourceHistoryCheckpointTree
+    $shFollowUp = '1' * 40
+    $shFollowUpTree = '2' * 40
+    $shMerge = '3' * 40
+
+    Assert-True ($FormalPrepareSourceHistoryCheckpointPaths.Count -eq 7) 'Source-history checkpoint is not exactly seven files.'
+    Assert-True ($FormalPrepareSourceHistoryFollowUpPaths.Count -eq 2) 'Source-history follow-up is not exactly two files.'
+    Assert-True ($FormalPrepareSourceHistoryCumulativePaths.Count -eq 9) 'Source-history cumulative merge set is not exactly nine files.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree) 'Exact e9 source-history checkpoint was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead ('f' * 40) -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree)) 'Arbitrary source-history checkpoint head was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($FormalPreparePostMergeAnchorHead) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree $shCheckpointTree)) 'Wrong source-history checkpoint parent was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths ($FormalPrepareSourceHistoryCheckpointPaths | Select-Object -Skip 1) -CurrentTree $shCheckpointTree)) 'Source-history checkpoint missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths ($FormalPrepareSourceHistoryCheckpointPaths + 'unexpected.txt') -CurrentTree $shCheckpointTree)) 'Source-history checkpoint with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryCheckpointShape -CurrentHead $shCheckpoint -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCheckpointPaths -CurrentTree ('d' * 40))) 'Source-history checkpoint tree drift was accepted.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths) 'Exact source-history follow-up was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shAnchor) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths)) 'Squash/rebase-shaped follow-up was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint, $shAnchor) -ChangedPaths $FormalPrepareSourceHistoryFollowUpPaths)) 'Two-parent follow-up was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths ($FormalPrepareSourceHistoryFollowUpPaths | Select-Object -Skip 1))) 'Source-history follow-up missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryFollowUpShape -ParentHeads @($shCheckpoint) -ChangedPaths ($FormalPrepareSourceHistoryFollowUpPaths + 'unexpected.txt'))) 'Source-history follow-up with an extra path was accepted.'
+
+    Assert-True (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true) 'Exact source-history normal merge was rejected.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shFollowUp, $shAnchor) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Reversed source-history merge parent order was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths ($FormalPrepareSourceHistoryCumulativePaths | Select-Object -Skip 1) -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge missing a path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths ($FormalPrepareSourceHistoryCumulativePaths + 'unexpected.txt') -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge with an extra path was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree ('d' * 40) -SourceTree $shFollowUpTree -SourceFollowUpValid $true)) 'Source-history merge tree mismatch was accepted.'
+    Assert-True (-not (Test-FormalPrepareSourceHistoryMergeShape -ParentHeads @($shAnchor, $shFollowUp) -ChangedPaths $FormalPrepareSourceHistoryCumulativePaths -CurrentTree $shFollowUpTree -SourceTree $shFollowUpTree -SourceFollowUpValid $false)) 'Source-history merge with an invalid/stale follow-up was accepted.'
+
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $shAnchor) -eq 'postmerge-merge') 'Existing cb9 anchor entered the source-history merge branch.'
+    Assert-True ((Assert-FormalPrepareCheckpointBasis -CurrentHead $shCheckpoint) -eq 'sourcehistory-checkpoint') 'Exact e9 checkpoint was not accepted after the first-parent guard.'
+
+    Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shAnchor -Staged @() -Dirty $FormalPrepareSourceHistoryFollowUpPaths -FixtureMode $true -BasisKind 'sourcehistory-checkpoint'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shAnchor -Staged @() -Dirty ($FormalPrepareSourceHistoryFollowUpPaths | Select-Object -Skip 1) -FixtureMode $true -BasisKind 'sourcehistory-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history checkpoint accepted a partial follow-up dirty set.'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shCheckpoint -OriginMain $shCheckpoint -Staged @() -Dirty $FormalPrepareSourceHistoryFollowUpPaths -FixtureMode $true -BasisKind 'sourcehistory-checkpoint' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history checkpoint accepted stale origin equal to itself.'
+    Assert-FormalPrepareRepoState -CurrentHead $shFollowUp -OriginMain $shAnchor -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-followup'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shFollowUp -OriginMain $shAnchor -Staged @() -Dirty @($FormalPrepareSourceHistoryFollowUpPaths[0]) -FixtureMode $true -BasisKind 'sourcehistory-followup' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history follow-up retained dirty basis files.'
+    Assert-FormalPrepareRepoState -CurrentHead $shMerge -OriginMain $shMerge -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-merge'
+    Assert-ThrowsLike { Assert-FormalPrepareRepoState -CurrentHead $shMerge -OriginMain $shAnchor -Staged @() -Dirty @() -FixtureMode $true -BasisKind 'sourcehistory-merge' } 'UPGRADE_PREPARE_BASIS_FAIL' 'Source-history merge accepted stale anchor origin.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $true) -eq $FormalPrepareSourceHistoryBranch) 'Source-history fixture branch was rejected.'
+
+    Write-Output 'prepare source-history progression seam: PASS anchor=cb9ae02d checkpoint=e9f4520 exact-seven followup=exact-two merge=normal-exact-nine tree=source-equal origin=kind-bound'
 }
 function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput 'main' -FixtureMode $false) -eq 'main') 'Live main was rejected.'
@@ -389,6 +435,9 @@ function Assert-BranchGuardContract {
     Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $true) -eq $FormalPreparePostMergeFixBranch) 'Fixture post-merge fix branch was rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPreparePostMergeFixBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the post-merge fix branch.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPreparePostMergeFixBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss branch name was accepted.'
+    Assert-True ((Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $true) -eq $FormalPrepareSourceHistoryBranch) 'Fixture source-history branch was rejected.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $FormalPrepareSourceHistoryBranch -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch main' 'Live mode accepted the source-history branch.'
+    Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput ($FormalPrepareSourceHistoryBranch + '-extra') -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'A near-miss source-history branch was accepted.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput $null -FixtureMode $false } 'UPGRADE_PREPARE_BASIS_FAIL.*detached HEAD' 'Detached HEAD was not explicitly rejected.'
     Assert-ThrowsLike { Assert-FormalPrepareMainBranch -BranchOutput 'feature/test' -FixtureMode $true } 'UPGRADE_PREPARE_BASIS_FAIL.*Expected branch' 'An arbitrary fixture branch was accepted.'
 }
@@ -396,7 +445,7 @@ function Assert-BranchGuardContract {
 function Assert-CurrentHeadCheckpointBasis {
     $actualHead = (git rev-parse HEAD).Trim()
     $basisKind = Assert-FormalPrepareCheckpointBasis -CurrentHead $actualHead
-    Assert-True ($basisKind -in @('postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
+    Assert-True ($basisKind -in @('sourcehistory-checkpoint', 'sourcehistory-followup', 'sourcehistory-merge', 'postmerge-anchor', 'postmerge-source-checkpoint', 'postmerge-merge', 'active-anchor', 'active-source-checkpoint', 'active-merge', 'merged-main', 'source-checkpoint', 'future-merge')) 'Current HEAD was not accepted as a current approved basis.'
     Assert-ThrowsLike { Get-GitOutput -Arguments @('laplace-sentry-invalid-smoke-command') } 'UPGRADE_GIT_FAIL.*git laplace-sentry-invalid-smoke-command.*exit=[1-9]' 'Smoke Git bridge did not preserve a readable nonzero failure.'
     Write-Output ('prepare current-head basis: PASS head=' + $actualHead + ' basis=' + $basisKind + ' checked=true')
 }
@@ -457,6 +506,14 @@ Set-StrictMode -Version Latest
 function global:git {
     param([Parameter(ValueFromRemainingArguments=`$true)][object[]]`$GitArguments)
     `$parts = @(`$GitArguments | ForEach-Object { [string]`$_ })
+    if (`$parts.Count -eq 5 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'status' -and `$parts[3] -eq '--porcelain=v1' -and `$parts[4] -eq '--untracked-files=all') {
+        # The parent smoke already proves the exact dirty-path basis matrix. The
+        # isolated child exercises post-basis Prepare behavior against fixture
+        # targets, so expose the ruled follow-up as clean without changing the
+        # production gate or hiding any other Git observation.
+        `$global:LASTEXITCODE = 0
+        return
+    }
     if (`$parts.Count -eq 4 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'branch' -and `$parts[3] -eq '--show-current') {
         # 依實際 HEAD 落在哪條線回報對應的 approved working branch：
         # active 線回 active branch，舊鏈回舊 branch。production 的 branch guard 不受影響。
@@ -468,9 +525,14 @@ function global:git {
             `$rl = (& git.exe -C `$RepoRoot rev-list --parents -n1 `$observedHead 2>`$null | Select-Object -First 1)
             if (`$rl) { `$observedParents = @(([string]`$rl).Trim() -split '\s+' | Select-Object -Skip 1) }
         }
-        # post-merge 線必須先判：其 anchor 的 parent[0] 正好是 active anchor，
+        # source-history 線最具體，必須先判；follow-up 的 sole parent 是 e9。
+        `$resolvedBranch = if (`$observedHead -eq `$FormalPrepareSourceHistoryCheckpointHead -or
+            (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPrepareSourceHistoryCheckpointHead)) {
+            `$FormalPrepareSourceHistoryBranch
+        }
+        # post-merge 線必須先於 active 線判：其 anchor 的 parent[0] 正好是 active anchor，
         # 若先判 active 線會把 post-merge 形狀誤配成 active branch。
-        `$resolvedBranch = if (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
+        elseif (`$observedHead -eq `$FormalPreparePostMergeAnchorHead -or
             (`$observedParents.Count -ge 1 -and `$observedParents[0] -eq `$FormalPreparePostMergeAnchorHead)) {
             `$FormalPreparePostMergeFixBranch
         }
@@ -546,7 +608,7 @@ function Initialize-PrepareTemplate {
     Remove-TestTree $build
     New-Item -ItemType Directory -Path (Join-Path $backend 'data') -Force | Out-Null
     "[General]`r`neye_size=480" | Set-Content -LiteralPath (Join-Path $frontend 'sentry_config.ini') -Encoding UTF8
-    '[{"uuid":"fixture-project","name":"must-survive"}]' | Set-Content -LiteralPath (Join-Path $backend 'data\projects.json') -Encoding UTF8
+    '[{"uuid":"fixture-project","name":"must-survive","path":"C:\\fixture-project","output_file":["C:\\fixture-project\\README.md"],"target_files":["C:\\fixture-project\\README.md"],"ignore_patterns":[]}]' | Set-Content -LiteralPath (Join-Path $backend 'data\projects.json') -Encoding UTF8
     $SourceMarker | Set-Content -LiteralPath (Join-Path $frontend 'version.txt') -Encoding ASCII -NoNewline
     $SourceMarker | Set-Content -LiteralPath (Join-Path $backend 'version.txt') -Encoding ASCII -NoNewline
     $observation = Join-Path $TemplateRoot 'observation.json'
@@ -771,7 +833,12 @@ function Assert-NoTransactionDirectory {
 }
 
 function Assert-RejectedBeforeTransaction {
-    param([string]$Name, [scriptblock]$Mutate, [hashtable]$InvokeOverrides = @{})
+    param(
+        [string]$Name,
+        [scriptblock]$Mutate,
+        [hashtable]$InvokeOverrides = @{},
+        [string]$ExpectedCompatibilityStatus = ''
+    )
     Invoke-SmokeCase $Name {
         $case = New-PrepareCase $Name
         $observation = Get-Content -LiteralPath $case.Observation -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -784,8 +851,38 @@ function Assert-RejectedBeforeTransaction {
         Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6. stderr=$($result.Stderr)"
         Assert-True ($result.Json.result -eq 'failed' -and $result.Json.state -eq 'rejected') "[$Name] pre-transaction result was not an explicit rejection."
         Assert-True ($result.Json.failure_phase -eq 'before_transaction' -and -not $result.Json.transaction_id -and -not $result.Json.transaction_root) "[$Name] rejection exposed the wrong transaction phase."
+        if ($ExpectedCompatibilityStatus) {
+            Assert-True ($null -ne $result.Json.compatibility) "[$Name] compatibility receipt was missing. stdout=$($result.Stdout) stderr=$($result.Stderr)"
+            Assert-True ($result.Json.compatibility.status -eq $ExpectedCompatibilityStatus) "[$Name] compatibility status was not $ExpectedCompatibilityStatus."
+            Assert-True ([bool]$result.Json.compatibility.read_only) "[$Name] compatibility result was not read-only."
+        }
         Assert-NoTransactionDirectory $case
         Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
+    }
+}
+
+function Assert-CompatibilityCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Mutate,
+        [Parameter(Mandatory = $true)][string]$ExpectedOverall,
+        [Parameter(Mandatory = $true)][string]$ExpectedProjects,
+        [Parameter(Mandatory = $true)][string]$ExpectedConfig
+    )
+    Invoke-SmokeCase $Name {
+        $case = New-PrepareCase $Name
+        & $Mutate $case
+        $before = (Get-TreeCanonical $case.Frontend) + "`n---backend---`n" + (Get-TreeCanonical $case.Backend)
+        $result = Get-FormalPrepareCompatibilityReport -Inputs ([pscustomobject]@{ FrontendTarget = $case.Frontend; BackendTarget = $case.Backend })
+        $after = (Get-TreeCanonical $case.Frontend) + "`n---backend---`n" + (Get-TreeCanonical $case.Backend)
+        $projects = @($result.files | Where-Object { $_.data_id -eq 'Backend/data/projects.json' })[0]
+        $config = @($result.files | Where-Object { $_.data_id -eq 'Frontend/sentry_config.ini' })[0]
+        Assert-True ($result.schema -eq 'laplace-compatibility-preflight-v1' -and [bool]$result.read_only) "[$Name] compatibility result contract is wrong."
+        Assert-True ($result.status -eq $ExpectedOverall) "[$Name] overall status expected=$ExpectedOverall actual=$($result.status)."
+        Assert-True ($projects.status -eq $ExpectedProjects) "[$Name] projects status expected=$ExpectedProjects actual=$($projects.status)."
+        Assert-True ($config.status -eq $ExpectedConfig) "[$Name] config status expected=$ExpectedConfig actual=$($config.status)."
+        Assert-True ($after -ceq $before) "[$Name] compatibility validator changed protected fixture data."
+        Assert-NoTransactionDirectory $case
     }
 }
 
@@ -833,6 +930,55 @@ try {
     # 先單獨驗證 literal argv seam，避免正式邊界大量唯讀 WSL fingerprint 呼叫掩蓋此契約的原始結果。
     Invoke-SmokeGroup 'metadata' { Assert-ProductionWslMetadataSeam }
 
+    Invoke-SmokeGroup 'compatibility' {
+        Assert-CompatibilityCase 'compat-current' { param($c) } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-legacy' {
+            param($c)
+            '[{"uuid":"legacy-project","name":"legacy","root_path":"C:\\legacy","output_file":"C:\\legacy\\README.md","target_files":["C:\\legacy\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'migration-required' 'migration-required' 'compatible'
+        Assert-CompatibilityCase 'compat-missing-field' {
+            param($c)
+            '[{"uuid":"missing-targets","name":"missing-targets","path":"C:\\missing-targets","output_file":["C:\\missing-targets\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'migration-required' 'migration-required' 'compatible'
+        Assert-CompatibilityCase 'compat-unknown-field' {
+            param($c)
+            '[{"uuid":"future-project","name":"future","path":"C:\\future","output_file":["C:\\future\\README.md"],"target_files":["C:\\future\\README.md"],"future_optional":{"enabled":true}}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-wrong-type' {
+            param($c)
+            '[{"uuid":"wrong-type","name":"wrong-type","path":"C:\\wrong-type","output_file":[42],"target_files":["C:\\wrong-type\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'unsupported' 'unsupported' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-missing-key' {
+            param($c)
+            "[General]`r`neye_size=480" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-unknown-key' {
+            param($c)
+            "[General]`r`neye_size=480`r`nfuture_optional=true" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-wrong-value' {
+            param($c)
+            "[General]`r`neye_size=not-a-number" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'unsupported' 'compatible' 'unsupported'
+        Assert-CompatibilityCase 'compat-unreadable' {
+            param($c)
+            '{not-json' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'unreadable' 'unreadable' 'compatible'
+
+        Assert-RejectedBeforeTransaction 'compat-legacy-rejection' {
+            param($c, $o)
+            '[{"uuid":"legacy-project","name":"legacy","root_path":"C:\\legacy","output_file":"C:\\legacy\\README.md","target_files":["C:\\legacy\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'migration-required'
+        Assert-RejectedBeforeTransaction 'compat-wrong-type-rejection' {
+            param($c, $o)
+            '[{"uuid":"wrong-type","name":"wrong-type","path":"C:\\wrong-type","output_file":[42],"target_files":["C:\\wrong-type\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'unsupported'
+        Assert-RejectedBeforeTransaction 'compat-unreadable-rejection' {
+            param($c, $o)
+            '{not-json' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'unreadable'
+    }
+
     if (Test-SmokeGroup 'formal-boundary') {
         $script:FormalBefore = @(Get-FormalBoundaryCanonical) -join "`n"
     }
@@ -844,6 +990,7 @@ try {
             $prepared = Invoke-PrepareProcess -Case $success
             Assert-True ($prepared.ExitCode -eq 0 -and $prepared.Json.result -eq 'prepared') "Success prepare failed. stderr=$($prepared.Stderr)"
             Assert-True ($prepared.Json.state -eq 'prepared_pending_apply' -and [int]$prepared.Json.formal_target_write_count -eq 0) 'Success state/write count mismatch.'
+            Assert-True ($prepared.Json.compatibility.status -eq 'compatible' -and [bool]$prepared.Json.compatibility.read_only) 'Success output omitted the compatible read-only receipt.'
             Assert-True ((Get-CaseTargetCanonical $success) -ceq $targetBefore) 'Success prepare changed fixture targets.'
             $transactionDirs = @(Get-ChildItem -LiteralPath $success.Transactions -Directory -Force)
             Assert-True ($transactionDirs.Count -eq 1) 'Success did not create exactly one transaction.'
@@ -852,6 +999,7 @@ try {
             $preimageManifest = Get-Content -LiteralPath $journal.manifests.preimage.path -Raw -Encoding UTF8 | ConvertFrom-Json
             $packageManifest = Get-Content -LiteralPath $journal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
             Assert-True ($journal.schema -eq 'laplace-formal-prepare-v1') 'Journal schema mismatch.'
+            Assert-True ($journal.compatibility.schema -eq 'laplace-compatibility-preflight-v1' -and $journal.compatibility.status -eq 'compatible' -and [bool]$journal.compatibility.read_only) 'Journal did not seal the compatible read-only receipt.'
             Assert-True ($journal.target_commit -eq $TargetCommit) 'Prepare journal target_commit did not use the shared formal target.'
             $packageMarkers = @($packageManifest.records | Where-Object { $_.key -in @('Backend/version.txt', 'Frontend/version.txt') })
             Assert-True ($packageMarkers.Count -eq 2) 'Package manifest must contain both version marker records.'

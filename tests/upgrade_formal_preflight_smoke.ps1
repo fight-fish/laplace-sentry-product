@@ -3,7 +3,7 @@ param(
     [ValidateSet('all', 'source-target', 'runtime-observation', 'protected-data', 'path-boundary')]
     [string[]]$Group = @('all'),
 
-    [ValidateSet('all', 'success', 'exact-mixed', 'exact-mixed-adapter-near-miss', 'exact-mixed-tray-target-near-miss', 'exact-mixed-tray-arbitrary-near-miss', 'exact-mixed-managed-near-miss', 'exact-mixed-missing', 'exact-mixed-extra', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
+    [ValidateSet('all', 'success', 'source-history-shallow', 'exact-mixed', 'exact-mixed-adapter-near-miss', 'exact-mixed-tray-target-near-miss', 'exact-mixed-tray-arbitrary-near-miss', 'exact-mixed-managed-near-miss', 'exact-mixed-missing', 'exact-mixed-extra', 'source-dirty', 'target-missing', 'marker-missing', 'marker-different', 'marker-unknown', 'marker-non-ancestor', 'marker-true-non-ancestor', 'managed-drift', 'delete-and-requirements-policy', 'ui-active-lock-ambiguous', 'owned-daemon-worker', 'stale-registry-warning', 'pid-reuse-unregistered-worker', 'protected-missing-unreadable', 'observation-escape', 'observation-frontend-overlap', 'observation-backend-overlap', 'frontend-backend-overlap', 'outside-temp-boundary')]
     [string[]]$Case = @('all'),
 
     [ValidateRange(10, 600)]
@@ -179,6 +179,35 @@ function Set-ExactMixedTarget {
     $MixedRepairMarker | Set-Content -LiteralPath (Join-Path $Case.Backend 'version.txt') -Encoding ASCII -NoNewline
 }
 
+function Set-SourceHistoryFixture {
+    param(
+        [Parameter(Mandatory = $true)]$Case,
+        [switch]$Shallow
+    )
+    $sourceRoot = Join-Path $Case.Root 'source-repo'
+    $sourceUri = 'file:///' + $RepoRoot.Replace('\', '/')
+    $cloneArguments = @('clone', '--quiet', '--no-local')
+    if ($Shallow) { $cloneArguments += @('--depth', '1') }
+    $cloneArguments += @($sourceUri, $sourceRoot)
+    & git @cloneArguments
+    Assert-True ($LASTEXITCODE -eq 0) 'Unable to create source-history fixture clone.'
+    Copy-Item -LiteralPath $UpgradeScript -Destination (Join-Path $sourceRoot 'scripts\upgrade.ps1') -Force
+    $actualShallow = (& git -C $sourceRoot rev-parse --is-shallow-repository).Trim()
+    $expectedShallow = if ($Shallow) { 'true' } else { 'false' }
+    Assert-True ($actualShallow -eq $expectedShallow) "Source-history fixture shallow mismatch: expected=$expectedShallow actual=$actualShallow"
+    $Case.UpgradeScript = Join-Path $sourceRoot 'scripts\upgrade.ps1'
+    return $sourceRoot
+}
+
+function New-TrueNonAncestorCommit {
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+    $tree = (& git -C $SourceRoot rev-parse 'HEAD^{tree}').Trim()
+    Assert-True ($LASTEXITCODE -eq 0 -and $tree -match '^[0-9a-f]{40}$') 'Unable to resolve fixture tree.'
+    $commit = (& git -C $SourceRoot -c 'user.name=Laplace Sentry Test' -c 'user.email=laplace-sentry-test@example.invalid' commit-tree $tree -m 'true non-ancestor fixture').Trim()
+    Assert-True ($LASTEXITCODE -eq 0 -and $commit -match '^[0-9a-f]{40}$') 'Unable to create true non-ancestor fixture commit.'
+    return $commit
+}
+
 function New-Observation {
     return [ordered]@{
         source_dirty = $false
@@ -203,6 +232,7 @@ function New-TestCase {
         Frontend = Join-Path $root 'frontend-target'
         Backend = Join-Path $root 'backend-target'
         Observation = Join-Path $root 'observation.json'
+        UpgradeScript = $UpgradeScript
     }
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     Copy-ManagedTree -Case $case
@@ -234,10 +264,11 @@ function Invoke-PreflightProcess {
         [Parameter(Mandatory = $true)][string]$IsolationRoot,
         [Parameter(Mandatory = $true)][string]$Frontend,
         [Parameter(Mandatory = $true)][string]$Backend,
-        [Parameter(Mandatory = $true)][string]$Observation
+        [Parameter(Mandatory = $true)][string]$Observation,
+        [Parameter(Mandatory = $true)][string]$UpgradeScriptPath
     )
     $arguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Argument $UpgradeScript),
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Quote-Argument $UpgradeScriptPath),
         '-Mode', 'PreflightFormal',
         '-IsolationRoot', (Quote-Argument $IsolationRoot),
         '-FrontendTarget', (Quote-Argument $Frontend),
@@ -312,7 +343,7 @@ function Run-Case {
             & $Arrange $case $observation
             Write-Observation -Case $case -Observation $observation
             $before = Get-TreeFingerprint $case.Root
-            $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $case.Observation
+            $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $case.Observation -UpgradeScriptPath $case.UpgradeScript
             $after = Get-TreeFingerprint $case.Root
             Assert-True ($before -ceq $after) "$Name changed fake target/observation content or timestamps."
             Assert-ResultTags -Result $result -ExpectedExit $ExpectedExit -FailureTags $FailureTags -WarningTags $WarningTags
@@ -334,6 +365,11 @@ try {
             $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_coherence' })[0]
             Assert-True ($check.status -eq 'pass' -and $check.reason -match 'contract=generic-marker-tree-v1') 'Generic coherent result was not identified as generic.'
         }
+        Run-Case 'source-history-shallow' { param($case, $o) [void](Set-SourceHistoryFixture -Case $case -Shallow) } 2 @('[UPGRADE_SOURCE_HISTORY_FAIL]') @() {
+            param($result)
+            $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_version' })[0]
+            Assert-True ($check.status -eq 'fail' -and $check.reason -match 'target_version=') 'Shallow source did not fail the target-version prerequisite.'
+        }
         Run-Case 'exact-mixed' { param($case, $o) Set-ExactMixedTarget $case } 0 @() @() {
             param($result)
             $check = @($result.Json.checks | Where-Object { $_.id -eq 'target_coherence' })[0]
@@ -351,6 +387,17 @@ try {
         Run-Case 'marker-different' { param($case, $o) 'different' | Set-Content -LiteralPath (Join-Path $case.Backend 'version.txt') -Encoding ASCII -NoNewline } 2 @('[UPGRADE_VERSION_FAIL]')
         Run-Case 'marker-unknown' { param($case, $o) 'not-a-commit' | Set-Content -LiteralPath (Join-Path $case.Frontend 'version.txt') -Encoding ASCII -NoNewline; 'not-a-commit' | Set-Content -LiteralPath (Join-Path $case.Backend 'version.txt') -Encoding ASCII -NoNewline } 2 @('[UPGRADE_VERSION_FAIL]')
         Run-Case 'marker-non-ancestor' { param($case, $o) $o.force_non_ancestor = $true } 2 @('[UPGRADE_VERSION_FAIL]')
+        Run-Case 'marker-true-non-ancestor' {
+            param($case, $o)
+            $sourceRoot = Set-SourceHistoryFixture -Case $case
+            $nonAncestor = New-TrueNonAncestorCommit -SourceRoot $sourceRoot
+            $nonAncestor | Set-Content -LiteralPath (Join-Path $case.Frontend 'version.txt') -Encoding ASCII -NoNewline
+            $nonAncestor | Set-Content -LiteralPath (Join-Path $case.Backend 'version.txt') -Encoding ASCII -NoNewline
+        } 2 @('[UPGRADE_VERSION_FAIL]') @() {
+            param($result)
+            $actualFailures = @($result.Json.failures | ForEach-Object { $_.tag })
+            Assert-True ('[UPGRADE_SOURCE_HISTORY_FAIL]' -notin $actualFailures) 'Full-history true non-ancestor was misclassified as shallow history.'
+        }
         Run-Case 'managed-drift' {
             param($case, $o)
             Remove-Item -LiteralPath (Join-Path $case.Frontend 'run_ui.vbs') -Force
@@ -404,7 +451,7 @@ try {
                 '{}' | Set-Content -LiteralPath $outsideObservation -Encoding UTF8
                 $case = New-TestCase 'observation-escape'
                 $before = Get-TreeFingerprint $case.Root
-                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $outsideObservation
+                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $outsideObservation -UpgradeScriptPath $case.UpgradeScript
                 Assert-True ($before -ceq (Get-TreeFingerprint $case.Root)) 'Observation escape rejection changed fixture tree.'
                 Assert-ResultTags $result 2 @('[UPGRADE_PREFLIGHT_FAIL]')
                 Remove-TestTree $case.Root
@@ -418,7 +465,7 @@ try {
                 $overlapObservation = Join-Path $case.Frontend 'src\observation.json'
                 '{}' | Set-Content -LiteralPath $overlapObservation -Encoding UTF8
                 $before = Get-TreeFingerprint $case.Root
-                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $overlapObservation
+                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $overlapObservation -UpgradeScriptPath $case.UpgradeScript
                 Assert-True ($before -ceq (Get-TreeFingerprint $case.Root)) 'Frontend/observation overlap rejection changed fixture tree.'
                 Assert-ResultTags $result 2 @('[UPGRADE_PREFLIGHT_FAIL]')
             }
@@ -431,7 +478,7 @@ try {
                 $overlapObservation = Join-Path $case.Backend 'src\observation.json'
                 '{}' | Set-Content -LiteralPath $overlapObservation -Encoding UTF8
                 $before = Get-TreeFingerprint $case.Root
-                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $overlapObservation
+                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend $case.Backend -Observation $overlapObservation -UpgradeScriptPath $case.UpgradeScript
                 Assert-True ($before -ceq (Get-TreeFingerprint $case.Root)) 'Backend/observation overlap rejection changed fixture tree.'
                 Assert-ResultTags $result 2 @('[UPGRADE_PREFLIGHT_FAIL]')
             }
@@ -442,7 +489,7 @@ try {
             $case = New-TestCase 'frontend-backend-overlap'
             try {
                 $before = Get-TreeFingerprint $case.Root
-                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend (Join-Path $case.Frontend 'src') -Observation $case.Observation
+                $result = Invoke-PreflightProcess -IsolationRoot $case.Root -Frontend $case.Frontend -Backend (Join-Path $case.Frontend 'src') -Observation $case.Observation -UpgradeScriptPath $case.UpgradeScript
                 Assert-True ($before -ceq (Get-TreeFingerprint $case.Root)) 'Frontend/backend overlap rejection changed fixture tree.'
                 Assert-ResultTags $result 2 @('[UPGRADE_PREFLIGHT_FAIL]')
             }
@@ -451,7 +498,7 @@ try {
 
         Invoke-SmokeCase 'outside-temp-boundary' {
             $forbiddenRoot = Join-Path $RepoRoot 'forbidden-preflight-fixture'
-            $result = Invoke-PreflightProcess -IsolationRoot $forbiddenRoot -Frontend (Join-Path $forbiddenRoot 'frontend') -Backend (Join-Path $forbiddenRoot 'backend') -Observation (Join-Path $forbiddenRoot 'observation.json')
+            $result = Invoke-PreflightProcess -IsolationRoot $forbiddenRoot -Frontend (Join-Path $forbiddenRoot 'frontend') -Backend (Join-Path $forbiddenRoot 'backend') -Observation (Join-Path $forbiddenRoot 'observation.json') -UpgradeScriptPath $UpgradeScript
             Assert-ResultTags $result 2 @('[UPGRADE_PREFLIGHT_FAIL]')
             Assert-True (-not (Test-Path -LiteralPath $forbiddenRoot)) 'Outside-TEMP boundary check created a repository path.'
         }

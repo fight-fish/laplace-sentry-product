@@ -37,6 +37,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run_upgrade_quick_
 | Preflight Helper 契約 | `tests\upgrade_formal_preflight_contract.ps1`                                               | 在不執行大型測試矩陣的情況下，確認 PreflightFormal 的 Selector／Tag 對 Source、Target、Runtime、受保護資料及非同步子程序輸出的連線仍然存在。 |
 | TEMP 整合測試           | `tests\upgrade_isolated_smoke.ps1`                                                          | 驗證公開的 `upgrade.bat --stage` 能正確進入嚴格 TEMP 演練流程，並保護正式資料。                                          |
 | TEMP Preflight 代表案例 | `tests\upgrade_formal_preflight_smoke.ps1 -Group path-boundary -Case outside-temp-boundary` | 驗證 Preflight 能拒絕 Repository 或 TEMP 外部的測試路徑，且不會碰觸正式資料。                                           |
+| Source-history 代表案例 | `tests\upgrade_formal_preflight_smoke.ps1 -Group source-target -Case source-history-shallow` | 以 TEMP shallow clone 證明正式來源資格會專用 fail-closed，且不寫入假目標。                                                |
 
 ---
 
@@ -61,6 +62,7 @@ Python Tree Query 合約測試使用 `tests\_tree_query_contract_bootstrap.py` �
 - 只允許正式 helper 明列的既有修改；未列入允許範圍的 dirty 或 untracked 路徑一律拒絕。
 - 版本錨點必須是明示核准的錨點，或符合明示 parent lineage 與精確 changed-path shape 的單一直接子版本。
 - 少檔、多檔、替換檔、錯誤父版本、合併形狀或更深後代均不得靠名稱相似而通過。
+- 正式 source repo 必須是 non-shallow；shallow fixture 預期命中 `UPGRADE_SOURCE_HISTORY_FAIL`，完整歷史中的真非祖先仍預期命中 `UPGRADE_VERSION_FAIL`。測試只使用 TEMP 本機 clone，不自動補史、不接觸正式副本。
 
 這些門檻保護的是測試輸入基準，不代表正式環境已被檢查或可以套用升級。
 
@@ -96,7 +98,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run_upgrade_quick_
 | Python 單元／契約測試             | `python -m unittest discover...`           | 數秒              | 不會                            | 已包含於 Quick Gate                                                        | `未執行 Python Contract Tests。`                                                  |
 | TEMP Prepare 整合測試          | `tests\upgrade_formal_prepare_smoke.ps1`   | 每組／每案例不同；完整測試較慢 | 僅讀取規格允許的 Metadata；測試資料皆在 TEMP | 否（Quick Gate 只驗 Selector／Contract）                                     | `未執行 PrepareFormal TEMP 整合，因此 Prepare Transaction／Manifest／Reentry 風險本輪未驗證。`  |
 | TEMP Formal Apply 整合測試     | `tests\upgrade_formal_apply_smoke.ps1`     | 很耗時             | 不會；僅使用 TEMP                   | 否                                                                      | `未執行 Formal Apply TEMP Matrix，因此 Rollback 與 Marker 等高覆蓋測試本輪未驗證。`              |
-| TEMP Preflight 整合測試        | `tests\upgrade_formal_preflight_smoke.ps1` | 每案例／每組不同；完整矩陣較慢 | 不會；僅使用 TEMP 假目標               | Quick Gate 只包含 Helper Contract 與 `path-boundary/outside-temp-boundary` | `未執行完整 PreflightFormal Fixture Matrix，本輪僅驗證 Helper Contract 與指定 Selector 案例。` |
+| TEMP Preflight 整合測試        | `tests\upgrade_formal_preflight_smoke.ps1` | 每案例／每組不同；完整矩陣較慢 | 不會；僅使用 TEMP 假目標與本機 clone       | Quick Gate 包含 Helper Contract、路徑邊界、source-history 與 exact-mixed 代表案例 | `未執行完整 PreflightFormal Fixture Matrix，本輪僅驗證 Helper Contract 與指定 Selector 案例。` |
 | TEMP Mixed Repair 整合測試     | `tests\upgrade_mixed_repair_smoke.ps1`     | 很耗時             | 不會；僅使用 TEMP                   | 否                                                                      | `未執行 Mixed Repair TEMP Matrix，因此混合版本 Rollback 覆蓋本輪未驗證。`                       |
 | TEMP Isolated Apply Matrix | `tests\upgrade_isolated_apply_smoke.ps1`   | 很耗時             | 不會；僅使用 TEMP                   | 否                                                                      | `未執行 Isolated Apply Rollback Matrix。`                                         |
 | 正式環境唯讀人工檢查                 | 經授權後，僅執行唯讀 Preflight／Transaction 驗證        | 人工操作，依環境而定      | 僅唯讀且須明確授權                     | 否                                                                      | `未執行正式環境唯讀檢查，因此本輪未對正式環境做任何宣稱。`                                                |
@@ -123,7 +125,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\run_upgrade_quick_
 
 若 Quick Gate 全部通過（Green），**只能代表：**
 
-> Python Contract 測試、PowerShell Parser／Static Contract、Preflight Helper Contract、一個嚴格 TEMP 的公開 Stage 演練，以及 Preflight `path-boundary/outside-temp-boundary` 代表案例皆已通過。
+> Python Contract 測試、PowerShell Parser／Static Contract、Preflight Helper Contract、一個嚴格 TEMP 的公開 Stage 演練，以及 Preflight 路徑邊界、source-history、exact-mixed positive／near-miss 代表案例皆已通過。
 
 **並不代表：**
 
