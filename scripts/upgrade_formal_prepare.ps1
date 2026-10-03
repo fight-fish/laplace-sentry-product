@@ -3,25 +3,26 @@
 建立正式修復前的完整證據交易，但不套用任何檔案。
 
 .DESCRIPTION
-Purpose: validate the exact ruled mixed source, then seal a full preimage, exact Git-object package, canonical manifests, and a durable prepare journal.
+Purpose: validate protected-data compatibility and the exact ruled mixed source, then seal a full preimage, exact Git-object package, canonical manifests, and a durable prepare journal.
 Inputs: normalized upgrade inputs; fixed formal targets for live mode, or complete isolated TEMP targets plus observation JSON for fixture mode.
-Outputs: one transaction directory containing preimage/, package/, three manifests, and transaction-journal.json.
+Outputs: a read-only compatibility result; on success, one transaction directory containing preimage/, package/, three manifests, and transaction-journal.json.
 SSOT Output: transaction-journal.json; stdout is derived from the same journal fields.
 Exit codes: the caller maps prepared/already_prepared to 0 and every rejection, recovery gate, or prepare failure to 6.
 SKIP conditions: one intact, identical prepared_pending_apply transaction returns already_prepared without writing.
-FAIL conditions: boundary, ACL/owner, space, runtime, exact source, evidence, reentry, or durability checks fail.
+FAIL conditions: compatibility, boundary, ACL/owner, space, runtime, exact source, evidence, reentry, or durability checks fail.
 Order-sensitive checks: every live/source gate and already-prepared decision occurs before a new transaction directory is created.
 Side effects: writes only below the verified transaction parent; never writes formal targets, stops processes, cleans registry, applies, repairs, or rolls back.
 #>
 
 # 這支腳本在做什麼：正式修復前先留下完整原貌、待套用資料與可驗證交易紀錄，成功後停在等待套用。
 # 這支腳本不做什麼：不套用、不修復、不回退、不啟停程序、不清 registry，也不碰正式目標內容。
-# 常改區塊：prepare 的硬檢查、manifest 欄位、交易重入與 TEMP 故障注入。
+# 常改區塊：compatibility preflight、prepare 的硬檢查、manifest 欄位、交易重入與 TEMP 故障注入。
 # 不要亂動的區塊：固定正式路徑、exact mixed state、0 正式寫入、durable journal 與 evidence hash sealing。
 
 Set-StrictMode -Version Latest
 
 $FormalPrepareSchema = 'laplace-formal-prepare-v1'
+$FormalCompatibilitySchema = 'laplace-compatibility-preflight-v1'
 # 決策 331 固定的真實三段來源鏈與未來唯一 merge shape。
 $FormalPrepareOriginMainHead = '08bb6641ac042c6ce20ec92501f6814fe9f22fac'
 $FormalPrepareExistingCheckpointHead = 'bf8f57bf7e1d31d3a708ba80ef0316faef8ebea9'
@@ -133,6 +134,7 @@ $FormalPrepareTransactionsParent = Join-Path $env:LOCALAPPDATA 'LaplaceSentryUpg
 $FormalPrepareJournalReserveBytes = [int64](1MB)
 $FormalPrepareSafetyMarginBytes = [int64](64MB)
 $script:FormalPrepareFailureJournal = $null
+$script:FormalPrepareCompatibility = $null
 
 # =========================
 # 輸入與路徑邊界
@@ -777,6 +779,216 @@ function ConvertTo-FormalPrepareObservationRecord {
     }
 }
 
+# =========================
+# 受保護資料相容性預檢（只讀）
+# =========================
+
+function Test-FormalCompatibilityStringArray {
+    param($Value)
+    if ($null -eq $Value -or -not ($Value -is [System.Array])) { return $false }
+    foreach ($item in @($Value)) {
+        if (-not ($item -is [string]) -or [string]::IsNullOrWhiteSpace($item)) { return $false }
+    }
+    return $true
+}
+
+function Get-FormalCompatibilityStatus {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Statuses)
+    foreach ($status in @('unreadable', 'unsupported', 'migration-required', 'compatible')) {
+        if ($Statuses -contains $status) { return $status }
+    }
+    return 'compatible'
+}
+
+function New-FormalCompatibilityFileResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$DataId,
+        [Parameter(Mandatory = $true)][ValidateSet('compatible', 'migration-required', 'unsupported', 'unreadable')][string]$Status,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ReasonCodes,
+        [int]$RecordCount = 0,
+        [AllowEmptyCollection()][string[]]$UnknownFields = @()
+    )
+    return [pscustomobject]@{
+        data_id = $DataId
+        status = $Status
+        reason_codes = @($ReasonCodes | Sort-Object -Unique)
+        record_count = $RecordCount
+        unknown_fields = @($UnknownFields | Sort-Object -Unique)
+    }
+}
+
+function Get-FormalProjectsCompatibility {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return New-FormalCompatibilityFileResult -DataId 'Backend/data/projects.json' -Status 'unreadable' -ReasonCodes @('projects_not_readable')
+    }
+
+    try { $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop }
+    catch { return New-FormalCompatibilityFileResult -DataId 'Backend/data/projects.json' -Status 'unreadable' -ReasonCodes @('projects_not_readable') }
+    if ([string]::IsNullOrWhiteSpace($raw) -or -not $raw.TrimStart().StartsWith('[') -or -not $raw.TrimEnd().EndsWith(']')) {
+        return New-FormalCompatibilityFileResult -DataId 'Backend/data/projects.json' -Status 'unreadable' -ReasonCodes @('projects_json_not_array')
+    }
+    try { $parsed = $raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { return New-FormalCompatibilityFileResult -DataId 'Backend/data/projects.json' -Status 'unreadable' -ReasonCodes @('projects_json_parse_failed') }
+
+    $records = @($parsed)
+    $recordStatuses = @()
+    $reasonCodes = @()
+    $unknownFields = @()
+    $knownFields = @('uuid', 'name', 'path', 'root_path', 'output_file', 'target_files', 'ignore_patterns')
+    foreach ($record in $records) {
+        if ($null -eq $record -or $record -isnot [pscustomobject]) {
+            $recordStatuses += 'unsupported'
+            $reasonCodes += 'project_record_not_object'
+            continue
+        }
+
+        $recordStatus = 'compatible'
+        foreach ($property in @($record.PSObject.Properties)) {
+            if ($property.Name -notin $knownFields) { $unknownFields += $property.Name }
+        }
+        foreach ($requiredText in @('uuid', 'name')) {
+            $property = $record.PSObject.Properties[$requiredText]
+            if ($null -eq $property -or -not ($property.Value -is [string]) -or [string]::IsNullOrWhiteSpace($property.Value)) {
+                $recordStatus = 'unsupported'
+                $reasonCodes += "project_$($requiredText)_missing_or_invalid"
+            }
+        }
+
+        $pathProperty = $record.PSObject.Properties['path']
+        $legacyPathProperty = $record.PSObject.Properties['root_path']
+        if ($null -eq $pathProperty) {
+            if ($null -ne $legacyPathProperty -and $legacyPathProperty.Value -is [string] -and -not [string]::IsNullOrWhiteSpace($legacyPathProperty.Value)) {
+                if ($recordStatus -ne 'unsupported') { $recordStatus = 'migration-required' }
+                $reasonCodes += 'project_legacy_root_path'
+            }
+            else {
+                $recordStatus = 'unsupported'
+                $reasonCodes += 'project_path_missing_or_invalid'
+            }
+        }
+        elseif (-not ($pathProperty.Value -is [string]) -or [string]::IsNullOrWhiteSpace($pathProperty.Value)) {
+            $recordStatus = 'unsupported'
+            $reasonCodes += 'project_path_missing_or_invalid'
+        }
+        elseif ($null -ne $legacyPathProperty) {
+            if ($recordStatus -ne 'unsupported') { $recordStatus = 'migration-required' }
+            $reasonCodes += 'project_legacy_root_path_present'
+        }
+
+        $outputProperty = $record.PSObject.Properties['output_file']
+        if ($null -eq $outputProperty) {
+            if ($recordStatus -ne 'unsupported') { $recordStatus = 'migration-required' }
+            $reasonCodes += 'project_output_file_missing'
+        }
+        elseif ($outputProperty.Value -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($outputProperty.Value)) {
+                $recordStatus = 'unsupported'
+                $reasonCodes += 'project_output_file_invalid'
+            }
+            elseif ($recordStatus -ne 'unsupported') {
+                $recordStatus = 'migration-required'
+                $reasonCodes += 'project_legacy_output_file_string'
+            }
+        }
+        elseif (-not (Test-FormalCompatibilityStringArray -Value $outputProperty.Value)) {
+            $recordStatus = 'unsupported'
+            $reasonCodes += 'project_output_file_invalid'
+        }
+
+        $targetsProperty = $record.PSObject.Properties['target_files']
+        if ($null -eq $targetsProperty) {
+            if ($recordStatus -ne 'unsupported') { $recordStatus = 'migration-required' }
+            $reasonCodes += 'project_target_files_missing'
+        }
+        elseif (-not (Test-FormalCompatibilityStringArray -Value $targetsProperty.Value)) {
+            $recordStatus = 'unsupported'
+            $reasonCodes += 'project_target_files_invalid'
+        }
+
+        $ignoreProperty = $record.PSObject.Properties['ignore_patterns']
+        if ($null -ne $ignoreProperty -and -not (Test-FormalCompatibilityStringArray -Value $ignoreProperty.Value)) {
+            $recordStatus = 'unsupported'
+            $reasonCodes += 'project_ignore_patterns_invalid'
+        }
+        $recordStatuses += $recordStatus
+    }
+    if ($unknownFields.Count -gt 0) { $reasonCodes += 'project_unknown_fields_ignored' }
+    $status = Get-FormalCompatibilityStatus -Statuses $recordStatuses
+    return New-FormalCompatibilityFileResult -DataId 'Backend/data/projects.json' -Status $status -ReasonCodes $reasonCodes -RecordCount $records.Count -UnknownFields $unknownFields
+}
+
+function Get-FormalSentryConfigCompatibility {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return New-FormalCompatibilityFileResult -DataId 'Frontend/sentry_config.ini' -Status 'unreadable' -ReasonCodes @('config_not_readable')
+    }
+    try { $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop) }
+    catch { return New-FormalCompatibilityFileResult -DataId 'Frontend/sentry_config.ini' -Status 'unreadable' -ReasonCodes @('config_not_readable') }
+
+    $knownKeys = @('enable_guidance', 'enable_smart_match', 'eye_size')
+    $seenKnown = @{}
+    $unknownFields = @()
+    $reasonCodes = @()
+    $status = 'compatible'
+    $section = 'General'
+    foreach ($sourceLine in $lines) {
+        $line = ([string]$sourceLine).Trim()
+        if (-not $line -or $line.StartsWith(';') -or $line.StartsWith('#')) { continue }
+        if ($line -match '^\[([^\]]+)\]$') {
+            $section = $matches[1]
+            continue
+        }
+        if ($line -notmatch '^([^=]+)=(.*)$') {
+            $status = 'unsupported'
+            $reasonCodes += 'config_malformed_line'
+            continue
+        }
+        $key = $matches[1].Trim()
+        $value = $matches[2].Trim()
+        if (-not $key) {
+            $status = 'unsupported'
+            $reasonCodes += 'config_empty_key'
+            continue
+        }
+        if ($section -ne 'General' -or $key -notin $knownKeys) {
+            $unknownFields += "$section/$key"
+            continue
+        }
+        if ($seenKnown.ContainsKey($key)) {
+            $status = 'unsupported'
+            $reasonCodes += 'config_duplicate_known_key'
+            continue
+        }
+        $seenKnown[$key] = $true
+        if ($key -in @('enable_guidance', 'enable_smart_match') -and $value -notmatch '^(?i:true|false|1|0)$') {
+            $status = 'unsupported'
+            $reasonCodes += "config_$($key)_invalid"
+        }
+        elseif ($key -eq 'eye_size' -and $value -notmatch '^\d+(?:\.\d+)?$') {
+            $status = 'unsupported'
+            $reasonCodes += 'config_eye_size_invalid'
+        }
+    }
+    if ($seenKnown.Count -lt $knownKeys.Count) { $reasonCodes += 'config_missing_keys_use_defaults' }
+    if ($unknownFields.Count -gt 0) { $reasonCodes += 'config_unknown_fields_ignored' }
+    return New-FormalCompatibilityFileResult -DataId 'Frontend/sentry_config.ini' -Status $status -ReasonCodes $reasonCodes -RecordCount $seenKnown.Count -UnknownFields $unknownFields
+}
+
+function Get-FormalPrepareCompatibilityReport {
+    param([Parameter(Mandatory = $true)]$Inputs)
+    $files = @(
+        (Get-FormalProjectsCompatibility -Path (Join-Path $Inputs.BackendTarget 'data\projects.json')),
+        (Get-FormalSentryConfigCompatibility -Path (Join-Path $Inputs.FrontendTarget 'sentry_config.ini'))
+    )
+    return [pscustomobject]@{
+        schema = $FormalCompatibilitySchema
+        status = Get-FormalCompatibilityStatus -Statuses @($files | ForEach-Object { $_.status })
+        read_only = $true
+        files = $files
+    }
+}
+
 function Get-FormalPrepareSourceSnapshot {
     param(
         [Parameter(Mandatory = $true)]$Inputs,
@@ -1129,6 +1341,11 @@ function Assert-FormalPrepareTransactionIntegrity {
         [int]$Journal.formal_target_write_count -ne 0) {
         throw '[UPGRADE_PREPARE_RECOVERY_REQUIRED] Prepared transaction boundary or state is invalid.'
     }
+    if ($null -eq $Journal.PSObject.Properties['compatibility'] -or
+        $Journal.compatibility.schema -ne $FormalCompatibilitySchema -or
+        $Journal.compatibility.status -ne 'compatible' -or -not [bool]$Journal.compatibility.read_only) {
+        throw '[UPGRADE_PREPARE_RECOVERY_REQUIRED] Prepared transaction has no valid compatible read-only receipt.'
+    }
     foreach ($name in @('source', 'preimage', 'package')) {
         [void](Assert-FormalPrepareManifestIntegrity -TransactionRoot $TransactionRoot -ManifestReference $Journal.manifests.$name)
     }
@@ -1186,6 +1403,7 @@ function New-FormalPrepareFailureResult {
             software_state_id = $journal.software_state_id
             evidence_state_id = $journal.evidence_state_id
             manifests = $journal.manifests
+            compatibility = $journal.compatibility
             error = $journal.error
             formal_target_write_count = [int]$journal.formal_target_write_count
             warnings = @($journal.warnings)
@@ -1199,6 +1417,7 @@ function New-FormalPrepareFailureResult {
         failure_phase = 'before_transaction'
         transaction_id = $null
         transaction_root = $null
+        compatibility = $script:FormalPrepareCompatibility
         error = $Message
         formal_target_write_count = 0
     }
@@ -1220,6 +1439,7 @@ function ConvertTo-FormalPrepareResult {
         software_state_id = $Journal.software_state_id
         evidence_state_id = $Journal.evidence_state_id
         manifests = $Journal.manifests
+        compatibility = $Journal.compatibility
         formal_target_write_count = [int]$Journal.formal_target_write_count
         warnings = @($Journal.warnings)
     }
@@ -1228,6 +1448,7 @@ function ConvertTo-FormalPrepareResult {
 function Invoke-FormalPrepareMode {
     param([Parameter(Mandatory = $true)]$Inputs)
     $script:FormalPrepareFailureJournal = $null
+    $script:FormalPrepareCompatibility = $null
     $fixtureMode = Test-FormalPrepareFixtureMode -Inputs $Inputs
     $script:FormalPrepareObservationPath = $Inputs.PreflightObservationPath
     Assert-FormalPrepareRepoBasis -FixtureMode $fixtureMode
@@ -1250,6 +1471,13 @@ function Invoke-FormalPrepareMode {
         }
     }
     else { Assert-FormalPrepareObservationSafe -Observation $observation }
+
+    # COMPAT: This gate classifies protected data only. Non-compatible shapes stop before any transaction or data write.
+    $compatibility = Get-FormalPrepareCompatibilityReport -Inputs $Inputs
+    $script:FormalPrepareCompatibility = $compatibility
+    if ($compatibility.status -ne 'compatible') {
+        throw "[UPGRADE_PREPARE_COMPATIBILITY_FAIL] Protected data status=$($compatibility.status)"
+    }
 
     $layout = Resolve-MixedRepairLayout -Inputs $Inputs
     $snapshot = Get-FormalPrepareSourceSnapshot -Inputs $Inputs -Layout $layout -Observation $observation
@@ -1303,6 +1531,7 @@ function Invoke-FormalPrepareMode {
         required_space = $space
         observed_free_bytes = $freeBytes
         manifests = [pscustomobject]@{ source = $null; preimage = $null; package = $null }
+        compatibility = $compatibility
         formal_target_write_count = 0
         failure_phase = $null
         warnings = $warnings

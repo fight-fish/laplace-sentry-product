@@ -1,9 +1,9 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('all', 'basis-only', 'metadata', 'formal-boundary', 'success', 'runtime-rejection', 'acl-rejection', 'source-rejection', 'transaction-boundary', 'failure-injection', 'reentry-cleanup')]
+    [ValidateSet('all', 'basis-only', 'metadata', 'compatibility', 'formal-boundary', 'success', 'runtime-rejection', 'acl-rejection', 'source-rejection', 'transaction-boundary', 'failure-injection', 'reentry-cleanup')]
     [string[]]$Group = @('all'),
 
-    [ValidateSet('all', 'success-and-rerun', 'active-lock', 'owned-ui', 'owned-daemon', 'owned-worker', 'ambiguous-runtime', 'acl-reject', 'owner-reject', 'space-reject', 'adapter-drift', 'tray-drift', 'marker-drift', 'transaction-overlap', 'transaction-unc', 'transaction-reparse', 'inject-preimage', 'inject-package', 'inject-prepare', 'inject-journal', 'inject-secondsnapshot', 'inject-evidencetamper', 'incomplete-rerun', 'evidence-tamper-rerun', 'multiple-transactions')]
+    [ValidateSet('all', 'compat-current', 'compat-legacy', 'compat-missing-field', 'compat-unknown-field', 'compat-wrong-type', 'compat-ini-missing-key', 'compat-ini-unknown-key', 'compat-ini-wrong-value', 'compat-unreadable', 'compat-legacy-rejection', 'compat-wrong-type-rejection', 'compat-unreadable-rejection', 'success-and-rerun', 'active-lock', 'owned-ui', 'owned-daemon', 'owned-worker', 'ambiguous-runtime', 'acl-reject', 'owner-reject', 'space-reject', 'adapter-drift', 'tray-drift', 'marker-drift', 'transaction-overlap', 'transaction-unc', 'transaction-reparse', 'inject-preimage', 'inject-package', 'inject-prepare', 'inject-journal', 'inject-secondsnapshot', 'inject-evidencetamper', 'incomplete-rerun', 'evidence-tamper-rerun', 'multiple-transactions')]
     [string[]]$Case = @('all')
 )
 
@@ -12,20 +12,20 @@ param(
 Proves PrepareFormal under isolated TEMP fixtures and the read-only production WSL metadata seam.
 
 .DESCRIPTION
-Purpose: exercise prepare success, rejection, interruption, reentry, integrity sealing, the zero-formal-write boundary, and production WSL stat argument handling.
+Purpose: exercise protected-data compatibility classification, prepare success, rejection, interruption, reentry, integrity sealing, the zero-formal-write boundary, and production WSL stat argument handling.
 Inputs: fixed Git objects, generated mixed Frontend/Backend targets and observation JSON below system TEMP, plus formal backend main.py as a read-only metadata witness.
 Outputs: one PASS/FAIL result; all fixture evidence is removed before exit.
 SSOT Output: process exit code; zero means every prepare-only assertion passed.
 Exit codes: 0 pass, 1 assertion, boundary, script, or cleanup failure.
 SKIP conditions: none.
-FAIL conditions: any wrong exit/result/state/count/hash/reentry/boundary result, TEMP residue, or production metadata command/parser result.
+FAIL conditions: any wrong compatibility/exit/result/state/count/hash/reentry/boundary result, protected-data mutation, TEMP residue, or production metadata command/parser result.
 Order-sensitive checks: formal-boundary and fixture target snapshots are captured before prepare and compared after every case.
 Side effects: creates and removes only verified strict children of system TEMP and issues read-only WSL stat calls; never invokes live PrepareFormal, upgrade.bat, Git writes, processes, registry, or runtime changes.
 #>
 
 # 這支腳本在做什麼：用 TEMP 假目標證明完整 prepare 契約，並唯讀走過 production WSL metadata 接縫。
 # 這支腳本不做什麼：不執行真實 prepare、不建立正式 transaction root，也不測 apply／repair／rollback。
-# 常改區塊：production metadata 接縫、拒絕案例、故障注入、manifest 與重入斷言。
+# 常改區塊：compatibility fixture、production metadata 接縫、拒絕案例、故障注入、manifest 與重入斷言。
 # 不要亂動的區塊：正式邊界前後 fingerprint、嚴格 TEMP 清理與 0 formal target writes。
 
 Set-StrictMode -Version Latest
@@ -506,6 +506,14 @@ Set-StrictMode -Version Latest
 function global:git {
     param([Parameter(ValueFromRemainingArguments=`$true)][object[]]`$GitArguments)
     `$parts = @(`$GitArguments | ForEach-Object { [string]`$_ })
+    if (`$parts.Count -eq 5 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'status' -and `$parts[3] -eq '--porcelain=v1' -and `$parts[4] -eq '--untracked-files=all') {
+        # The parent smoke already proves the exact dirty-path basis matrix. The
+        # isolated child exercises post-basis Prepare behavior against fixture
+        # targets, so expose the ruled follow-up as clean without changing the
+        # production gate or hiding any other Git observation.
+        `$global:LASTEXITCODE = 0
+        return
+    }
     if (`$parts.Count -eq 4 -and `$parts[0] -eq '-C' -and `$parts[1] -eq `$RepoRoot -and `$parts[2] -eq 'branch' -and `$parts[3] -eq '--show-current') {
         # 依實際 HEAD 落在哪條線回報對應的 approved working branch：
         # active 線回 active branch，舊鏈回舊 branch。production 的 branch guard 不受影響。
@@ -600,7 +608,7 @@ function Initialize-PrepareTemplate {
     Remove-TestTree $build
     New-Item -ItemType Directory -Path (Join-Path $backend 'data') -Force | Out-Null
     "[General]`r`neye_size=480" | Set-Content -LiteralPath (Join-Path $frontend 'sentry_config.ini') -Encoding UTF8
-    '[{"uuid":"fixture-project","name":"must-survive"}]' | Set-Content -LiteralPath (Join-Path $backend 'data\projects.json') -Encoding UTF8
+    '[{"uuid":"fixture-project","name":"must-survive","path":"C:\\fixture-project","output_file":["C:\\fixture-project\\README.md"],"target_files":["C:\\fixture-project\\README.md"],"ignore_patterns":[]}]' | Set-Content -LiteralPath (Join-Path $backend 'data\projects.json') -Encoding UTF8
     $SourceMarker | Set-Content -LiteralPath (Join-Path $frontend 'version.txt') -Encoding ASCII -NoNewline
     $SourceMarker | Set-Content -LiteralPath (Join-Path $backend 'version.txt') -Encoding ASCII -NoNewline
     $observation = Join-Path $TemplateRoot 'observation.json'
@@ -825,7 +833,12 @@ function Assert-NoTransactionDirectory {
 }
 
 function Assert-RejectedBeforeTransaction {
-    param([string]$Name, [scriptblock]$Mutate, [hashtable]$InvokeOverrides = @{})
+    param(
+        [string]$Name,
+        [scriptblock]$Mutate,
+        [hashtable]$InvokeOverrides = @{},
+        [string]$ExpectedCompatibilityStatus = ''
+    )
     Invoke-SmokeCase $Name {
         $case = New-PrepareCase $Name
         $observation = Get-Content -LiteralPath $case.Observation -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -838,8 +851,38 @@ function Assert-RejectedBeforeTransaction {
         Assert-True ($result.ExitCode -eq 6) "[$Name] expected exit 6. stderr=$($result.Stderr)"
         Assert-True ($result.Json.result -eq 'failed' -and $result.Json.state -eq 'rejected') "[$Name] pre-transaction result was not an explicit rejection."
         Assert-True ($result.Json.failure_phase -eq 'before_transaction' -and -not $result.Json.transaction_id -and -not $result.Json.transaction_root) "[$Name] rejection exposed the wrong transaction phase."
+        if ($ExpectedCompatibilityStatus) {
+            Assert-True ($null -ne $result.Json.compatibility) "[$Name] compatibility receipt was missing. stdout=$($result.Stdout) stderr=$($result.Stderr)"
+            Assert-True ($result.Json.compatibility.status -eq $ExpectedCompatibilityStatus) "[$Name] compatibility status was not $ExpectedCompatibilityStatus."
+            Assert-True ([bool]$result.Json.compatibility.read_only) "[$Name] compatibility result was not read-only."
+        }
         Assert-NoTransactionDirectory $case
         Assert-True ((Get-CaseTargetCanonical $case) -ceq $before) "[$Name] changed fixture targets."
+    }
+}
+
+function Assert-CompatibilityCase {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Mutate,
+        [Parameter(Mandatory = $true)][string]$ExpectedOverall,
+        [Parameter(Mandatory = $true)][string]$ExpectedProjects,
+        [Parameter(Mandatory = $true)][string]$ExpectedConfig
+    )
+    Invoke-SmokeCase $Name {
+        $case = New-PrepareCase $Name
+        & $Mutate $case
+        $before = (Get-TreeCanonical $case.Frontend) + "`n---backend---`n" + (Get-TreeCanonical $case.Backend)
+        $result = Get-FormalPrepareCompatibilityReport -Inputs ([pscustomobject]@{ FrontendTarget = $case.Frontend; BackendTarget = $case.Backend })
+        $after = (Get-TreeCanonical $case.Frontend) + "`n---backend---`n" + (Get-TreeCanonical $case.Backend)
+        $projects = @($result.files | Where-Object { $_.data_id -eq 'Backend/data/projects.json' })[0]
+        $config = @($result.files | Where-Object { $_.data_id -eq 'Frontend/sentry_config.ini' })[0]
+        Assert-True ($result.schema -eq 'laplace-compatibility-preflight-v1' -and [bool]$result.read_only) "[$Name] compatibility result contract is wrong."
+        Assert-True ($result.status -eq $ExpectedOverall) "[$Name] overall status expected=$ExpectedOverall actual=$($result.status)."
+        Assert-True ($projects.status -eq $ExpectedProjects) "[$Name] projects status expected=$ExpectedProjects actual=$($projects.status)."
+        Assert-True ($config.status -eq $ExpectedConfig) "[$Name] config status expected=$ExpectedConfig actual=$($config.status)."
+        Assert-True ($after -ceq $before) "[$Name] compatibility validator changed protected fixture data."
+        Assert-NoTransactionDirectory $case
     }
 }
 
@@ -887,6 +930,55 @@ try {
     # 先單獨驗證 literal argv seam，避免正式邊界大量唯讀 WSL fingerprint 呼叫掩蓋此契約的原始結果。
     Invoke-SmokeGroup 'metadata' { Assert-ProductionWslMetadataSeam }
 
+    Invoke-SmokeGroup 'compatibility' {
+        Assert-CompatibilityCase 'compat-current' { param($c) } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-legacy' {
+            param($c)
+            '[{"uuid":"legacy-project","name":"legacy","root_path":"C:\\legacy","output_file":"C:\\legacy\\README.md","target_files":["C:\\legacy\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'migration-required' 'migration-required' 'compatible'
+        Assert-CompatibilityCase 'compat-missing-field' {
+            param($c)
+            '[{"uuid":"missing-targets","name":"missing-targets","path":"C:\\missing-targets","output_file":["C:\\missing-targets\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'migration-required' 'migration-required' 'compatible'
+        Assert-CompatibilityCase 'compat-unknown-field' {
+            param($c)
+            '[{"uuid":"future-project","name":"future","path":"C:\\future","output_file":["C:\\future\\README.md"],"target_files":["C:\\future\\README.md"],"future_optional":{"enabled":true}}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-wrong-type' {
+            param($c)
+            '[{"uuid":"wrong-type","name":"wrong-type","path":"C:\\wrong-type","output_file":[42],"target_files":["C:\\wrong-type\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'unsupported' 'unsupported' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-missing-key' {
+            param($c)
+            "[General]`r`neye_size=480" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-unknown-key' {
+            param($c)
+            "[General]`r`neye_size=480`r`nfuture_optional=true" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'compatible' 'compatible' 'compatible'
+        Assert-CompatibilityCase 'compat-ini-wrong-value' {
+            param($c)
+            "[General]`r`neye_size=not-a-number" | Set-Content -LiteralPath $c.Config -Encoding UTF8
+        } 'unsupported' 'compatible' 'unsupported'
+        Assert-CompatibilityCase 'compat-unreadable' {
+            param($c)
+            '{not-json' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } 'unreadable' 'unreadable' 'compatible'
+
+        Assert-RejectedBeforeTransaction 'compat-legacy-rejection' {
+            param($c, $o)
+            '[{"uuid":"legacy-project","name":"legacy","root_path":"C:\\legacy","output_file":"C:\\legacy\\README.md","target_files":["C:\\legacy\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'migration-required'
+        Assert-RejectedBeforeTransaction 'compat-wrong-type-rejection' {
+            param($c, $o)
+            '[{"uuid":"wrong-type","name":"wrong-type","path":"C:\\wrong-type","output_file":[42],"target_files":["C:\\wrong-type\\README.md"]}]' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'unsupported'
+        Assert-RejectedBeforeTransaction 'compat-unreadable-rejection' {
+            param($c, $o)
+            '{not-json' | Set-Content -LiteralPath $c.Projects -Encoding UTF8
+        } -ExpectedCompatibilityStatus 'unreadable'
+    }
+
     if (Test-SmokeGroup 'formal-boundary') {
         $script:FormalBefore = @(Get-FormalBoundaryCanonical) -join "`n"
     }
@@ -898,6 +990,7 @@ try {
             $prepared = Invoke-PrepareProcess -Case $success
             Assert-True ($prepared.ExitCode -eq 0 -and $prepared.Json.result -eq 'prepared') "Success prepare failed. stderr=$($prepared.Stderr)"
             Assert-True ($prepared.Json.state -eq 'prepared_pending_apply' -and [int]$prepared.Json.formal_target_write_count -eq 0) 'Success state/write count mismatch.'
+            Assert-True ($prepared.Json.compatibility.status -eq 'compatible' -and [bool]$prepared.Json.compatibility.read_only) 'Success output omitted the compatible read-only receipt.'
             Assert-True ((Get-CaseTargetCanonical $success) -ceq $targetBefore) 'Success prepare changed fixture targets.'
             $transactionDirs = @(Get-ChildItem -LiteralPath $success.Transactions -Directory -Force)
             Assert-True ($transactionDirs.Count -eq 1) 'Success did not create exactly one transaction.'
@@ -906,6 +999,7 @@ try {
             $preimageManifest = Get-Content -LiteralPath $journal.manifests.preimage.path -Raw -Encoding UTF8 | ConvertFrom-Json
             $packageManifest = Get-Content -LiteralPath $journal.manifests.package.path -Raw -Encoding UTF8 | ConvertFrom-Json
             Assert-True ($journal.schema -eq 'laplace-formal-prepare-v1') 'Journal schema mismatch.'
+            Assert-True ($journal.compatibility.schema -eq 'laplace-compatibility-preflight-v1' -and $journal.compatibility.status -eq 'compatible' -and [bool]$journal.compatibility.read_only) 'Journal did not seal the compatible read-only receipt.'
             Assert-True ($journal.target_commit -eq $TargetCommit) 'Prepare journal target_commit did not use the shared formal target.'
             $packageMarkers = @($packageManifest.records | Where-Object { $_.key -in @('Backend/version.txt', 'Frontend/version.txt') })
             Assert-True ($packageMarkers.Count -eq 2) 'Package manifest must contain both version marker records.'
