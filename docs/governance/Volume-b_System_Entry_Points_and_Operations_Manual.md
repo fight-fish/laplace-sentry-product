@@ -201,6 +201,8 @@ run_ui.bat
 - 無參數或 `--dry-run`：輸出安全升級計畫，不寫入正式副本。
 - `--stage -StagingRoot PATH`：只在指定 staging root 建立套件、備份與計畫產物，不寫入正式 Windows 或 WSL runtime。
 
+正式升級使用的 source repo 必須是 non-shallow，並能以本機 Git objects 證明版本 marker 到目前 HEAD 的 ancestry。`PreflightFormal` 與 isolated version contract 會先檢查此資格；shallow source 以 `UPGRADE_SOURCE_HISTORY_FAIL` 拒絕，不得在升級流程內自動 fetch、deepen 或 unshallow。來源補史或重取屬升級交易外的獨立整備動作，必須另有明確授權。
+
 公開入口不負責停止正式程序、套用正式檔案、寫入版本標記或執行正式回復。
 
 ## 4.4 授權制正式升級流程
